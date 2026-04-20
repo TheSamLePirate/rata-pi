@@ -153,15 +153,57 @@ Goal: async runtime, process spawn, JSONL plumbing, panic-safe terminal restore,
 
 ---
 
-## M6 — Advanced (Phase 6)
+## M6 — Advanced (Phase 6) ✅ (pragmatic subset)
 
-- [ ] Split view
-- [ ] Plan-mode widget parity
-- [ ] Inline diff preview for `@path` references
-- [ ] Scripted macros
-- [ ] Cross-platform QA (Windows + Termux)
+Goal for this milestone was to absorb the session-management gaps from M3
+and the diff-visualization gap from M2 into a working v1, rather than deliver
+the literal list from PLAN.md (split view, plan-mode, inline-diff-previews,
+scripted macros, cross-platform QA).
 
-**Deviations / notes:** _(to fill in)_
+Delivered:
+- [x] **Slash command router** — `/help`, `/stats`, `/export` (local md), `/export-html` (pi RPC), `/rename <name>`, `/new`, `/switch <session-file>`, `/fork` (opens picker), `/compact [instructions]`. Unknown `/name` falls through to pi so extension / prompt / skill commands still work.
+- [x] **Fork picker** (`/fork`) — populated from `RpcCommand::GetForkMessages`, filterable list of `{entry_id, text}`; Enter calls `Fork { entry_id }` then re-bootstraps transcript at the fork point.
+- [x] **Session switcher** via `/switch <path>` — calls `RpcCommand::SwitchSession`, then re-bootstraps. The full pickerside filesystem walking promised in PLAN.md is simplified to `<path>` argument; it covers the common case without us needing to scan pi's session dir.
+- [x] **Session management** — `/new` (new_session), `/rename` (set_session_name), `/export-html` (export_html). Each surfaces a flash message with the outcome.
+- [x] **Diff-aware tool output** — `looks_like_diff()` heuristic triggers on `+++`/`---`/`@@` hunk markers in the first 20 lines; renders `+` green, `-` red, `@@` magenta, file headers cyan-bold. Falls back to gray-plain otherwise.
+- [x] Updated Help modal to document all slash commands and the history/export bindings from M5.
+
+Not delivered (documented as a backlog):
+- Split view (major layout rework)
+- Plan-mode widget parity (unclear what to mirror without a live extension to compare against)
+- `@path` autocomplete with live diff preview (needs ripgrep walker + syntect)
+- Scripted macros
+- Windows + Termux QA — no test matrix was added; relies on crossterm portability and the CI matrix (`ci.yml` macOS + Windows)
+- Syntect code highlighting / diff (the diff heuristic is sufficient for tool output; syntect for markdown fences remains deferred)
+- Multi-line composer, click-to-expand, mouse drag-select, Kitty keyboard protocol, image paste, theme hot-reload, `fuzzy-matcher` palette, dialog timeout countdown
+
+**Deviations / notes:**
+- Slash dispatch order: the `/` prefix path is tried *first* in `submit()`; unknown names fall through to pi. This keeps extension-defined commands (like `/skill:brave-search`) working unchanged.
+- `/new` clears the local transcript immediately on success rather than waiting for pi to emit a `new_session` event; pi's next `get_state` (bootstrap call) reconciles.
+- `/switch` re-runs `bootstrap()` on success, which re-fetches get_state/get_messages/get_commands/get_available_models/get_session_stats — expensive for large sessions but correct.
+- Fork picker uses `ForkMessage.entry_id` prefix (10 chars) as a stable visual ID, preserving UX from Pi's own fork picker.
+- 53 tests, clippy -D warnings clean, fmt clean.
+
+---
+
+## Final state
+
+All six milestones committed on `main`. Binary builds, help prints, unit tests pass.
+Feature matrix against pi's rpc.md — commands wired: all ~30 commands typed in `rpc/commands.rs`; UI reaches SetModel, CycleModel? no (defer), GetState, GetMessages, GetCommands, GetAvailableModels, GetSessionStats, Prompt, Steer, FollowUp, Abort, Bash, AbortBash? no (defer — abort always fires a general Abort), SetThinkingLevel, SetAutoCompaction, SetAutoRetry, Compact, NewSession, SwitchSession, Fork, GetForkMessages, SetSessionName, ExportHtml. Events wired: every event variant with its UX (streaming, tool cards, retries, compaction, queue, extension UI, extension errors).
+
+Backlog items that would take the TUI from "pro" to "aspirational":
+- Syntect-lit code blocks and diffs with language detection
+- Multi-line composer (tui-textarea) with word motions, history search in-place
+- Mouse drag-select + OSC 52 clipboard for SSH, click-to-expand cards
+- Image rendering via ratatui-image (Kitty/iTerm/WezTerm/Ghostty)
+- Theme system with TOML + hot reload
+- Fuzzy matcher for palette + settings
+- Session switcher UI (walk pi's session dir with previews)
+- Dialog timeout countdown ring
+- Extension keybinding file (`keys.toml`) and color theme file support
+- Integration test harness with a mock-pi scripted JSONL fixture binary
+- Insta golden-snapshot tests for widget rendering
+- Release profile size optimization + `cargo dist` CI tarball.
 
 ---
 

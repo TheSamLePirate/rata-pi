@@ -38,8 +38,8 @@ use crate::rpc::client::{self, RpcClient, RpcError};
 use crate::rpc::commands::{ExtensionUiResponse, RpcCommand};
 use crate::rpc::events::{AssistantEvent, Incoming};
 use crate::rpc::types::{
-    AgentMessage, AssistantBlock, CommandInfo, ContentBlock, FollowUpMode, Model, SessionStats,
-    State, SteeringMode, ThinkingLevel, ToolResultPayload, UserContent,
+    AgentMessage, AssistantBlock, CommandInfo, ContentBlock, FollowUpMode, ForkMessage, Model,
+    SessionStats, State, SteeringMode, ThinkingLevel, ToolResultPayload, UserContent,
 };
 use crate::ui::ext_ui::{ExtReq, ExtUiState, NotifyKind, WidgetPlacement, parse as parse_ext};
 use crate::ui::markdown;
@@ -854,6 +854,37 @@ async fn handle_modal_key(
                 _ => {}
             }
         }
+        Modal::Forks(list) => {
+            let n = filtered_count_forks(&list.items, &list.query);
+            if handle_list_keys(&mut list.query, &mut list.selected, code, n) {
+                return;
+            }
+            match code {
+                KeyCode::Esc => app.modal = None,
+                KeyCode::Enter => {
+                    let pick = filtered_forks(&list.items, &list.query)
+                        .nth(list.selected)
+                        .cloned();
+                    app.modal = None;
+                    if let (Some(c), Some(f)) = (client, pick) {
+                        match c
+                            .call(RpcCommand::Fork {
+                                entry_id: f.entry_id.clone(),
+                            })
+                            .await
+                        {
+                            Ok(_) => {
+                                app.flash(format!("forked at {}", truncate_preview(&f.text, 40)));
+                                // Reload transcript at the fork point.
+                                bootstrap(c, app).await;
+                            }
+                            Err(e) => app.flash(format!("fork failed: {e}")),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         Modal::Thinking(radio) => match code {
             KeyCode::Esc => app.modal = None,
             KeyCode::Up => {
@@ -1070,6 +1101,17 @@ fn filtered_count_history(items: &[HistoryEntry], q: &str) -> usize {
     filtered_history(items, q).count()
 }
 
+fn filtered_forks<'a>(
+    items: &'a [ForkMessage],
+    q: &'a str,
+) -> impl Iterator<Item = &'a ForkMessage> + 'a {
+    items.iter().filter(move |f| matches_query(&f.text, q))
+}
+
+fn filtered_count_forks(items: &[ForkMessage], q: &str) -> usize {
+    filtered_forks(items, q).count()
+}
+
 fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
 }
@@ -1092,6 +1134,155 @@ async fn submit(app: &mut App, client: Option<&RpcClient>) {
     app.input.clear();
 
     app.history.record(&text);
+
+    // Local slash commands — intercepted before pi sees them. Each branch is a
+    // no-op if we return; otherwise fall through to send to pi (for extension /
+    // prompt / skill commands that pi itself handles).
+    if let Some(rest) = text.strip_prefix('/') {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("");
+        let arg = parts.next().unwrap_or("").trim();
+        match name {
+            "help" => {
+                app.modal = Some(Modal::Help);
+                return;
+            }
+            "stats" => {
+                if let Some(stats) = &app.session.stats {
+                    app.modal = Some(Modal::Stats(Box::new(stats.clone())));
+                }
+                return;
+            }
+            "export" => {
+                match crate::ui::export::export(&app.transcript) {
+                    Ok(p) => app.flash(format!("exported → {}", p.display())),
+                    Err(e) => app.flash(format!("export failed: {e}")),
+                }
+                return;
+            }
+            "rename" => {
+                if arg.is_empty() {
+                    app.flash("usage: /rename <name>");
+                    return;
+                }
+                let name_str = arg.to_string();
+                match client
+                    .call(RpcCommand::SetSessionName {
+                        name: name_str.clone(),
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        app.session.session_name = Some(name_str.clone());
+                        app.flash(format!("session renamed → {name_str}"));
+                    }
+                    Err(e) => app.flash(format!("rename failed: {e}")),
+                }
+                return;
+            }
+            "new" => {
+                match client
+                    .call(RpcCommand::NewSession {
+                        parent_session: None,
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        app.transcript = Transcript::default();
+                        app.flash("new session started");
+                    }
+                    Err(e) => app.flash(format!("new session failed: {e}")),
+                }
+                return;
+            }
+            "export-html" => {
+                match client
+                    .call(RpcCommand::ExportHtml { output_path: None })
+                    .await
+                {
+                    Ok(ok) => {
+                        let path = ok
+                            .data
+                            .as_ref()
+                            .and_then(|v| v.get("path"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("(no path)")
+                            .to_string();
+                        app.flash(format!("html → {path}"));
+                    }
+                    Err(e) => app.flash(format!("export-html failed: {e}")),
+                }
+                return;
+            }
+            "switch" => {
+                if arg.is_empty() {
+                    app.flash("usage: /switch <session-file>");
+                    return;
+                }
+                match client
+                    .call(RpcCommand::SwitchSession {
+                        session_path: arg.to_string(),
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        app.flash(format!("switched → {arg}"));
+                        // Reload state + messages from the new session.
+                        bootstrap(client, app).await;
+                    }
+                    Err(e) => app.flash(format!("switch failed: {e}")),
+                }
+                return;
+            }
+            "fork" => {
+                match client.call(RpcCommand::GetForkMessages).await {
+                    Ok(ok) => {
+                        let items: Vec<ForkMessage> = ok
+                            .data
+                            .as_ref()
+                            .and_then(|v| v.get("messages"))
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|m| {
+                                        serde_json::from_value::<ForkMessage>(m.clone()).ok()
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if items.is_empty() {
+                            app.flash("no fork candidates");
+                            return;
+                        }
+                        app.modal = Some(Modal::Forks(ListModal::new(
+                            "forks",
+                            "type to filter · Enter fork · Esc close",
+                            items,
+                        )));
+                    }
+                    Err(e) => app.flash(format!("get_fork_messages failed: {e}")),
+                }
+                return;
+            }
+            "compact" => {
+                let _ = client
+                    .fire(RpcCommand::Compact {
+                        custom_instructions: if arg.is_empty() {
+                            None
+                        } else {
+                            Some(arg.to_string())
+                        },
+                    })
+                    .await;
+                app.flash("compacting…");
+                return;
+            }
+            _ => {
+                // Unknown local slash — fall through to pi so extension /
+                // prompt / skill commands still work.
+            }
+        }
+    }
 
     if let Some(cmd) = text.strip_prefix('!') {
         let cmd = cmd.trim();
@@ -1491,10 +1682,16 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, tc: &ToolCall) {
                 Style::default().add_modifier(Modifier::DIM),
             )));
         } else {
+            let diff_like = looks_like_diff(&output);
             for part in output.split('\n').take(200) {
+                let styled = if diff_like {
+                    diff_style_for(part)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
                 lines.push(Line::from(vec![
                     Span::raw("    "),
-                    Span::styled(part.to_string(), Style::default().fg(Color::Gray)),
+                    Span::styled(part.to_string(), styled),
                 ]));
             }
         }
@@ -1531,6 +1728,33 @@ fn args_preview(args: &serde_json::Value) -> String {
         String::new()
     } else {
         serde_json::to_string(args).unwrap_or_default()
+    }
+}
+
+/// Heuristic: does this output look like a unified diff? Triggers if we see
+/// `+++ ` or `--- ` or `@@ ` markers anywhere in the first ~20 lines.
+fn looks_like_diff(s: &str) -> bool {
+    for line in s.lines().take(20) {
+        if line.starts_with("+++ ") || line.starts_with("--- ") || line.starts_with("@@ ") {
+            return true;
+        }
+    }
+    false
+}
+
+fn diff_style_for(line: &str) -> Style {
+    if line.starts_with("+++ ") || line.starts_with("--- ") {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with("@@") {
+        Style::default().fg(Color::Magenta)
+    } else if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::Gray)
     }
 }
 
@@ -1891,6 +2115,13 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, _app: &App) {
             90,
             24,
         ),
+        Modal::Forks(list) => (
+            format!(" {} ", list.title),
+            forks_text(list),
+            list.hint.clone(),
+            90,
+            24,
+        ),
         Modal::ExtSelect {
             title,
             options,
@@ -1959,19 +2190,34 @@ fn help_text() -> Text<'static> {
             kb("Enter"),
             Span::raw(" submit   "),
             kb("Shift+Enter"),
-            Span::raw(" newline (M5)"),
+            Span::raw(" newline (deferred)"),
         ]),
         Line::from(vec![
             kb("!cmd"),
-            Span::raw(" run bash RPC · "),
+            Span::raw(" bash RPC · "),
             kb("/"),
             Span::raw(" commands"),
+        ]),
+        Line::from(vec![
+            Span::styled("  slash: ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(
+                "/help /stats /export /export-html /rename <n> /new /switch <p> /fork /compact",
+                Style::default().fg(Color::Yellow),
+            ),
         ]),
         Line::from(vec![
             kb("Esc"),
             Span::raw(" abort/clear/quit · "),
             kb("Ctrl+C"),
             Span::raw(" quit"),
+        ]),
+        Line::from(vec![
+            kb("Ctrl+R"),
+            Span::raw(" history search · "),
+            kb("Ctrl+S"),
+            Span::raw(" export markdown · "),
+            kb("↑/↓"),
+            Span::raw(" history"),
         ]),
         Line::default(),
         Line::from(vec![kb("Ctrl+T"), Span::raw(" toggle thinking blocks")]),
@@ -2189,6 +2435,45 @@ fn thinking_text(radio: &RadioModal<ThinkingLevel>) -> Text<'static> {
             ])
         })
         .collect();
+    Text::from(lines)
+}
+
+fn forks_text(list: &ListModal<ForkMessage>) -> Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("filter: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(
+            list.query.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::default());
+    let filtered: Vec<&ForkMessage> = filtered_forks(&list.items, &list.query).collect();
+    for (i, f) in filtered.iter().enumerate() {
+        let marker = if i == list.selected { "▸" } else { " " };
+        let style = if i == list.selected {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), style),
+            Span::styled(
+                truncate_preview(&f.entry_id, 10),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw("  "),
+            Span::styled(truncate_preview(&f.text.replace('\n', " ⏎ "), 200), style),
+        ]));
+    }
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no fork candidates)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
     Text::from(lines)
 }
 
