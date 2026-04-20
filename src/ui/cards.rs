@@ -6,10 +6,11 @@
 //! about wrapping.
 
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 
 use crate::theme::Theme;
 
@@ -43,7 +44,14 @@ impl Card {
         body_h.saturating_add(2) // top + bottom border
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect, _theme: &Theme) {
+    pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) {
+        self.render_to_buffer(area, f.buffer_mut(), theme);
+    }
+
+    /// Render into any buffer at `area`. Used directly by `render` and also
+    /// by the transcript virtualization path when it needs a scratch buffer
+    /// to clip a tall card to the visible window.
+    pub fn render_to_buffer(&self, area: Rect, buf: &mut Buffer, _theme: &Theme) {
         let border_style = Style::default().fg(self.border_color);
         // Swap border weight based on focus so the focused card is obviously
         // different, without changing hue (role colors stay meaningful).
@@ -103,7 +111,7 @@ impl Card {
         }
 
         let inner = block.inner(area);
-        f.render_widget(block, area);
+        block.render(area, buf);
 
         // Body with one-column left padding for breathing room.
         let pad = Rect::new(
@@ -112,10 +120,9 @@ impl Card {
             inner.width.saturating_sub(2),
             inner.height,
         );
-        f.render_widget(
-            Paragraph::new(self.body.clone()).wrap(Wrap { trim: false }),
-            pad,
-        );
+        Paragraph::new(self.body.clone())
+            .wrap(Wrap { trim: false })
+            .render(pad, buf);
     }
 }
 

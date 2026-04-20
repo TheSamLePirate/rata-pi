@@ -2348,6 +2348,56 @@ impl Visual {
             Self::Inline(r) => r.render(f, area),
         }
     }
+
+    /// Render a visual into `target` when part of it is scrolled off the
+    /// top (`skip > 0`) and/or the bottom extends below the viewport.
+    ///
+    /// Strategy: allocate a scratch `Buffer` sized to the visual's *full*
+    /// height, render into it, then copy the visible rows into the frame.
+    /// This gives correct output for both partial-top and partial-bottom
+    /// cases — including the auto-follow "show the tail of a long card"
+    /// case where the top of the card is off-screen but the last N rows
+    /// (including the bottom border) must be visible.
+    fn render_clipped(
+        &self,
+        f: &mut ratatui::Frame,
+        target: Rect,
+        idx: usize,
+        app: &App,
+        skip: u16,
+        full_h: u16,
+    ) {
+        use ratatui::buffer::Buffer;
+        let full = Rect::new(0, 0, target.width.max(1), full_h.max(1));
+        let mut scratch = Buffer::empty(full);
+        match self {
+            Self::Card(c) => {
+                let mut c = c.clone();
+                c.focused = app.focus_idx == Some(idx);
+                c.render_to_buffer(full, &mut scratch, &app.theme);
+            }
+            Self::Inline(r) => {
+                use ratatui::widgets::{Paragraph, Widget, Wrap};
+                Paragraph::new(r.lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .render(full, &mut scratch);
+            }
+        }
+        // Blit [skip .. skip + target.height] from scratch into the frame.
+        let frame_buf = f.buffer_mut();
+        for dy in 0..target.height {
+            let src_y = skip.saturating_add(dy);
+            if src_y >= full.height {
+                break;
+            }
+            for dx in 0..target.width {
+                let src_pos = (dx, src_y);
+                let dst_pos = (target.x + dx, target.y + dy);
+                let cell = scratch[src_pos].clone();
+                frame_buf[dst_pos] = cell;
+            }
+        }
+    }
 }
 
 fn build_visuals(app: &App) -> Vec<Visual> {
@@ -3124,29 +3174,22 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
         if draw_h == 0 {
             break;
         }
-        // If we have to skip rows of this card, use a clipped sub-area.
-        // We render the card into a rect that's the FULL card height so its
-        // contents aren't distorted, then set a Clip rect via Clear; simpler:
-        // stash the effective top by rendering in a taller virtual rect with
-        // a negative y offset. Ratatui doesn't support negative y, so instead
-        // we render at a rect whose y = draw_y - skip and rely on Frame's
-        // clip. To keep this simple, we skip partial-first-card rendering and
-        // start drawing from the entry fully — the max_offset + auto-follow
-        // guarantees we never need partials when live-tail is on. Manual
-        // scroll CAN cut a card but we clamp to card boundaries below.
-        let card_rect = Rect::new(content.x, draw_y, content.width, draw_h.min(*h));
-        if skip == 0 {
-            v.render(f, card_rect, i, app);
+        let target = Rect::new(content.x, draw_y, content.width, draw_h);
+        if skip == 0 && draw_h >= *h {
+            // Card fully fits: draw normally.
+            v.render(f, target, i, app);
         } else {
-            // Card straddles top: fade its first visible row with a dim note.
-            let mut bumped = card_rect;
-            // Shrink so the first `skip` rows aren't drawn.
-            bumped.height = (*h).saturating_sub(skip).min(remaining_vertical);
-            // Render a synthetic "…" header in place, then body below.
-            render_cutoff_hint(f, Rect::new(bumped.x, bumped.y, bumped.width, 1), t);
-            if bumped.height > 1 {
-                let sub = Rect::new(bumped.x, bumped.y + 1, bumped.width, bumped.height - 1);
-                v.render(f, sub, i, app);
+            // Either the top is scrolled off (skip > 0) or the card is
+            // taller than the remaining viewport (bottom is cut). Render
+            // the full card into a scratch buffer, then blit the visible
+            // slice into the frame's buffer. Guarantees the tail of a
+            // long streaming assistant card is always in view in auto-
+            // follow mode.
+            v.render_clipped(f, target, i, app, skip, *h);
+            if skip > 0 {
+                // Paint a subtle "continues above" hint on the first visible
+                // row so the user knows there's earlier content.
+                render_cutoff_hint(f, Rect::new(target.x, target.y, target.width, 1), t);
             }
         }
         draw_y = draw_y.saturating_add(draw_h);
