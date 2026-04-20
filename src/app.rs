@@ -797,20 +797,40 @@ async fn ui_loop(
     let mut stats_tick = tokio::time::interval(Duration::from_secs(5));
     stats_tick.tick().await;
 
+    // 30 fps soft cap on redraws. During heavy pi streaming we coalesce
+    // bursts of events under a single render so the markdown / syntect /
+    // virtualization work doesn't swamp the runtime.
+    const MIN_FRAME: Duration = Duration::from_millis(33);
+    let mut last_draw = tokio::time::Instant::now()
+        .checked_sub(MIN_FRAME * 2)
+        .unwrap_or_else(tokio::time::Instant::now);
+
     loop {
-        terminal.draw(|f| draw(f, app))?;
+        if tokio::time::Instant::now().duration_since(last_draw) >= MIN_FRAME {
+            terminal.draw(|f| draw(f, app))?;
+            last_draw = tokio::time::Instant::now();
+        }
         if app.quit {
             break;
         }
 
         tokio::select! {
-            Some(msg) = events.recv() => handle_incoming(msg, app, client).await,
+            Some(msg) = events.recv() => {
+                handle_incoming(msg, app, client).await;
+                // Drain any additional buffered events so one redraw covers
+                // a whole text_delta burst instead of re-rendering per token.
+                for _ in 0..64 {
+                    match events.try_recv() {
+                        Ok(msg) => handle_incoming(msg, app, client).await,
+                        Err(_) => break,
+                    }
+                }
+            }
             Some(Ok(ev)) = crossterm_events.next() => handle_crossterm(ev, app, client).await,
             _ = tick.tick() => {
                 app.ticks = app.ticks.wrapping_add(1);
                 app.tick_status();
                 app.clamp_focus();
-                // Expire flash after ~1.5s.
                 if let Some((_, at)) = app.flash
                     && app.ticks.wrapping_sub(at) > 15 {
                     app.flash = None;
@@ -2352,12 +2372,12 @@ impl Visual {
     /// Render a visual into `target` when part of it is scrolled off the
     /// top (`skip > 0`) and/or the bottom extends below the viewport.
     ///
-    /// Strategy: allocate a scratch `Buffer` sized to the visual's *full*
-    /// height, render into it, then copy the visible rows into the frame.
-    /// This gives correct output for both partial-top and partial-bottom
-    /// cases — including the auto-follow "show the tail of a long card"
-    /// case where the top of the card is off-screen but the last N rows
-    /// (including the bottom border) must be visible.
+    /// Allocation-free: we use `Block::borders` to opt in/out of each
+    /// border edge (top border is omitted when clipped from above, bottom
+    /// when clipped from below) and `Paragraph::scroll` on the body to
+    /// shift it by the appropriate wrapped-row count. This is what makes
+    /// long streaming assistant cards cheap to render — no per-frame
+    /// scratch `Buffer` sized to the full card height.
     fn render_clipped(
         &self,
         f: &mut ratatui::Frame,
@@ -2367,37 +2387,129 @@ impl Visual {
         skip: u16,
         full_h: u16,
     ) {
-        use ratatui::buffer::Buffer;
-        let full = Rect::new(0, 0, target.width.max(1), full_h.max(1));
-        let mut scratch = Buffer::empty(full);
         match self {
-            Self::Card(c) => {
-                let mut c = c.clone();
-                c.focused = app.focus_idx == Some(idx);
-                c.render_to_buffer(full, &mut scratch, &app.theme);
-            }
+            Self::Card(c) => render_card_clipped(f, target, c, app, idx, skip, full_h),
             Self::Inline(r) => {
-                use ratatui::widgets::{Paragraph, Widget, Wrap};
-                Paragraph::new(r.lines.clone())
-                    .wrap(Wrap { trim: false })
-                    .render(full, &mut scratch);
-            }
-        }
-        // Blit [skip .. skip + target.height] from scratch into the frame.
-        let frame_buf = f.buffer_mut();
-        for dy in 0..target.height {
-            let src_y = skip.saturating_add(dy);
-            if src_y >= full.height {
-                break;
-            }
-            for dx in 0..target.width {
-                let src_pos = (dx, src_y);
-                let dst_pos = (target.x + dx, target.y + dy);
-                let cell = scratch[src_pos].clone();
-                frame_buf[dst_pos] = cell;
+                use ratatui::widgets::{Paragraph, Wrap};
+                f.render_widget(
+                    Paragraph::new(r.lines.clone())
+                        .wrap(Wrap { trim: false })
+                        .scroll((skip, 0)),
+                    target,
+                );
             }
         }
     }
+}
+
+/// Partial-card renderer: selectively omits the top / bottom border edges
+/// when the card is clipped and uses `Paragraph::scroll` to skip body rows.
+/// Avoids allocating a scratch buffer sized to the full card.
+fn render_card_clipped(
+    f: &mut ratatui::Frame,
+    target: Rect,
+    card: &crate::ui::cards::Card,
+    app: &App,
+    idx: usize,
+    skip: u16,
+    full_h: u16,
+) {
+    let focused = app.focus_idx == Some(idx);
+    let show_top = skip == 0;
+    let show_bottom = skip.saturating_add(target.height) >= full_h;
+
+    let mut borders = Borders::LEFT | Borders::RIGHT;
+    if show_top {
+        borders |= Borders::TOP;
+    }
+    if show_bottom {
+        borders |= Borders::BOTTOM;
+    }
+
+    let btype = if focused {
+        BorderType::Double
+    } else {
+        BorderType::Rounded
+    };
+    let border_style = Style::default().fg(card.border_color);
+
+    let focus_mark = if focused && show_top {
+        vec![
+            Span::styled(
+                " ▶",
+                Style::default()
+                    .fg(card.border_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]
+    } else if show_top {
+        vec![Span::raw(" ")]
+    } else {
+        // No top border, no title room.
+        Vec::new()
+    };
+
+    let mut block = Block::default()
+        .borders(borders)
+        .border_type(btype)
+        .border_style(border_style);
+    if show_top {
+        let mut title_spans = focus_mark;
+        title_spans.extend([
+            Span::styled(
+                card.icon.to_string(),
+                Style::default()
+                    .fg(card.icon_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                card.title.clone(),
+                Style::default()
+                    .fg(card.title_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]);
+        block = block.title(Line::from(title_spans));
+        if let Some(r) = &card.right_title {
+            block = block.title_top(
+                Line::from(vec![Span::styled(
+                    format!(" {r} "),
+                    Style::default().fg(card.border_color),
+                )])
+                .right_aligned(),
+            );
+        }
+    }
+
+    let inner = block.inner(target);
+    f.render_widget(block, target);
+
+    // How many wrapped body rows to skip. If we drew a top border, body
+    // starts at `inner.y` (row 1 of the card). If we didn't, `inner.y`
+    // corresponds to body row `skip - (was there a top border? 0 : ?)`.
+    //
+    // Layout of a full card: row 0 = top border, rows 1..=body_h = body,
+    // row body_h+1 = bottom border. skip rows are removed from the top of
+    // the card. If show_top, skip == 0 so body_skip = 0. If !show_top,
+    // we already ate the top border's 1 row in skip, so body rows to skip
+    // = skip - 1.
+    let body_skip = if show_top { 0 } else { skip.saturating_sub(1) };
+
+    let pad = Rect::new(
+        inner.x.saturating_add(1),
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
+    );
+    f.render_widget(
+        Paragraph::new(card.body.clone())
+            .wrap(Wrap { trim: false })
+            .scroll((body_skip, 0)),
+        pad,
+    );
 }
 
 fn build_visuals(app: &App) -> Vec<Visual> {
