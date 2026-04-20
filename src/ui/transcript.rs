@@ -22,6 +22,10 @@ pub enum Entry {
     Error(String),
     Compaction(Compaction),
     Retry(Retry),
+    /// Horizontal turn divider (emitted on `turn_start`).
+    TurnMarker {
+        number: u32,
+    },
 }
 
 #[derive(Debug, Clone)]

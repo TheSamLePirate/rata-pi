@@ -1,8 +1,10 @@
 pub mod ansi;
 pub mod cards;
 pub mod commands;
+pub mod diff;
 pub mod export;
 pub mod ext_ui;
 pub mod markdown;
 pub mod modal;
+pub mod syntax;
 pub mod transcript;

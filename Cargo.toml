@@ -37,6 +37,12 @@ directories = "6"
 
 # Rendering
 pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5", default-features = false, features = [
+    "parsing",
+    "default-syntaxes",
+    "default-themes",
+    "regex-fancy",
+] }
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]

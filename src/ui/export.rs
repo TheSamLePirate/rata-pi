@@ -71,6 +71,9 @@ pub fn render(transcript: &Transcript) -> String {
             }
             Entry::Compaction(c) => render_compaction(&mut out, c),
             Entry::Retry(r) => render_retry(&mut out, r),
+            Entry::TurnMarker { number } => {
+                out.push_str(&format!("\n---\n\n**turn {number}**\n\n"));
+            }
         }
     }
     out

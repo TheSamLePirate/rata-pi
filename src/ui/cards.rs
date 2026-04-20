@@ -44,13 +44,32 @@ impl Card {
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect, _theme: &Theme) {
-        let mut border_style = Style::default().fg(self.border_color);
-        if self.focused {
-            border_style = border_style.add_modifier(Modifier::BOLD);
-        }
+        let border_style = Style::default().fg(self.border_color);
+        // Swap border weight based on focus so the focused card is obviously
+        // different, without changing hue (role colors stay meaningful).
+        let btype = if self.focused {
+            BorderType::Double
+        } else {
+            BorderType::Rounded
+        };
 
-        let title_line = Line::from(vec![
-            Span::raw(" "),
+        // Leading marker + icon + title. The marker only appears when
+        // focused so the focused card gets a very clear "you are here" cue.
+        let focus_mark = if self.focused {
+            vec![
+                Span::styled(
+                    " ▶",
+                    Style::default()
+                        .fg(self.border_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ]
+        } else {
+            vec![Span::raw(" ")]
+        };
+        let mut title_spans = focus_mark;
+        title_spans.extend([
             Span::styled(
                 self.icon.to_string(),
                 Style::default()
@@ -66,10 +85,11 @@ impl Card {
             ),
             Span::raw(" "),
         ]);
+        let title_line = Line::from(title_spans);
 
         let mut block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(btype)
             .border_style(border_style)
             .title(title_line);
         if let Some(r) = &self.right_title {

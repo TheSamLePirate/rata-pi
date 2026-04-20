@@ -28,6 +28,10 @@ struct Renderer {
     list_stack: Vec<ListState>,
     link_targets: Vec<String>,
     in_code_block: bool,
+    /// Buffer for the current fenced code block — tokenized via syntect on
+    /// End(CodeBlock).
+    code_buf: String,
+    code_lang: String,
     /// Deferred: we suppress the blank line inserted after a block element when
     /// the next event is also a block-terminating one, to avoid double spacing.
     last_was_block_end: bool,
@@ -160,20 +164,34 @@ impl Renderer {
             Event::Start(Tag::CodeBlock(kind)) => {
                 self.flush_current();
                 self.in_code_block = true;
-                let lang = match kind {
-                    CodeBlockKind::Fenced(l) if !l.is_empty() => format!("┄ {l} ┄"),
-                    _ => "┄".to_string(),
+                self.code_buf.clear();
+                self.code_lang = match kind {
+                    CodeBlockKind::Fenced(l) => l.to_string(),
+                    _ => String::new(),
                 };
-                self.lines
-                    .push(Line::styled(lang, Style::default().fg(Color::DarkGray)));
-                self.push_style(Modifier::empty(), Some(Color::Yellow));
+                // Top chip: language tag, right-aligned in dim gray.
+                let lang_chip = if self.code_lang.is_empty() {
+                    "┄─────".to_string()
+                } else {
+                    format!("┄─── {} ───┄", self.code_lang)
+                };
+                self.lines.push(Line::styled(
+                    lang_chip,
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
             Event::End(TagEnd::CodeBlock) => {
-                self.pop_style();
-                self.flush_current();
+                // Tokenize the buffered code via syntect, inject the resulting
+                // lines verbatim. Strip a final newline so we don't emit a
+                // trailing empty row.
+                let code = std::mem::take(&mut self.code_buf);
+                let lang = std::mem::take(&mut self.code_lang);
+                for l in crate::ui::syntax::highlight(&code, &lang) {
+                    self.lines.push(l);
+                }
                 self.in_code_block = false;
                 self.lines.push(Line::styled(
-                    "┄".to_string(),
+                    "└──────".to_string(),
                     Style::default().fg(Color::DarkGray),
                 ));
                 self.blank_line();
@@ -254,16 +272,28 @@ impl Renderer {
                 ));
             }
 
-            Event::Text(t) => self.push_text(&t),
+            Event::Text(t) => {
+                if self.in_code_block {
+                    self.code_buf.push_str(&t);
+                } else {
+                    self.push_text(&t);
+                }
+            }
 
             Event::SoftBreak => {
                 if self.in_code_block {
-                    self.break_line();
+                    self.code_buf.push('\n');
                 } else {
                     self.cur.push(Span::raw(" "));
                 }
             }
-            Event::HardBreak => self.break_line(),
+            Event::HardBreak => {
+                if self.in_code_block {
+                    self.code_buf.push('\n');
+                } else {
+                    self.break_line();
+                }
+            }
 
             Event::TaskListMarker(done) => {
                 let s = if done { "[x] " } else { "[ ] " };

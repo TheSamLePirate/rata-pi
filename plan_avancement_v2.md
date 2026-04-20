@@ -145,19 +145,44 @@ Also folds in V2.0 bug fixes the user reported (see "Fixes" below).
 
 ---
 
-## V2.3 — Syntect + diff widget + extended markdown
+## V2.3 — Syntect + diff widget + per-tool renderers ✅ (core)
 
-- [ ] `syntect` integration (default-on via `syntax` feature)
-- [ ] Markdown fenced code → syntect-highlighted lines
-- [ ] `diff.rs` widget: unified by default, side-by-side via `d/D`
-- [ ] Auto-detect lang from diff header path or fence tag
-- [ ] Line-numbers toggle (`Ctrl+Shift+L`)
-- [ ] Tool renderer registry: bash / read_file / edit / apply_patch / str_replace / grep / todo / unknown
-- [ ] Each tool renderer owns its card body
-- [ ] Markdown table rendering (ratatui Table widget)
-- [ ] Syntax-theme fallback when user's theme doesn't define one
+### Delivered
+- [x] **syntect integration** (`src/ui/syntax.rs`) — OnceLock-loaded SyntaxSet + `base16-ocean.dark` theme; `highlight(code, lang_hint) -> Vec<Line<'static>>`. Lang detection tries token → extension → case-insensitive name → plain-text. Default features stripped to: `parsing`, `default-syntaxes`, `default-themes`, `regex-fancy` (pure-Rust regex, no C dep).
+- [x] **Markdown fenced code** now tokenizes through syntect. The markdown renderer buffers text during `Start(CodeBlock)…End(CodeBlock)`, then emits the highlighted lines surrounded by `┄─── lang ───┄` / `└──────` chip rows for a clean "code block" frame.
+- [x] **Inline unified-diff widget** (`src/ui/diff.rs`) — `is_unified_diff(s)` heuristic + `render(diff, theme)`. Output:
+  - File-header rows in `diff_file` (cyan bold)
+  - `@@` hunk rows in `diff_hunk` (magenta)
+  - Body rows with a **two-number gutter** (`old_ln / new_ln`) + a `+` / `-` / `space` chip + the line body
+  - Context lines get **syntect-highlighted** when the `+++` header carries a file path we can derive a lang from (e.g. `+++ b/src/app.rs` → Rust highlight on surrounding context)
+- [x] **Per-tool body dispatcher** with 7 families (`tool_family` match): `bash`, `edit` (covers `edit` / `apply_patch` / `str_replace` / `str_replace_editor` / `multi_edit` / `patch`), `read_file` (covers `read` / `readfile` / `view` / `cat`), `grep` (covers `grep` / `search` / `rg` / `ripgrep`), `write` (covers `write` / `write_file` / `create`), `todo` (covers `todo` / `todowrite` / `tasks`), generic fallback.
+  - **Edit family**: synthesizes a mini diff from `old_string` / `new_string` when those args are present, runs it through syntect with the file extension as lang hint. Unified-diff output from pi is routed to `diff::render`.
+  - **Read family**: `path` chip in the body; collapsed shows "N lines — Enter / Ctrl+E to view"; expanded runs the file content through syntect using the extension. `strip_line_numbers` removes common `N→content` prefixes so syntect tokenizes clean source.
+  - **Grep family**: `"pattern"` chip; results grouped by file (file name on its own line in accent, hits indented under it).
+  - **Write family**: `path` chip + syntect-highlighted content.
+  - **Todo family**: `☐ / ◐ / ☑` by status, coloured dim / warning / success.
+  - **Bash family**: keeps the existing BashExec card path.
+- [x] **Tool card title/chip redesign** — title is `▸ tool_name` with a family-specific left icon (`±` / `▤` / `⌕` / `✎` / `☐` / `⚙`). The right-chip shows the primary arg (`file_path`, `pattern`, `command`) when present, falling back to `✓ ok` / `✗ error` / `⚙ running`.
+- [x] **Turn separator** — `Entry::TurnMarker { number }` pushed on `Incoming::TurnStart` (from the second turn onward). Renders as a centered `──── turn N ────────` divider between cards.
+- [x] **Focus-border fixes** — responds to the user bug report. Focused cards now use `BorderType::Double` (instead of a subtle `Modifier::BOLD` which many terminals render indistinguishably) and prepend a `▶` marker in the title. Border stays role-coloured so User/Thinking/Assistant/Tool semantics remain meaningful.
+- [x] Export (`ui/export.rs`) gets a markdown `---` + **turn N** divider for TurnMarker entries so exports show the turn structure too.
 
-**Notes:** _(to fill in)_
+### Deferred
+- [ ] Side-by-side diff (`d/D`) — unified is the right default; side-by-side needs width-aware column split and I didn't want to bloat V2.3.
+- [ ] Line-numbers toggle (`Ctrl+Shift+L`) — diff widget already shows both old/new numbers; the toggle is mostly for read_file syntect renders. Add with V2.4.
+- [ ] Markdown table rendering — pulldown-cmark table events still fall through; will use ratatui's Table widget in a V2.4 / V2.5 follow-up.
+- [ ] Cache compiled syntax references per-file — syntect re-tokenizes on every streaming redraw. Fine for sub-400-line content, but add an LRU cache if profiling shows stutter on long assistant responses.
+
+### Tests
+- 70 pass (V2.2 63 + 3 syntax + 4 diff).
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo fmt --check` clean.
+
+**Notes:**
+- `syntect` adds ~3 MiB to debug binary and ~2 MiB to `--release -s` builds — acceptable for the visual win.
+- Regex flavor `regex-fancy` was chosen over `regex-onig` to avoid a C dep; some edge-case syntax definitions fall back gracefully.
+- `base16-ocean.dark` was picked over prettier options because it's bundled with syntect (no separate `.tmTheme` file) and its palette reads on every rata-pi theme.
+- TurnMarker intentionally doesn't fire before turn 1 — a leading divider looks wrong on first prompt.
 
 ---
 
