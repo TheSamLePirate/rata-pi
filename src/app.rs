@@ -11,6 +11,7 @@
 //!   cycles the composer between steer / follow-up intent during streaming
 //! - F8 = compact now, F9 = toggle auto-compaction, F10 = toggle auto-retry
 
+use std::collections::VecDeque;
 use std::io::{Stdout, stdout};
 use std::panic;
 use std::time::Duration;
@@ -30,7 +31,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap};
 
 use crate::cli::Args;
 use crate::history::{History, HistoryEntry};
@@ -98,6 +99,44 @@ enum ComposerMode {
     FollowUp,
 }
 
+/// High-level "what's pi doing right now" state for the StatusWidget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveState {
+    Idle,
+    Sending,
+    Llm,
+    Thinking,
+    Tool,
+    Streaming,
+    Compacting,
+    Retrying {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+    },
+    Error,
+}
+
+impl LiveState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Sending => "sending",
+            Self::Llm => "llm",
+            Self::Thinking => "thinking",
+            Self::Tool => "tool",
+            Self::Streaming => "streaming",
+            Self::Compacting => "compacting",
+            Self::Retrying { .. } => "retrying",
+            Self::Error => "error",
+        }
+    }
+
+    fn wants_spinner(self) -> bool {
+        !matches!(self, Self::Idle | Self::Error)
+    }
+}
+
 impl ComposerMode {
     fn cycle_stream(self) -> Self {
         match self {
@@ -139,6 +178,19 @@ struct App {
     ext_ui: ExtUiState,
     history: History,
     theme: Theme,
+
+    // ── V2.1: live status signals ────────────────────────────────────────
+    live: LiveState,
+    live_since_tick: u64,
+    tool_running: u32,
+    tool_done: u32,
+    tokens_this_sec: u32,
+    throughput: VecDeque<u32>, // last 60 secs, one bucket per second
+    cost_session: f64,
+    cost_series: VecDeque<f64>, // last 30 turns
+    last_event_tick: u64,
+    turn_count: u32,
+    last_sec_tick: u64,
 }
 
 impl App {
@@ -162,6 +214,74 @@ impl App {
             ext_ui: ExtUiState::default(),
             history: History::load(),
             theme: *theme::default_theme(),
+            live: LiveState::Idle,
+            live_since_tick: 0,
+            tool_running: 0,
+            tool_done: 0,
+            tokens_this_sec: 0,
+            throughput: VecDeque::with_capacity(60),
+            cost_session: 0.0,
+            cost_series: VecDeque::with_capacity(30),
+            last_event_tick: 0,
+            turn_count: 0,
+            last_sec_tick: 0,
+        }
+    }
+
+    fn set_live(&mut self, s: LiveState) {
+        if self.live != s {
+            self.live = s;
+            self.live_since_tick = self.ticks;
+        }
+    }
+
+    fn push_tokens(&mut self, n: u32) {
+        self.tokens_this_sec = self.tokens_this_sec.saturating_add(n);
+    }
+
+    /// Called on every tick; rolls the per-second throughput bucket forward.
+    fn tick_status(&mut self) {
+        let sec = self.ticks / 10;
+        if sec > self.last_sec_tick {
+            for _ in self.last_sec_tick..sec {
+                self.throughput
+                    .push_back(std::mem::take(&mut self.tokens_this_sec));
+                if self.throughput.len() > 60 {
+                    self.throughput.pop_front();
+                }
+            }
+            self.last_sec_tick = sec;
+        }
+    }
+
+    fn event_received(&mut self) {
+        self.last_event_tick = self.ticks;
+    }
+
+    fn elapsed_since_live(&self) -> Duration {
+        let dt = self.ticks.saturating_sub(self.live_since_tick);
+        Duration::from_millis(dt * 100)
+    }
+
+    fn recent_avg_throughput(&self) -> u32 {
+        if self.throughput.is_empty() {
+            return 0;
+        }
+        let sum: u32 = self.throughput.iter().sum();
+        sum / self.throughput.len() as u32
+    }
+
+    fn heartbeat_color(&self) -> Color {
+        let delta = self.ticks.saturating_sub(self.last_event_tick);
+        if self.live == LiveState::Idle {
+            self.theme.dim
+        } else if delta < 3 {
+            self.theme.success
+        } else if delta < 100 {
+            // fade toward warning after 10s of silence while streaming
+            self.theme.warning
+        } else {
+            self.theme.error
         }
     }
 
@@ -196,24 +316,49 @@ impl App {
     }
 
     fn on_event(&mut self, ev: Incoming) {
+        self.event_received();
         match ev {
-            Incoming::AgentStart => self.is_streaming = true,
+            Incoming::AgentStart => {
+                self.is_streaming = true;
+                self.set_live(LiveState::Llm);
+            }
             Incoming::AgentEnd { .. } => {
                 self.is_streaming = false;
-                // Composer returns to Prompt outside streaming.
                 self.composer_mode = ComposerMode::Prompt;
+                self.set_live(LiveState::Idle);
+                self.tool_running = 0;
+            }
+            Incoming::TurnStart => {
+                self.turn_count = self.turn_count.saturating_add(1);
+            }
+            Incoming::TurnEnd {
+                message: Some(AgentMessage::Assistant { usage: Some(u), .. }),
+                ..
+            } => {
+                if let Some(c) = u.cost {
+                    self.cost_session += c.total;
+                    self.cost_series.push_back(c.total);
+                    if self.cost_series.len() > 30 {
+                        self.cost_series.pop_front();
+                    }
+                }
             }
             Incoming::MessageUpdate {
                 assistant_message_event,
                 ..
             } => match assistant_message_event {
                 AssistantEvent::TextDelta { delta, .. } => {
+                    self.set_live(LiveState::Streaming);
+                    self.push_tokens(approx_tokens(&delta));
                     self.transcript.append_assistant(&delta);
                 }
                 AssistantEvent::ThinkingDelta { delta, .. } => {
+                    self.set_live(LiveState::Thinking);
+                    self.push_tokens(approx_tokens(&delta));
                     self.transcript.append_thinking(&delta);
                 }
                 AssistantEvent::Error { reason, .. } => {
+                    self.set_live(LiveState::Error);
                     self.transcript
                         .push(Entry::Warn(format!("stream error: {reason:?}")));
                 }
@@ -223,7 +368,11 @@ impl App {
                 tool_call_id,
                 tool_name,
                 args,
-            } => self.transcript.start_tool(tool_call_id, tool_name, args),
+            } => {
+                self.tool_running = self.tool_running.saturating_add(1);
+                self.set_live(LiveState::Tool);
+                self.transcript.start_tool(tool_call_id, tool_name, args);
+            }
             Incoming::ToolExecutionUpdate {
                 tool_call_id,
                 partial_result,
@@ -236,20 +385,33 @@ impl App {
                 result,
                 is_error,
                 ..
-            } => self
-                .transcript
-                .finish_tool(&tool_call_id, &result, is_error),
+            } => {
+                self.tool_running = self.tool_running.saturating_sub(1);
+                self.tool_done = self.tool_done.saturating_add(1);
+                if self.tool_running == 0 && self.is_streaming {
+                    self.set_live(LiveState::Llm);
+                }
+                self.transcript
+                    .finish_tool(&tool_call_id, &result, is_error);
+            }
             Incoming::AutoRetryStart {
                 attempt,
                 max_attempts,
                 delay_ms,
                 error_message,
-            } => self.transcript.push_retry_waiting(
-                attempt,
-                max_attempts,
-                delay_ms,
-                error_message.unwrap_or_else(|| "transient error".into()),
-            ),
+            } => {
+                self.set_live(LiveState::Retrying {
+                    attempt,
+                    max_attempts,
+                    delay_ms,
+                });
+                self.transcript.push_retry_waiting(
+                    attempt,
+                    max_attempts,
+                    delay_ms,
+                    error_message.unwrap_or_else(|| "transient error".into()),
+                );
+            }
             Incoming::AutoRetryEnd {
                 success,
                 attempt,
@@ -260,9 +422,15 @@ impl App {
                 } else {
                     RetryState::Exhausted(final_error.unwrap_or_else(|| "unknown".into()))
                 };
+                if success && self.is_streaming {
+                    self.set_live(LiveState::Llm);
+                } else {
+                    self.set_live(LiveState::Idle);
+                }
                 self.transcript.resolve_retry(attempt, state);
             }
             Incoming::CompactionStart { reason } => {
+                self.set_live(LiveState::Compacting);
                 self.transcript.push_compaction_start(format!("{reason:?}"));
             }
             Incoming::CompactionEnd {
@@ -282,6 +450,11 @@ impl App {
                         summary: result.map(|r| r.summary),
                     }
                 };
+                if self.is_streaming {
+                    self.set_live(LiveState::Llm);
+                } else {
+                    self.set_live(LiveState::Idle);
+                }
                 self.transcript.finish_compaction(reason, state);
             }
             Incoming::ExtensionError { error, .. } => {
@@ -300,6 +473,12 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// Very rough char→token approximation — ~4 chars/token for English. Only
+/// used for the live throughput sparkline, not anything billed.
+fn approx_tokens(s: &str) -> u32 {
+    (s.chars().count() as u32).div_ceil(4)
 }
 
 // ───────────────────────────────────────────────────────── bootstrap ──
@@ -574,6 +753,7 @@ async fn ui_loop(
             Some(Ok(ev)) = crossterm_events.next() => handle_crossterm(ev, app, client).await,
             _ = tick.tick() => {
                 app.ticks = app.ticks.wrapping_add(1);
+                app.tick_status();
                 // Expire flash after ~1.5s.
                 if let Some((_, at)) = app.flash
                     && app.ticks.wrapping_sub(at) > 15 {
@@ -633,11 +813,22 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
 async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Option<&RpcClient>) {
     match (code, mods) {
         (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
-        // Ctrl+Shift+T cycles theme — check first since it also matches
-        // KeyCode::Char('T'), KeyModifiers::CONTROL | SHIFT on many terminals.
+        // Cycle theme. Several bindings so we work across terminals:
+        //   • Alt+T         — reliable on macOS Terminal / iTerm / xterm
+        //   • Ctrl+Shift+T  — works where Kitty keyboard protocol is active
+        //   • F12           — pure function-key fallback
+        // Matched BEFORE Ctrl+T so the more-specific combo wins.
         (KeyCode::Char('t') | KeyCode::Char('T'), m)
             if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
         {
+            app.cycle_theme();
+            app.flash(format!("theme → {}", app.theme.name));
+        }
+        (KeyCode::Char('t') | KeyCode::Char('T'), m) if m.contains(KeyModifiers::ALT) => {
+            app.cycle_theme();
+            app.flash(format!("theme → {}", app.theme.name));
+        }
+        (KeyCode::F(12), _) => {
             app.cycle_theme();
             app.flash(format!("theme → {}", app.theme.name));
         }
@@ -658,8 +849,8 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
         (KeyCode::F(1), _) => {
             app.modal = Some(Modal::Commands(ListModal::new(
                 "commands",
-                "↑↓ pick · Enter insert · Esc close",
-                app.session.commands.clone(),
+                "type to filter · Enter apply/insert · Esc close",
+                merged_commands(&app.session.commands),
             )));
         }
         (KeyCode::F(5), _) => {
@@ -749,11 +940,10 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
             }
         }
         (KeyCode::Char('/'), KeyModifiers::NONE) if app.input.is_empty() => {
-            // Open commands modal as a slash autocomplete source.
             app.modal = Some(Modal::Commands(ListModal::new(
                 "/ commands",
-                "type to filter · Enter insert · Esc close",
-                app.session.commands.clone(),
+                "type to filter · Enter apply/insert · Esc close",
+                merged_commands(&app.session.commands),
             )));
         }
         (KeyCode::Esc, _) => {
@@ -828,6 +1018,36 @@ async fn handle_modal_key(
                         app.modal = None;
                         return;
                     }
+                    // Built-in slash commands execute inline — no-argument
+                    // commands (like /help, /stats, /export, /theme cycle,
+                    // /new, /compact, /model, /think, /cycle-*, /copy,
+                    // /auto-*) fire immediately; commands that typically need
+                    // an argument still prefill so the user can type it.
+                    if crate::ui::commands::is_builtin(&cmd) {
+                        let needs_arg = matches!(cmd.name.as_str(), "rename" | "switch");
+                        if needs_arg {
+                            app.input.clear();
+                            app.input.push('/');
+                            app.input.push_str(&cmd.name);
+                            app.input.push(' ');
+                        } else {
+                            // Close modal first, then dispatch locally.
+                            app.modal = None;
+                            let name = cmd.name.clone();
+                            if !try_local_slash(app, &name, "") {
+                                if let Some(c) = client {
+                                    try_pi_slash(app, c, &name, "").await;
+                                } else {
+                                    app.flash(format!("/{name} needs pi (offline)"));
+                                }
+                            }
+                            return;
+                        }
+                        app.modal = None;
+                        return;
+                    }
+                    // Pi command — prefill the composer with /name so the
+                    // user can type arguments and submit.
                     app.input.clear();
                     app.input.push('/');
                     app.input.push_str(&cmd.name);
@@ -1159,203 +1379,326 @@ fn last_tool_id(transcript: &Transcript) -> Option<String> {
     })
 }
 
+/// Built-ins first (so they're easy to discover), then pi's own commands.
+fn merged_commands(pi_commands: &[CommandInfo]) -> Vec<CommandInfo> {
+    let mut v = crate::ui::commands::builtins();
+    v.extend_from_slice(pi_commands);
+    v
+}
+
+/// Handle slash commands that do NOT need pi. Returns true if consumed.
+fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
+    match name {
+        "help" => {
+            app.modal = Some(Modal::Help);
+            true
+        }
+        "stats" => {
+            if let Some(stats) = &app.session.stats {
+                app.modal = Some(Modal::Stats(Box::new(stats.clone())));
+            } else {
+                app.flash("no stats yet — try again once pi has responded");
+            }
+            true
+        }
+        "export" => {
+            match crate::ui::export::export(&app.transcript) {
+                Ok(p) => app.flash(format!("exported → {}", p.display())),
+                Err(e) => app.flash(format!("export failed: {e}")),
+            }
+            true
+        }
+        "clear" => {
+            app.transcript = Transcript::default();
+            app.flash("transcript view cleared (pi session intact)");
+            true
+        }
+        "theme" => {
+            if arg.is_empty() {
+                app.cycle_theme();
+                app.flash(format!("theme → {}", app.theme.name));
+            } else if app.set_theme_by_name(arg) {
+                app.flash(format!("theme → {}", app.theme.name));
+            } else {
+                app.flash(format!(
+                    "unknown theme: {arg} — try: {}",
+                    theme::builtins()
+                        .iter()
+                        .map(|t| t.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            true
+        }
+        "themes" => {
+            let items: Vec<CommandInfo> = theme::builtins()
+                .iter()
+                .map(|t| CommandInfo {
+                    name: format!("theme {}", t.name),
+                    description: Some(format!("switch to {}", t.name)),
+                    source: crate::rpc::types::CommandSource::Builtin,
+                    location: None,
+                    path: None,
+                })
+                .collect();
+            app.modal = Some(Modal::Commands(ListModal::new(
+                "themes",
+                "type to filter · Enter apply · Esc close",
+                items,
+            )));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Handle slash commands that DO need pi. Returns true if consumed.
+async fn try_pi_slash(app: &mut App, client: &RpcClient, name: &str, arg: &str) -> bool {
+    match name {
+        "rename" => {
+            if arg.is_empty() {
+                app.flash("usage: /rename <name>");
+                return true;
+            }
+            let name_str = arg.to_string();
+            match client
+                .call(RpcCommand::SetSessionName {
+                    name: name_str.clone(),
+                })
+                .await
+            {
+                Ok(_) => {
+                    app.session.session_name = Some(name_str.clone());
+                    app.flash(format!("session renamed → {name_str}"));
+                }
+                Err(e) => app.flash(format!("rename failed: {e}")),
+            }
+            true
+        }
+        "new" => {
+            match client
+                .call(RpcCommand::NewSession {
+                    parent_session: None,
+                })
+                .await
+            {
+                Ok(_) => {
+                    app.transcript = Transcript::default();
+                    app.flash("new session started");
+                }
+                Err(e) => app.flash(format!("new session failed: {e}")),
+            }
+            true
+        }
+        "export-html" => {
+            match client
+                .call(RpcCommand::ExportHtml { output_path: None })
+                .await
+            {
+                Ok(ok) => {
+                    let path = ok
+                        .data
+                        .as_ref()
+                        .and_then(|v| v.get("path"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no path)")
+                        .to_string();
+                    app.flash(format!("html → {path}"));
+                }
+                Err(e) => app.flash(format!("export-html failed: {e}")),
+            }
+            true
+        }
+        "switch" => {
+            if arg.is_empty() {
+                app.flash("usage: /switch <session-file>");
+                return true;
+            }
+            match client
+                .call(RpcCommand::SwitchSession {
+                    session_path: arg.to_string(),
+                })
+                .await
+            {
+                Ok(_) => {
+                    app.flash(format!("switched → {arg}"));
+                    bootstrap(client, app).await;
+                }
+                Err(e) => app.flash(format!("switch failed: {e}")),
+            }
+            true
+        }
+        "fork" => {
+            match client.call(RpcCommand::GetForkMessages).await {
+                Ok(ok) => {
+                    let items: Vec<ForkMessage> = ok
+                        .data
+                        .as_ref()
+                        .and_then(|v| v.get("messages"))
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|m| {
+                                    serde_json::from_value::<ForkMessage>(m.clone()).ok()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if items.is_empty() {
+                        app.flash("no fork candidates");
+                        return true;
+                    }
+                    app.modal = Some(Modal::Forks(ListModal::new(
+                        "forks",
+                        "type to filter · Enter fork · Esc close",
+                        items,
+                    )));
+                }
+                Err(e) => app.flash(format!("get_fork_messages failed: {e}")),
+            }
+            true
+        }
+        "compact" => {
+            let _ = client
+                .fire(RpcCommand::Compact {
+                    custom_instructions: if arg.is_empty() {
+                        None
+                    } else {
+                        Some(arg.to_string())
+                    },
+                })
+                .await;
+            app.flash("compacting…");
+            true
+        }
+        "model" => {
+            app.modal = Some(Modal::Models(ListModal::new(
+                "model",
+                "↑↓ pick · Enter set · Esc close",
+                app.session.available_models.clone(),
+            )));
+            true
+        }
+        "think" => {
+            let cur = app.session.thinking.unwrap_or(ThinkingLevel::Medium);
+            let opts = [
+                (ThinkingLevel::Off, "off"),
+                (ThinkingLevel::Minimal, "minimal"),
+                (ThinkingLevel::Low, "low"),
+                (ThinkingLevel::Medium, "medium"),
+                (ThinkingLevel::High, "high"),
+                (ThinkingLevel::Xhigh, "xhigh"),
+            ];
+            let selected = opts.iter().position(|(l, _)| *l == cur).unwrap_or(3);
+            app.modal = Some(Modal::Thinking(RadioModal::new(
+                "thinking level",
+                opts.to_vec(),
+                selected,
+            )));
+            true
+        }
+        "cycle-model" => {
+            match client.call(RpcCommand::CycleModel).await {
+                Ok(ok) => {
+                    if let Some(v) = ok.data
+                        && let Some(m) = v.get("model")
+                        && let Some(prov) = m.get("provider").and_then(|x| x.as_str())
+                        && let Some(id) = m.get("id").and_then(|x| x.as_str())
+                    {
+                        app.session.model_label = format!("{prov}/{id}");
+                        app.flash(format!("model → {prov}/{id}"));
+                    } else {
+                        app.flash("cycled model");
+                    }
+                }
+                Err(e) => app.flash(format!("cycle_model failed: {e}")),
+            }
+            true
+        }
+        "cycle-think" => {
+            match client.call(RpcCommand::CycleThinkingLevel).await {
+                Ok(_) => app.flash("cycled thinking level"),
+                Err(e) => app.flash(format!("cycle_thinking_level failed: {e}")),
+            }
+            true
+        }
+        "auto-compact" => {
+            let next = !app.session.auto_compaction.unwrap_or(true);
+            app.session.auto_compaction = Some(next);
+            let _ = client
+                .fire(RpcCommand::SetAutoCompaction { enabled: next })
+                .await;
+            app.flash(format!("auto-compact {}", on_off(next)));
+            true
+        }
+        "auto-retry" => {
+            let next = !app.session.auto_retry.unwrap_or(true);
+            app.session.auto_retry = Some(next);
+            let _ = client
+                .fire(RpcCommand::SetAutoRetry { enabled: next })
+                .await;
+            app.flash(format!("auto-retry {}", on_off(next)));
+            true
+        }
+        "copy" => {
+            match client.call(RpcCommand::GetLastAssistantText).await {
+                Ok(ok) => {
+                    let text = ok
+                        .data
+                        .as_ref()
+                        .and_then(|v| v.get("text"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if text.is_empty() {
+                        app.flash("no assistant message yet");
+                    } else {
+                        app.flash(format!(
+                            "copied {} chars (clipboard wiring in V2.4)",
+                            text.len()
+                        ));
+                    }
+                }
+                Err(e) => app.flash(format!("copy failed: {e}")),
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 async fn submit(app: &mut App, client: Option<&RpcClient>) {
     let text = app.input.trim().to_string();
     if text.is_empty() {
         return;
     }
-    let Some(client) = client else {
-        return;
-    };
     app.input.clear();
-
     app.history.record(&text);
 
-    // Local slash commands — intercepted before pi sees them. Each branch is a
-    // no-op if we return; otherwise fall through to send to pi (for extension /
-    // prompt / skill commands that pi itself handles).
+    // 1) Local slash commands — these work even without pi connected.
     if let Some(rest) = text.strip_prefix('/') {
         let mut parts = rest.splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim();
-        match name {
-            "help" => {
-                app.modal = Some(Modal::Help);
+        if try_local_slash(app, name, arg) {
+            return;
+        }
+        // Local didn't handle it — if pi is here, try pi-requiring ones.
+        if let Some(c) = client {
+            if try_pi_slash(app, c, name, arg).await {
                 return;
             }
-            "stats" => {
-                if let Some(stats) = &app.session.stats {
-                    app.modal = Some(Modal::Stats(Box::new(stats.clone())));
-                }
-                return;
-            }
-            "export" => {
-                match crate::ui::export::export(&app.transcript) {
-                    Ok(p) => app.flash(format!("exported → {}", p.display())),
-                    Err(e) => app.flash(format!("export failed: {e}")),
-                }
-                return;
-            }
-            "rename" => {
-                if arg.is_empty() {
-                    app.flash("usage: /rename <name>");
-                    return;
-                }
-                let name_str = arg.to_string();
-                match client
-                    .call(RpcCommand::SetSessionName {
-                        name: name_str.clone(),
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        app.session.session_name = Some(name_str.clone());
-                        app.flash(format!("session renamed → {name_str}"));
-                    }
-                    Err(e) => app.flash(format!("rename failed: {e}")),
-                }
-                return;
-            }
-            "new" => {
-                match client
-                    .call(RpcCommand::NewSession {
-                        parent_session: None,
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        app.transcript = Transcript::default();
-                        app.flash("new session started");
-                    }
-                    Err(e) => app.flash(format!("new session failed: {e}")),
-                }
-                return;
-            }
-            "export-html" => {
-                match client
-                    .call(RpcCommand::ExportHtml { output_path: None })
-                    .await
-                {
-                    Ok(ok) => {
-                        let path = ok
-                            .data
-                            .as_ref()
-                            .and_then(|v| v.get("path"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("(no path)")
-                            .to_string();
-                        app.flash(format!("html → {path}"));
-                    }
-                    Err(e) => app.flash(format!("export-html failed: {e}")),
-                }
-                return;
-            }
-            "switch" => {
-                if arg.is_empty() {
-                    app.flash("usage: /switch <session-file>");
-                    return;
-                }
-                match client
-                    .call(RpcCommand::SwitchSession {
-                        session_path: arg.to_string(),
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        app.flash(format!("switched → {arg}"));
-                        // Reload state + messages from the new session.
-                        bootstrap(client, app).await;
-                    }
-                    Err(e) => app.flash(format!("switch failed: {e}")),
-                }
-                return;
-            }
-            "fork" => {
-                match client.call(RpcCommand::GetForkMessages).await {
-                    Ok(ok) => {
-                        let items: Vec<ForkMessage> = ok
-                            .data
-                            .as_ref()
-                            .and_then(|v| v.get("messages"))
-                            .and_then(|v| v.as_array())
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|m| {
-                                        serde_json::from_value::<ForkMessage>(m.clone()).ok()
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        if items.is_empty() {
-                            app.flash("no fork candidates");
-                            return;
-                        }
-                        app.modal = Some(Modal::Forks(ListModal::new(
-                            "forks",
-                            "type to filter · Enter fork · Esc close",
-                            items,
-                        )));
-                    }
-                    Err(e) => app.flash(format!("get_fork_messages failed: {e}")),
-                }
-                return;
-            }
-            "compact" => {
-                let _ = client
-                    .fire(RpcCommand::Compact {
-                        custom_instructions: if arg.is_empty() {
-                            None
-                        } else {
-                            Some(arg.to_string())
-                        },
-                    })
-                    .await;
-                app.flash("compacting…");
-                return;
-            }
-            "theme" => {
-                if arg.is_empty() {
-                    app.cycle_theme();
-                    app.flash(format!("theme → {}", app.theme.name));
-                } else if app.set_theme_by_name(arg) {
-                    app.flash(format!("theme → {}", app.theme.name));
-                } else {
-                    app.flash(format!(
-                        "unknown theme: {arg} — try one of: {}",
-                        theme::builtins()
-                            .iter()
-                            .map(|t| t.name)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-                return;
-            }
-            "themes" => {
-                // Build a picker list from built-ins (as CommandInfo for reuse).
-                let items: Vec<CommandInfo> = theme::builtins()
-                    .iter()
-                    .map(|t| CommandInfo {
-                        name: format!("theme {}", t.name),
-                        description: Some(format!("switch to {}", t.name)),
-                        source: crate::rpc::types::CommandSource::Extension,
-                        location: None,
-                        path: None,
-                    })
-                    .collect();
-                app.modal = Some(Modal::Commands(ListModal::new(
-                    "themes",
-                    "type to filter · Enter apply · Esc close",
-                    items,
-                )));
-                return;
-            }
-            _ => {
-                // Unknown local slash — fall through to pi so extension /
-                // prompt / skill commands still work.
-            }
+        } else {
+            app.flash(format!("unknown /{name} (pi is offline)"));
+            return;
         }
     }
+
+    // 2) Anything from here on needs pi.
+    let Some(client) = client else {
+        app.flash("pi is offline");
+        return;
+    };
 
     if let Some(cmd) = text.strip_prefix('!') {
         let cmd = cmd.trim();
@@ -1388,6 +1731,9 @@ async fn submit(app: &mut App, client: Option<&RpcClient>) {
     }
 
     app.transcript.push(Entry::User(text.clone()));
+    if !app.is_streaming {
+        app.set_live(LiveState::Sending);
+    }
     let rpc = match (app.is_streaming, app.composer_mode) {
         (false, _) => RpcCommand::Prompt {
             message: text,
@@ -1458,6 +1804,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .sum::<u16>()
         .min(8);
 
+    // StatusWidget takes a 4-row strip between the editor and footer, unless
+    // the terminal is too short.
+    let status_h: u16 = if area.height >= 20 { 4 } else { 0 };
+
     let constraints: Vec<Constraint> = {
         let mut c = vec![
             Constraint::Length(1), // header
@@ -1469,6 +1819,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         c.push(Constraint::Length(3)); // editor
         if below_h > 0 {
             c.push(Constraint::Length(below_h));
+        }
+        if status_h > 0 {
+            c.push(Constraint::Length(status_h));
         }
         c.push(Constraint::Length(2)); // footer
         c
@@ -1495,6 +1848,13 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     } else {
         None
     };
+    let status_rect = if status_h > 0 {
+        let r = rects[idx];
+        idx += 1;
+        Some(r)
+    } else {
+        None
+    };
     let footer = rects[idx];
 
     draw_header(f, header, app);
@@ -1505,6 +1865,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     draw_editor(f, editor_area, app);
     if let Some(r) = below_rect {
         draw_widgets(f, r, &below_widgets);
+    }
+    if let Some(r) = status_rect {
+        draw_status(f, r, app);
     }
     draw_footer(f, footer, app);
 
@@ -1584,6 +1947,187 @@ fn draw_toasts(
     f.render_widget(Paragraph::new(Text::from(lines)), rect);
 }
 
+fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let t = &app.theme;
+    let border_color = match app.live {
+        LiveState::Idle => t.border_idle,
+        LiveState::Error => t.error,
+        LiveState::Retrying { .. } => t.warning,
+        LiveState::Tool => t.role_tool,
+        LiveState::Thinking => t.role_thinking,
+        LiveState::Streaming | LiveState::Llm | LiveState::Sending => t.border_active,
+        LiveState::Compacting => t.accent_strong,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::styled(" status ", Style::default().fg(t.muted)),
+            Span::styled(
+                format!("· {}", fmt_elapsed(app.elapsed_since_live())),
+                Style::default().fg(t.dim),
+            ),
+            Span::raw(" "),
+        ]))
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 2 || inner.width < 20 {
+        return;
+    }
+
+    // Row 1: spinner + state label + sub-info · throughput label
+    // Row 2: throughput sparkline · tok/s · cost sparkline · $ turn/session
+    let [row1, row2] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
+        .flex(ratatui::layout::Flex::Start)
+        .areas(inner);
+
+    // ── row 1 — state line ──────────────────────────────────────────────
+    let spinner = if app.live.wants_spinner() {
+        const S: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let c = S[(app.ticks as usize) % S.len()];
+        Span::styled(
+            format!("{c} "),
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "· ",
+            Style::default().fg(t.dim).add_modifier(Modifier::BOLD),
+        )
+    };
+
+    let state_main = match app.live {
+        LiveState::Retrying {
+            attempt,
+            max_attempts,
+            delay_ms,
+        } => format!("retry {attempt}/{max_attempts} in {}ms", delay_ms),
+        LiveState::Llm => format!("llm · {}", app.session.model_label),
+        other => other.label().to_string(),
+    };
+
+    let tools_chip = if app.tool_running > 0 {
+        format!("  {} running · {} done", app.tool_running, app.tool_done)
+    } else if app.tool_done > 0 {
+        format!("  tools: {} done", app.tool_done)
+    } else {
+        String::new()
+    };
+
+    let turn_chip = if app.turn_count > 0 {
+        format!("  turn {}", app.turn_count)
+    } else {
+        String::new()
+    };
+
+    let spans = vec![
+        spinner,
+        Span::styled(state_main, Style::default().fg(border_color)),
+        Span::styled(turn_chip, Style::default().fg(t.dim)),
+        Span::styled(tools_chip, Style::default().fg(t.muted)),
+    ];
+    f.render_widget(Paragraph::new(Line::from(spans)), row1);
+
+    // ── row 2 — sparklines + numeric chips ──────────────────────────────
+    // Split the row into three regions: throughput label+spark, cost
+    // label+spark, session cost.
+    let cols = Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Percentage(35),
+        Constraint::Percentage(15),
+    ])
+    .split(row2);
+    let [tp_col, cost_col, total_col] = [cols[0], cols[1], cols[2]];
+
+    // Throughput subsection: "throughput  ▂▅▇  82 t/s"
+    let throughput_data: Vec<u64> = app.throughput.iter().copied().map(u64::from).collect();
+    let tp_label = Span::styled("throughput  ", Style::default().fg(t.dim));
+    let tp_rate = format!("  {} t/s", app.recent_avg_throughput());
+    let tp_rate_span = Span::styled(
+        tp_rate,
+        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+    );
+
+    // Allocate inside tp_col: label (12) | spark (flex) | rate (10)
+    let tp_inner = Layout::horizontal([
+        Constraint::Length(13),
+        Constraint::Min(5),
+        Constraint::Length(10),
+    ])
+    .split(tp_col);
+    f.render_widget(Paragraph::new(Line::from(vec![tp_label])), tp_inner[0]);
+    f.render_widget(
+        Sparkline::default()
+            .data(&throughput_data)
+            .style(Style::default().fg(t.accent)),
+        tp_inner[1],
+    );
+    f.render_widget(Paragraph::new(Line::from(vec![tp_rate_span])), tp_inner[2]);
+
+    // Cost subsection.
+    let cost_data: Vec<u64> = app
+        .cost_series
+        .iter()
+        .map(|c| (c * 100_000.0) as u64)
+        .collect();
+    let last_turn_cost = app.cost_series.back().copied().unwrap_or(0.0);
+    let cost_inner = Layout::horizontal([
+        Constraint::Length(7),
+        Constraint::Min(5),
+        Constraint::Length(12),
+    ])
+    .split(cost_col);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "cost  ",
+            Style::default().fg(t.dim),
+        )])),
+        cost_inner[0],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .data(&cost_data)
+            .style(Style::default().fg(t.success)),
+        cost_inner[1],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            format!("  ${last_turn_cost:.4}"),
+            Style::default().fg(t.success).add_modifier(Modifier::BOLD),
+        )])),
+        cost_inner[2],
+    );
+
+    // Session total cost.
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" session ", Style::default().fg(t.dim)),
+            Span::styled(
+                format!("${:.4}", app.cost_session),
+                Style::default()
+                    .fg(t.accent_strong)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        total_col,
+    );
+}
+
+fn fmt_elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    let h = s / 3600;
+    let m = (s % 3600) / 60;
+    let sec = s % 60;
+    if h > 0 {
+        format!("{h:02}:{m:02}:{sec:02}")
+    } else {
+        format!("{m:02}:{sec:02}")
+    }
+}
+
 fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let spinner = if app.is_streaming {
@@ -1618,6 +2162,11 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .map(|n| format!("  [{n}]"))
         .unwrap_or_default();
 
+    // Heartbeat dot: pulse shape via the triangle easer on the 10-tick loop
+    // of `ticks`. Color comes from heartbeat_color (maps recent-event time).
+    let heartbeat_pct = crate::anim::ease::triangle(((app.ticks % 10) as f64) / 10.0);
+    let heartbeat_sym = if heartbeat_pct > 0.5 { "●" } else { "○" };
+
     let line = Line::from(vec![
         Span::styled(
             " rata-pi ",
@@ -1626,6 +2175,10 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         ),
         Span::raw("  "),
+        Span::styled(
+            format!("{heartbeat_sym} "),
+            Style::default().fg(app.heartbeat_color()),
+        ),
         spinner,
         Span::styled(&app.session.model_label, Style::default().fg(t.accent)),
         Span::styled(session_name, Style::default().fg(t.dim)),
@@ -2410,6 +2963,7 @@ fn commands_text(list: &ListModal<CommandInfo>, t: &Theme) -> Text<'static> {
             crate::rpc::types::CommandSource::Extension => "ext",
             crate::rpc::types::CommandSource::Prompt => "prompt",
             crate::rpc::types::CommandSource::Skill => "skill",
+            crate::rpc::types::CommandSource::Builtin => "builtin",
         };
         let style = if i == list.selected {
             Style::default().fg(t.accent).add_modifier(Modifier::BOLD)

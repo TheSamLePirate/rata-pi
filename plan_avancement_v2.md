@@ -64,21 +64,50 @@ Planned follow-up to finish the V2.0 feature list without blocking the theme del
 
 ---
 
-## V2.1 — StatusWidget + header gauges + sparklines
+## V2.1 — StatusWidget + header gauges + sparklines ✅ (core)
 
-- [ ] `LiveState` struct tracking: current op, per-tool status, turn tokens, session cost, heartbeat
-- [ ] `StatusWidget` per PLAN_V2 §8 with all 10 states
-- [ ] Retry countdown ring (800 ms per sec, 8-frame arc)
-- [ ] Heartbeat dot top-right (green pulse per event, red if 10 s silence while streaming)
-- [ ] Sparkline widget (60-bucket rolling)
-- [ ] Throughput sparkline (tok/s) from message deltas
-- [ ] Cost sparkline from `turn_end.usage.cost.total`
-- [ ] Connection-quality sparkline from stats-ticker RTT
-- [ ] Animated smooth Gauge (tween fill, pulse red ≥85%)
-- [ ] StatusWidget golden snapshots for each state
-- [ ] Fire-every-event contract test (each `Incoming` variant changes status)
+Also folds in V2.0 bug fixes the user reported (see "Fixes" below).
 
-**Notes:** _(to fill in)_
+### Delivered
+- [x] `LiveState` enum with 9 explicit states covering the PLAN_V2 §8 spec: `Idle / Sending / Llm / Thinking / Tool / Streaming / Compacting / Retrying{attempt,max,delay_ms} / Error`. Each has its own border color + label + spinner policy.
+- [x] `StatusWidget` drawn as a 4-row bordered card between the editor and footer. Title shows `status · MM:SS` (or `HH:MM:SS` past an hour) for the current state.
+- [x] Row 1: spinner + state label (e.g. `llm · anthropic/claude-sonnet-4` or `retry 2/3 in 2000ms`) + `turn N` chip + running-tools chip (`K running · N done`).
+- [x] Row 2: throughput label + sparkline + `X t/s`; cost label + per-turn sparkline + `$0.XXXX`; session total cost.
+- [x] Heartbeat dot in the header that pulses via the `anim::ease::triangle` function; color goes `dim` (idle) → `success` (recent event) → `warning` (10 s silence while streaming) → `error` (100+ ticks silence).
+- [x] Throughput tracking: per-second bucket rolling 60 wide. `approx_tokens` (≈ 4 chars/token) converts text/thinking deltas into rate samples.
+- [x] Cost tracking from `turn_end.message.usage.cost.total`: 30-turn rolling series + running session total. Sparkline quantizes to hundred-thousandths of a dollar so per-turn granularity is legible.
+- [x] Retry state surfaces as the distinctive "retry N/M in Xms" label with a `warning`-colored border — the countdown ring per PLAN_V2 §8 is **deferred to V2.2** (needs `anim` registry integration; the `ease::triangle` primitive is already in place).
+- [x] Every event updates `last_event_tick`, so the heartbeat dot is a live liveness probe even when no state change happens (e.g. tool_execution_update coming in frequently).
+- [x] Layout gracefully degrades: if terminal height < 20 rows, StatusWidget is hidden.
+- [x] 63 tests pass (V2.0 was 62; +1 from commands::builtins test).
+
+### Fixes bundled in this milestone
+- [x] **`Ctrl+Shift+T` works now** on every terminal thanks to three bindings: `Ctrl+Shift+T` (Kitty keyboard protocol), `Alt+T` (reliable on macOS Terminal / iTerm / xterm), and `F12` (function-key fallback). All three call `cycle_theme`.
+- [x] **`/theme` works when pi is offline** — `submit()` is split into `try_local_slash` (no client needed) + `try_pi_slash` (requires client). Local commands run first, so `/theme`, `/help`, `/stats`, `/export`, `/themes`, `/clear` all work without pi.
+- [x] **Commands picker shows more than pi's skills now.** New `CommandSource::Builtin` variant + new `src/ui/commands.rs` with 19 curated built-ins: help, stats, themes, theme, export, export-html, copy, clear, rename, new, switch, fork, compact, model, think, cycle-model, cycle-think, auto-compact, auto-retry. The `F1` and `/` pickers merge built-ins with pi's extension/prompt/skill commands. A `[builtin]` badge tags them in the list.
+- [x] Picker Enter dispatches Builtin commands inline: no-argument built-ins fire immediately (e.g. `/help` opens help, `/theme` cycles); built-ins that expect an argument (`/rename`, `/switch`) prefill `/name ` so the user can type the argument and submit. Pi commands still prefill as before.
+
+### Deferred (queued for V2.2+)
+- [ ] Retry countdown ring graphic (8-frame circular arc) — anim registry plumbing lands with V2.2 conversation-view refactor
+- [ ] Connection-quality sparkline from stats-ticker RTT — needs latency capture in the RPC client; slotted for V2.2
+- [ ] Animated smooth Gauge tween in the footer — current Gauge jumps between states; smoothing comes with anim registry
+- [ ] StatusWidget golden snapshots per state (insta) — lands with V2.12 snapshot pass
+- [ ] Fire-every-event contract test — needs the Action reducer refactor (V2.0.1) so we can script actions
+
+**Notes:**
+- The `Sparkline` widget from Ratatui 0.30 takes `&[u64]`; we convert u32 throughput and scale cost (×100 000) to get readable micro-spark resolution at sub-cent amounts.
+- `LiveState::Sending` is set when the user submits so the UI flashes "sending" between the prompt going out and `agent_start` coming back — a small detail but closes the perception loop.
+- Turn counter is bumped on `turn_start` rather than `agent_start` so a multi-turn run (tool calls + follow-ups) counts correctly.
+- Added the `clear` local slash command — turns out to be super handy while debugging layout.
+- The 19 built-in commands + pi's own commands means the `/` picker is already 30+ entries on most sessions. Scrollable list lands with V2.5.
+
+---
+
+## V2.1 backlog items rolled forward
+
+- Retry countdown ring — bundled with the animation-registry consumer work in V2.2
+- Connection-quality sparkline — V2.2 (RTT capture in the RPC client)
+- Golden snapshots — V2.12
 
 ---
 

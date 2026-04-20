@@ -381,6 +381,10 @@ pub enum CommandSource {
     Extension,
     Prompt,
     Skill,
+    /// Local built-in of rata-pi (never emitted by pi; present so we can
+    /// mix them into the Commands picker alongside extension/prompt/skill).
+    #[serde(skip_deserializing)]
+    Builtin,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
