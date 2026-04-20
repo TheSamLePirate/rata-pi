@@ -111,20 +111,37 @@ Also folds in V2.0 bug fixes the user reported (see "Fixes" below).
 
 ---
 
-## V2.2 — Conversation view overhaul
+## V2.2 — Conversation view overhaul ✅ (core)
 
-- [ ] Message card widget (rounded borders `╭╮╰╯`, role-themed bg tint)
-- [ ] Role avatars (emoji or ASCII per role)
-- [ ] Relative timestamp + absolute on focus
-- [ ] Virtualized transcript (tui-scrollview or custom)
-- [ ] Focus mode (`Esc` toggles; `j/k/↑/↓` navigate; `Enter` expand; `c` copy)
-- [ ] Nested tool-call tree (tool calls visually nested inside assistant turn)
-- [ ] Sticky "live tail" indicator while scrolled up (+ `End` to re-pin)
-- [ ] Per-message collapse/expand (keyboard + click)
-- [ ] 10k-message stress test: maintains 60 fps
-- [ ] Golden snapshots of every message-card state (idle/focused/collapsed)
+### Delivered
+- [x] **Rounded-border message cards** via a new reusable `Card` widget in `src/ui/cards.rs`. `BorderType::Rounded` is used across the transcript and the outer transcript frame. Each entry type maps to a themed card with its own icon and border color.
+- [x] **Role icons** per card: `❯` user · `✦` thinking · `✦` pi · `⚙` tool · `$` bash. Info / Warn / Error / Compaction / Retry still render as inline non-bordered rows (they read better flat).
+- [x] **Model in the card title** — assistant cards show the current model provider/id as a right-aligned title chip. Tool cards show status label (`running / ok / error`) + a `▸`/`▾` expand marker in the title. Bash cards show `exit N` / `cancelled` as a right chip.
+- [x] **Virtualized transcript scroll** — `draw_body` now computes a per-visual height at the current content width using Ratatui's `Paragraph::line_count` (via the `unstable-rendered-line-info` feature), then skips entries above/below the viewport. 10k entries stay responsive because we never render what we don't draw.
+- [x] **Scrollbar** in the transcript's right column (1 cell wide). Thumb size and position are proportional to viewport/total. Dotted track + solid thumb in the theme's accent color. Same scrollbar renders inside any list modal (Commands / Models / History / Forks) when the content overflows.
+- [x] **Commands picker scrolls!** Previously the list just overflowed; now `draw_modal` computes a centered `scroll_y` around the selected item so it always stays visible, and adds the same scrollbar column. Fixes the F1 / `/` menu-not-scrolling bug the user reported.
+- [x] **Focus mode** — `Ctrl+F` enters focus mode; `j`/`k`/`↑`/`↓` move between cards; `g`/`G`/`Home`/`End` jump to top/bottom; `PgUp`/`PgDn` move by 5; `Enter` / `Space` toggles expand on tool cards; `Esc` / `q` exits. The focused card gets a bold `border_active`-colored border, and the transcript auto-scrolls to keep it centered. A `transcript · focus` title tag appears on the transcript frame while focus mode is on.
+- [x] **Sticky live-tail indicator** — when scrolled up (manual or focus-centered), a small `⬇ live tail (End)` chip appears at the bottom-center of the transcript with the theme accent background. Disappears automatically when the user hits `End` or scrolls back down.
+- [x] **Welcome card** — empty transcript shows a friendly "welcome to rata-pi" hint with the most useful keybindings instead of a blank pane.
+- [x] **Cut-off hint** — when card virtualization has to slice a partial card at the top of the viewport, we render a faint `⋯ (card continues above)` marker so the user never sees a headless body.
+- [x] **Focus auto-clamp** — when the transcript grows past the focused index, focus tracks the tail (feels natural when you `Ctrl+F` then watch new events roll in).
+- [x] **Thinking as blockquote** — thinking cards render with `│ ` prefix + italic muted text, reading like a proper quoted block. Token count lands in the right chip.
+- [x] **Context-aware footer hints** — focus mode shows `j/k nav · Enter expand · g/G top/bot · Esc exit`; idle mode shows `Enter send · / cmds · Ctrl+F focus · F5 model · …`; streaming shows its own abort/cycle hints.
 
-**Notes:** _(to fill in)_
+### Deferred
+- [ ] Emoji avatars (🧑 / 🤖 / 💭) — kept the single-char unicode icons because emoji width is inconsistent across terminals (2 cells in some, 1 in others) and breaks virtualization math. Revisit with a width probe in V2.4.
+- [ ] Relative timestamps + absolute-on-focus — transcript entries don't carry a creation timestamp yet; adding one is a small transcript.rs change but was scoped out of V2.2.
+- [ ] Nested tool-call tree (tools visually nested inside the assistant turn that triggered them) — needs a parent-child relationship we don't model yet. V2.3 alongside the tool-renderer registry.
+- [ ] 10k-message stress benchmark — infrastructure lands with V2.12.
+- [ ] Golden snapshots per card state — `insta` isn't in the dep tree yet; V2.12.
+
+### Notes
+- The `Paragraph::line_count` method requires ratatui's `unstable-rendered-line-info` feature. Enabled in `Cargo.toml`. Worth it: keeps our height math 100% in sync with the real wrap the renderer performs.
+- Card height = `line_count + 2` (top + bottom border). Bodies render with 1 column of left padding for breathing room.
+- `Visual` enum collapses Card and InlineRow — inline rows (Info/Warn/Error/Compaction/Retry) look denser as a single line and save vertical space in busy sessions.
+- Scroll offset is still line-granular (`Option<u16>` lines-from-top) because a single tall card can be > viewport; card-boundary-only snapping would make such a card unreachable.
+- The modal scrollbar logic is the same code path as the transcript's; extracted into `draw_scrollbar`.
+- 63 tests pass; clippy -D warnings clean; fmt clean.
 
 ---
 

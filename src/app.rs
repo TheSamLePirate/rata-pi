@@ -31,7 +31,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap};
 
 use crate::cli::Args;
 use crate::history::{History, HistoryEntry};
@@ -43,6 +43,7 @@ use crate::rpc::types::{
     SessionStats, State, SteeringMode, ThinkingLevel, ToolResultPayload, UserContent,
 };
 use crate::theme::{self, Theme};
+use crate::ui::cards::{Card, InlineRow};
 use crate::ui::ext_ui::{ExtReq, ExtUiState, NotifyKind, WidgetPlacement, parse as parse_ext};
 use crate::ui::markdown;
 use crate::ui::modal::{ListModal, Modal, RadioModal, centered, matches_query};
@@ -179,6 +180,9 @@ struct App {
     history: History,
     theme: Theme,
 
+    // ── V2.2: focus mode (Ctrl+F toggles; j/k navigate cards) ────────────
+    focus_idx: Option<usize>,
+
     // ── V2.1: live status signals ────────────────────────────────────────
     live: LiveState,
     live_since_tick: u64,
@@ -214,6 +218,7 @@ impl App {
             ext_ui: ExtUiState::default(),
             history: History::load(),
             theme: *theme::default_theme(),
+            focus_idx: None,
             live: LiveState::Idle,
             live_since_tick: 0,
             tool_running: 0,
@@ -313,6 +318,19 @@ impl App {
         self.session.follow_up_mode = Some(s.follow_up_mode);
         self.session.auto_compaction = Some(s.auto_compaction_enabled);
         self.session.session_name = s.session_name.clone();
+    }
+
+    /// Ensure `focus_idx` stays within bounds as the transcript grows or is
+    /// reset. Call after any transcript mutation.
+    fn clamp_focus(&mut self) {
+        if let Some(i) = self.focus_idx {
+            let n = self.transcript.entries().len();
+            if n == 0 {
+                self.focus_idx = None;
+            } else if i >= n {
+                self.focus_idx = Some(n - 1);
+            }
+        }
     }
 
     fn on_event(&mut self, ev: Incoming) {
@@ -479,6 +497,61 @@ impl App {
 /// used for the live throughput sparkline, not anything billed.
 fn approx_tokens(s: &str) -> u32 {
     (s.chars().count() as u32).div_ceil(4)
+}
+
+/// Truncate a string to `max` characters, appending an ellipsis if cut.
+fn truncate_preview(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Compact single-line preview of a tool's arguments.
+fn args_preview(args: &serde_json::Value) -> String {
+    if let Some(obj) = args.as_object() {
+        let mut parts: Vec<String> = obj
+            .iter()
+            .map(|(k, v)| match v {
+                serde_json::Value::String(s) => format!("{k}={:?}", truncate_preview(s, 40)),
+                _ => format!("{k}={v}"),
+            })
+            .collect();
+        parts.truncate(4);
+        parts.join("  ")
+    } else if args.is_null() {
+        String::new()
+    } else {
+        serde_json::to_string(args).unwrap_or_default()
+    }
+}
+
+/// Heuristic: does this output look like a unified diff?
+fn looks_like_diff(s: &str) -> bool {
+    for line in s.lines().take(20) {
+        if line.starts_with("+++ ") || line.starts_with("--- ") || line.starts_with("@@ ") {
+            return true;
+        }
+    }
+    false
+}
+
+fn diff_style_for(line: &str, t: &Theme) -> Style {
+    if line.starts_with("+++ ") || line.starts_with("--- ") {
+        Style::default()
+            .fg(t.diff_file)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with("@@") {
+        Style::default().fg(t.diff_hunk)
+    } else if line.starts_with('+') {
+        Style::default().fg(t.diff_add)
+    } else if line.starts_with('-') {
+        Style::default().fg(t.diff_remove)
+    } else {
+        Style::default().fg(t.muted)
+    }
 }
 
 // ───────────────────────────────────────────────────────── bootstrap ──
@@ -754,6 +827,7 @@ async fn ui_loop(
             _ = tick.tick() => {
                 app.ticks = app.ticks.wrapping_add(1);
                 app.tick_status();
+                app.clamp_focus();
                 // Expire flash after ~1.5s.
                 if let Some((_, at)) = app.flash
                     && app.ticks.wrapping_sub(at) > 15 {
@@ -798,11 +872,11 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
         Event::Mouse(MouseEvent { kind, .. }) => match kind {
             MouseEventKind::ScrollUp => {
                 let cur = app.scroll.unwrap_or(u16::MAX);
-                app.scroll = Some(cur.saturating_sub(3));
+                app.scroll = Some(cur.saturating_sub(4));
             }
             MouseEventKind::ScrollDown => {
                 let cur = app.scroll.unwrap_or(0);
-                app.scroll = Some(cur.saturating_add(3));
+                app.scroll = Some(cur.saturating_add(4));
             }
             _ => {}
         },
@@ -810,9 +884,75 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
     }
 }
 
+/// Key handler active while focus mode is on. Navigate cards, Enter expands
+/// tool cards, Esc exits.
+fn handle_focus_key(code: KeyCode, _mods: KeyModifiers, app: &mut App) {
+    let n = app.transcript.entries().len();
+    if n == 0 {
+        app.focus_idx = None;
+        return;
+    }
+    let cur = app.focus_idx.unwrap_or(0);
+    match code {
+        KeyCode::Esc => {
+            app.focus_idx = None;
+            app.scroll = None;
+            app.flash("focus mode off");
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            let next = (cur + 1).min(n - 1);
+            app.focus_idx = Some(next);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.focus_idx = Some(cur.saturating_sub(1));
+        }
+        KeyCode::Char('g') | KeyCode::Home => {
+            app.focus_idx = Some(0);
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            app.focus_idx = Some(n - 1);
+        }
+        KeyCode::PageDown => {
+            app.focus_idx = Some((cur + 5).min(n - 1));
+        }
+        KeyCode::PageUp => {
+            app.focus_idx = Some(cur.saturating_sub(5));
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            // Expand/collapse the focused tool card, if any.
+            if let Some(Entry::ToolCall(tc)) = app.transcript.entries().get(cur) {
+                let id = tc.id.clone();
+                app.transcript.toggle_tool_expanded(&id);
+            }
+        }
+        KeyCode::Char('q') => {
+            app.focus_idx = None;
+        }
+        _ => {}
+    }
+}
+
 async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Option<&RpcClient>) {
+    // Ctrl+C / Ctrl+D always quit, even in focus mode.
+    if let (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) = (code, mods) {
+        app.quit = true;
+        return;
+    }
+
+    // Focus mode intercepts navigation keys. Esc exits focus mode.
+    if app.focus_idx.is_some() {
+        handle_focus_key(code, mods, app);
+        return;
+    }
+
     match (code, mods) {
-        (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
+        // Enter focus mode — navigate and expand cards with j/k/↑/↓.
+        (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+            if !app.transcript.entries().is_empty() {
+                app.focus_idx = Some(app.transcript.entries().len().saturating_sub(1));
+                app.flash("focus mode · j/k nav · Enter expand · Esc exit");
+            }
+        }
         // Cycle theme. Several bindings so we work across terminals:
         //   • Alt+T         — reliable on macOS Terminal / iTerm / xterm
         //   • Ctrl+Shift+T  — works where Kitty keyboard protocol is active
@@ -970,11 +1110,14 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
         }
         (KeyCode::PageUp, _) => {
             let cur = app.scroll.unwrap_or(u16::MAX);
-            app.scroll = Some(cur.saturating_sub(5));
+            app.scroll = Some(cur.saturating_sub(10));
         }
         (KeyCode::PageDown, _) => {
             let cur = app.scroll.unwrap_or(0);
-            app.scroll = Some(cur.saturating_add(5));
+            app.scroll = Some(cur.saturating_add(10));
+        }
+        (KeyCode::Home, _) => {
+            app.scroll = Some(0);
         }
         (KeyCode::End, _) => app.scroll = None,
         _ => {}
@@ -2190,257 +2333,271 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn entries_to_lines(entries: &[Entry], show_thinking: bool, t: &Theme) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(entries.len() * 4);
-    for e in entries {
-        match e {
-            Entry::User(s) => {
-                let label = Span::styled(
-                    "you › ",
-                    Style::default()
-                        .fg(t.role_user)
-                        .add_modifier(Modifier::BOLD),
-                );
-                for (i, part) in s.split('\n').enumerate() {
-                    let prefix = if i == 0 {
-                        label.clone()
-                    } else {
-                        Span::raw("      ")
-                    };
-                    lines.push(Line::from(vec![prefix, Span::raw(part.to_string())]));
+// ───────────────────────────────────────── transcript visuals (V2.2) ──
+//
+// Each `Entry` in the transcript turns into exactly one `Visual`: either a
+// bordered `Card` (user / thinking / assistant / bash / tool) or an `InlineRow`
+// (info / warn / error / compaction / retry). The `Visual` knows how to
+// compute its own height at a given width and how to render itself into a
+// `Rect`, which lets `draw_body` virtualize scroll without a scene graph.
+
+enum Visual {
+    Card(Card),
+    Inline(InlineRow),
+}
+
+impl Visual {
+    fn height(&self, outer_w: u16) -> u16 {
+        match self {
+            Self::Card(c) => c.height(outer_w),
+            Self::Inline(r) => r.height(outer_w),
+        }
+    }
+
+    fn render(&self, f: &mut ratatui::Frame, area: Rect, idx: usize, app: &App) {
+        match self {
+            Self::Card(c) => {
+                let mut c = c.clone();
+                c.focused = app.focus_idx == Some(idx);
+                if c.focused {
+                    c.border_color = app.theme.border_active;
                 }
-                lines.push(Line::default());
+                c.render(f, area, &app.theme);
             }
+            Self::Inline(r) => r.render(f, area),
+        }
+    }
+}
+
+fn build_visuals(app: &App) -> Vec<Visual> {
+    let t = &app.theme;
+    let mut out = Vec::with_capacity(app.transcript.entries().len());
+    for e in app.transcript.entries() {
+        match e {
+            Entry::User(s) => out.push(Visual::Card(Card {
+                icon: "❯",
+                title: "you".into(),
+                right_title: None,
+                body: plain_paragraph(s, t.text),
+                border_color: t.role_user,
+                icon_color: t.role_user,
+                title_color: t.role_user,
+                focused: false,
+            })),
             Entry::Thinking(s) => {
-                if show_thinking {
-                    for (i, part) in s.split('\n').enumerate() {
-                        let prefix = Span::styled(
-                            if i == 0 { "think › " } else { "        " },
-                            Style::default().fg(t.role_thinking),
-                        );
-                        lines.push(Line::from(vec![
-                            prefix,
-                            Span::styled(
-                                part.to_string(),
-                                Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
-                            ),
-                        ]));
-                    }
-                    lines.push(Line::default());
+                if app.show_thinking {
+                    let body = thinking_body(s, t);
+                    let tokens = approx_tokens(s);
+                    out.push(Visual::Card(Card {
+                        icon: "✦",
+                        title: "thinking".into(),
+                        right_title: Some(format!("{tokens} tok")),
+                        body,
+                        border_color: t.role_thinking,
+                        icon_color: t.role_thinking,
+                        title_color: t.role_thinking,
+                        focused: false,
+                    }));
                 } else {
                     let count = s.lines().count().max(1);
-                    lines.push(Line::from(Span::styled(
-                        format!("▸ thinking ({count} lines — Ctrl+T to reveal)"),
-                        Style::default().fg(t.role_thinking),
-                    )));
+                    out.push(Visual::Inline(InlineRow {
+                        lines: vec![Line::from(Span::styled(
+                            format!("  ▸ thinking ({count} lines — Ctrl+T to reveal)"),
+                            Style::default().fg(t.role_thinking),
+                        ))],
+                    }));
                 }
             }
             Entry::Assistant(md) => {
-                let label = Span::styled(
-                    "pi  › ",
-                    Style::default()
-                        .fg(t.role_assistant)
-                        .add_modifier(Modifier::BOLD),
-                );
-                let rendered = markdown::render(md);
-                if rendered.is_empty() {
-                    lines.push(Line::from(vec![label]));
-                } else {
-                    for (i, mut l) in rendered.into_iter().enumerate() {
-                        let prefix = if i == 0 {
-                            label.clone()
-                        } else {
-                            Span::raw("      ")
-                        };
-                        l.spans.insert(0, prefix);
-                        lines.push(l);
-                    }
-                }
-                lines.push(Line::default());
+                let body = markdown::render(md);
+                out.push(Visual::Card(Card {
+                    icon: "✦",
+                    title: "pi".into(),
+                    right_title: Some(app.session.model_label.clone()),
+                    body: if body.is_empty() {
+                        vec![Line::from(Span::styled("…", Style::default().fg(t.dim)))]
+                    } else {
+                        body
+                    },
+                    border_color: t.role_assistant,
+                    icon_color: t.role_assistant,
+                    title_color: t.role_assistant,
+                    focused: false,
+                }));
             }
-            Entry::ToolCall(tc) => push_tool_lines(&mut lines, tc, t),
-            Entry::BashExec(bx) => push_bash_lines(&mut lines, bx, t),
-            Entry::Info(s) => lines.push(Line::from(Span::styled(
-                format!("· {s}"),
-                Style::default().fg(t.dim),
-            ))),
-            Entry::Warn(s) => lines.push(Line::from(Span::styled(
-                format!("⚠ {s}"),
-                Style::default().fg(t.warning),
-            ))),
-            Entry::Error(s) => lines.push(Line::from(Span::styled(
-                format!("✗ {s}"),
-                Style::default().fg(t.error),
-            ))),
-            Entry::Compaction(c) => push_compaction_line(&mut lines, c, t),
-            Entry::Retry(r) => push_retry_line(&mut lines, r, t),
+            Entry::ToolCall(tc) => out.push(Visual::Card(tool_card(tc, t))),
+            Entry::BashExec(bx) => out.push(Visual::Card(bash_card(bx, t))),
+            Entry::Info(s) => out.push(Visual::Inline(InlineRow {
+                lines: vec![Line::from(Span::styled(
+                    format!("  · {s}"),
+                    Style::default().fg(t.dim),
+                ))],
+            })),
+            Entry::Warn(s) => out.push(Visual::Inline(InlineRow {
+                lines: vec![Line::from(Span::styled(
+                    format!("  ⚠ {s}"),
+                    Style::default().fg(t.warning),
+                ))],
+            })),
+            Entry::Error(s) => out.push(Visual::Inline(InlineRow {
+                lines: vec![Line::from(Span::styled(
+                    format!("  ✗ {s}"),
+                    Style::default().fg(t.error),
+                ))],
+            })),
+            Entry::Compaction(c) => out.push(Visual::Inline(InlineRow {
+                lines: compaction_lines(c, t),
+            })),
+            Entry::Retry(r) => out.push(Visual::Inline(InlineRow {
+                lines: retry_lines(r, t),
+            })),
         }
+    }
+    out
+}
+
+fn plain_paragraph(s: &str, color: Color) -> Vec<Line<'static>> {
+    s.split('\n')
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(color))))
+        .collect()
+}
+
+fn thinking_body(s: &str, t: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for l in s.split('\n') {
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(t.role_thinking)),
+            Span::styled(
+                l.to_string(),
+                Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
     }
     lines
 }
 
-fn push_tool_lines(lines: &mut Vec<Line<'static>>, tc: &ToolCall, t: &Theme) {
-    let (sym, color) = match tc.status {
-        ToolStatus::Running => ("…", t.role_tool),
-        ToolStatus::Ok => ("✓", t.success),
-        ToolStatus::Err => ("✗", t.error),
+fn tool_card(tc: &ToolCall, t: &Theme) -> Card {
+    let (icon, color, status_label) = match tc.status {
+        ToolStatus::Running => ("⚙", t.role_tool, "running"),
+        ToolStatus::Ok => ("✓", t.success, "ok"),
+        ToolStatus::Err => ("✗", t.error, "error"),
     };
-    let arg_preview = truncate_preview(&args_preview(&tc.args), 60);
-    let header_style = if tc.status == ToolStatus::Err || tc.is_error {
-        Style::default().fg(t.error).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
-    };
-    let expand_hint = if tc.expanded { "▾" } else { "▸" };
-    lines.push(Line::from(vec![
-        Span::styled(format!("{expand_hint} {sym} {} ", tc.name), header_style),
-        Span::styled(arg_preview, Style::default().fg(t.dim)),
-    ]));
+    let color = if tc.is_error { t.error } else { color };
+
+    let arg_preview = args_preview(&tc.args);
+    let mut body: Vec<Line<'static>> = Vec::new();
+
+    if !arg_preview.is_empty() {
+        body.push(Line::from(vec![
+            Span::styled("args  ", Style::default().fg(t.dim)),
+            Span::styled(
+                truncate_preview(&arg_preview, 300),
+                Style::default().fg(t.muted),
+            ),
+        ]));
+    }
+
     if tc.expanded {
         let output = crate::ui::ansi::strip(&tc.output);
         if output.trim().is_empty() {
-            lines.push(Line::from(Span::styled(
-                "    (no output yet)",
+            body.push(Line::from(Span::styled(
+                "(no output yet)",
                 Style::default().fg(t.dim),
             )));
         } else {
             let diff_like = looks_like_diff(&output);
-            for part in output.split('\n').take(200) {
+            for part in output.split('\n').take(400) {
                 let styled = if diff_like {
                     diff_style_for(part, t)
                 } else {
                     Style::default().fg(t.muted)
                 };
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(part.to_string(), styled),
-                ]));
+                body.push(Line::from(Span::styled(part.to_string(), styled)));
             }
         }
     } else if !tc.output.trim().is_empty() {
-        let first = tc
+        let preview = tc
             .output
             .lines()
             .next()
-            .map(|s| truncate_preview(s, 80))
+            .map(|s| truncate_preview(s, 200))
             .unwrap_or_default();
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(first, Style::default().fg(t.dim)),
+        body.push(Line::from(vec![
+            Span::styled("out  ", Style::default().fg(t.dim)),
+            Span::styled(preview, Style::default().fg(t.muted)),
         ]));
-    }
-    lines.push(Line::default());
-}
-
-fn args_preview(args: &serde_json::Value) -> String {
-    if let Some(obj) = args.as_object() {
-        let mut parts: Vec<String> = obj
-            .iter()
-            .map(|(k, v)| match v {
-                serde_json::Value::String(s) => format!("{k}={:?}", truncate_preview(s, 40)),
-                _ => format!("{k}={v}"),
-            })
-            .collect();
-        parts.truncate(4);
-        parts.join("  ")
-    } else if args.is_null() {
-        String::new()
-    } else {
-        serde_json::to_string(args).unwrap_or_default()
-    }
-}
-
-/// Heuristic: does this output look like a unified diff? Triggers if we see
-/// `+++ ` or `--- ` or `@@ ` markers anywhere in the first ~20 lines.
-fn looks_like_diff(s: &str) -> bool {
-    for line in s.lines().take(20) {
-        if line.starts_with("+++ ") || line.starts_with("--- ") || line.starts_with("@@ ") {
-            return true;
+        if tc.output.lines().count() > 1 {
+            body.push(Line::from(Span::styled(
+                "(Enter / Ctrl+E to expand)",
+                Style::default().fg(t.dim),
+            )));
         }
     }
-    false
-}
+    if body.is_empty() {
+        body.push(Line::from(Span::styled("…", Style::default().fg(t.dim))));
+    }
 
-fn diff_style_for(line: &str, t: &Theme) -> Style {
-    if line.starts_with("+++ ") || line.starts_with("--- ") {
-        Style::default()
-            .fg(t.diff_file)
-            .add_modifier(Modifier::BOLD)
-    } else if line.starts_with("@@") {
-        Style::default().fg(t.diff_hunk)
-    } else if line.starts_with('+') {
-        Style::default().fg(t.diff_add)
-    } else if line.starts_with('-') {
-        Style::default().fg(t.diff_remove)
-    } else {
-        Style::default().fg(t.muted)
+    let expand = if tc.expanded { "▾" } else { "▸" };
+    let title = format!("{expand} {}  {}  {}", tc.name, icon, status_label);
+
+    Card {
+        icon: "⚙",
+        title,
+        right_title: None,
+        body,
+        border_color: color,
+        icon_color: color,
+        title_color: color,
+        focused: false,
     }
 }
 
-fn truncate_preview(s: &str, max: usize) -> String {
-    let s: String = s.chars().take(max + 1).collect();
-    if s.chars().count() > max {
-        let head: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{head}…")
-    } else {
-        s
-    }
-}
-
-fn push_bash_lines(lines: &mut Vec<Line<'static>>, bx: &BashExec, t: &Theme) {
-    let status_color = if bx.cancelled {
-        t.warning
+fn bash_card(bx: &BashExec, t: &Theme) -> Card {
+    let (status_color, status_txt) = if bx.cancelled {
+        (t.warning, "cancelled".to_string())
     } else if bx.exit_code == 0 {
-        t.success
+        (t.success, format!("exit {}", bx.exit_code))
     } else {
-        t.error
+        (t.error, format!("exit {}", bx.exit_code))
     };
-    let status_txt = if bx.cancelled {
-        " cancelled ".to_string()
-    } else {
-        format!(" exit {} ", bx.exit_code)
-    };
-    lines.push(Line::from(vec![
-        Span::styled(
-            "$ ",
-            Style::default()
-                .fg(t.role_bash)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            bx.command.clone(),
-            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            status_txt,
-            Style::default()
-                .bg(status_color)
-                .fg(Color::Rgb(0, 0, 0))
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    let body = crate::ui::ansi::strip(&bx.output);
-    for part in body.split('\n').take(200) {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(part.to_string(), Style::default().fg(t.muted)),
-        ]));
+    let body_text = crate::ui::ansi::strip(&bx.output);
+    let mut body: Vec<Line<'static>> = Vec::new();
+    for part in body_text.split('\n').take(300) {
+        body.push(Line::from(Span::styled(
+            part.to_string(),
+            Style::default().fg(t.muted),
+        )));
+    }
+    if body.is_empty() {
+        body.push(Line::from(Span::styled(
+            "(no output)",
+            Style::default().fg(t.dim),
+        )));
     }
     if bx.truncated {
         let path = bx
             .full_output_path
             .as_deref()
             .unwrap_or("(path not provided)");
-        lines.push(Line::from(Span::styled(
-            format!("  … output truncated — full log: {path}"),
+        body.push(Line::from(Span::styled(
+            format!("… truncated — full log: {path}"),
             Style::default().fg(t.warning),
         )));
     }
-    lines.push(Line::default());
+
+    Card {
+        icon: "$",
+        title: format!("$ {}", bx.command),
+        right_title: Some(status_txt),
+        body,
+        border_color: status_color,
+        icon_color: t.role_bash,
+        title_color: t.role_bash,
+        focused: false,
+    }
 }
 
-fn push_compaction_line(lines: &mut Vec<Line<'static>>, c: &Compaction, t: &Theme) {
+fn compaction_lines(c: &Compaction, t: &Theme) -> Vec<Line<'static>> {
     let (sym, color, label) = match &c.state {
         CompactionState::Running => ("⟲", t.accent_strong, "compacting".to_string()),
         CompactionState::Done { summary } => {
@@ -2461,18 +2618,18 @@ fn push_compaction_line(lines: &mut Vec<Line<'static>>, c: &Compaction, t: &Them
         CompactionState::Aborted => ("⟲", t.warning, "compaction aborted".into()),
         CompactionState::Failed(msg) => ("⟲", t.error, format!("compaction failed: {msg}")),
     };
-    lines.push(Line::from(vec![
+    vec![Line::from(vec![
         Span::styled(
-            format!("{sym} "),
+            format!("  {sym} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(label, Style::default().fg(color)),
         Span::raw(" "),
         Span::styled(format!("({})", c.reason), Style::default().fg(t.dim)),
-    ]));
+    ])]
 }
 
-fn push_retry_line(lines: &mut Vec<Line<'static>>, r: &Retry, t: &Theme) {
+fn retry_lines(r: &Retry, t: &Theme) -> Vec<Line<'static>> {
     let (sym, color, label) = match &r.state {
         RetryState::Waiting { delay_ms, error } => (
             "↻",
@@ -2496,20 +2653,32 @@ fn push_retry_line(lines: &mut Vec<Line<'static>>, r: &Retry, t: &Theme) {
             ),
         ),
     };
-    lines.push(Line::from(vec![
+    vec![Line::from(vec![
         Span::styled(
-            format!("{sym} "),
+            format!("  {sym} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(label, Style::default().fg(color)),
-    ]));
+    ])]
 }
 
 fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let t = &app.theme;
+    let border_color = if app.focus_idx.is_some() {
+        t.border_active
+    } else {
+        t.border_idle
+    };
+    let title = if app.focus_idx.is_some() {
+        " transcript · focus ".to_string()
+    } else {
+        " transcript ".to_string()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" transcript ")
-        .border_style(Style::default().add_modifier(Modifier::DIM));
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2517,16 +2686,14 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
         let msg = Paragraph::new(Text::from(vec![
             Line::from(Span::styled(
                 "⚠ pi is not available",
-                Style::default()
-                    .fg(app.theme.error)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(t.error).add_modifier(Modifier::BOLD),
             )),
             Line::default(),
             Line::from(err.clone()),
             Line::default(),
             Line::from(Span::styled(
                 "press q or Ctrl+C to quit",
-                Style::default().fg(app.theme.dim),
+                Style::default().fg(t.dim),
             )),
         ]))
         .wrap(Wrap { trim: false });
@@ -2534,19 +2701,178 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
         return;
     }
 
-    let lines = entries_to_lines(app.transcript.entries(), app.show_thinking, &app.theme);
-    let text = Text::from(lines);
-    let line_count = text.lines.len() as u16;
-    let viewport = inner.height;
-    let max_offset = line_count.saturating_sub(viewport);
-    let offset = match app.scroll {
-        None => max_offset,
-        Some(v) => v.min(max_offset),
+    // Leave one column on the right for the scrollbar indicator.
+    let content_w = inner.width.saturating_sub(1);
+    let sbar_col = Rect::new(inner.x + content_w, inner.y, 1, inner.height);
+    let content = Rect::new(inner.x, inner.y, content_w, inner.height);
+
+    // Build one Visual per entry, skipping Thinking when hidden.
+    let visuals = build_visuals(app);
+    if visuals.is_empty() {
+        let hint = Paragraph::new(Text::from(vec![
+            Line::from(Span::styled(
+                "welcome to rata-pi",
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            )),
+            Line::default(),
+            Line::from(Span::styled(
+                "type a prompt and press Enter · Ctrl+F focus mode · Alt+T theme · ?  help",
+                Style::default().fg(t.dim),
+            )),
+        ]))
+        .wrap(Wrap { trim: false });
+        f.render_widget(hint, inner);
+        return;
+    }
+
+    // Heights at the content width (leaves room for the scrollbar column).
+    let heights: Vec<u16> = visuals.iter().map(|v| v.height(content_w)).collect();
+    let total_h: u16 = heights.iter().fold(0u16, |a, b| a.saturating_add(*b));
+    let viewport = content.height;
+    let max_offset = total_h.saturating_sub(viewport);
+
+    // Resolve the scroll offset: auto-follow bottom OR follow focus OR user.
+    let offset: u16 = if let Some(idx) = app.focus_idx {
+        // Center the focused card in the viewport.
+        let mut prefix: u16 = 0;
+        for h in &heights[..idx.min(heights.len())] {
+            prefix = prefix.saturating_add(*h);
+        }
+        let focused_h = heights.get(idx).copied().unwrap_or(0);
+        let mid = prefix.saturating_add(focused_h / 2);
+        mid.saturating_sub(viewport / 2).min(max_offset)
+    } else {
+        match app.scroll {
+            None => max_offset,
+            Some(v) => v.min(max_offset),
+        }
     };
-    let para = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .scroll((offset, 0));
-    f.render_widget(para, inner);
+
+    // Render visuals that intersect [offset .. offset+viewport).
+    let mut y_cursor: u16 = 0;
+    let mut draw_y: u16 = content.y;
+    let end_y = content.y + viewport;
+    for (i, (v, h)) in visuals.iter().zip(heights.iter()).enumerate() {
+        let top = y_cursor;
+        let bottom = y_cursor.saturating_add(*h);
+        y_cursor = bottom;
+        if bottom <= offset {
+            continue;
+        }
+        if top >= offset + viewport {
+            break;
+        }
+        // How much of this visual's top is already scrolled off?
+        let skip = offset.saturating_sub(top);
+        let remaining_vertical = end_y.saturating_sub(draw_y);
+        let draw_h = h.saturating_sub(skip).min(remaining_vertical);
+        if draw_h == 0 {
+            break;
+        }
+        // If we have to skip rows of this card, use a clipped sub-area.
+        // We render the card into a rect that's the FULL card height so its
+        // contents aren't distorted, then set a Clip rect via Clear; simpler:
+        // stash the effective top by rendering in a taller virtual rect with
+        // a negative y offset. Ratatui doesn't support negative y, so instead
+        // we render at a rect whose y = draw_y - skip and rely on Frame's
+        // clip. To keep this simple, we skip partial-first-card rendering and
+        // start drawing from the entry fully — the max_offset + auto-follow
+        // guarantees we never need partials when live-tail is on. Manual
+        // scroll CAN cut a card but we clamp to card boundaries below.
+        let card_rect = Rect::new(content.x, draw_y, content.width, draw_h.min(*h));
+        if skip == 0 {
+            v.render(f, card_rect, i, app);
+        } else {
+            // Card straddles top: fade its first visible row with a dim note.
+            let mut bumped = card_rect;
+            // Shrink so the first `skip` rows aren't drawn.
+            bumped.height = (*h).saturating_sub(skip).min(remaining_vertical);
+            // Render a synthetic "…" header in place, then body below.
+            render_cutoff_hint(f, Rect::new(bumped.x, bumped.y, bumped.width, 1), t);
+            if bumped.height > 1 {
+                let sub = Rect::new(bumped.x, bumped.y + 1, bumped.width, bumped.height - 1);
+                v.render(f, sub, i, app);
+            }
+        }
+        draw_y = draw_y.saturating_add(draw_h);
+        if draw_y >= end_y {
+            break;
+        }
+    }
+
+    // Sticky live-tail chip when the user scrolled up.
+    let live_tail = app.focus_idx.is_none() && app.scroll.is_none();
+    if !live_tail && max_offset > 0 && offset < max_offset {
+        let chip = " ⬇ live tail (End) ";
+        let w = chip.chars().count() as u16;
+        if content.width > w + 2 {
+            let cx = content.x + (content.width - w) / 2;
+            let cy = content.y + content.height.saturating_sub(1);
+            let rect = Rect::new(cx, cy, w, 1);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    chip,
+                    Style::default()
+                        .bg(t.accent)
+                        .fg(Color::Rgb(0, 0, 0))
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                rect,
+            );
+        }
+    }
+
+    // Scrollbar column.
+    draw_scrollbar(f, sbar_col, offset, viewport, total_h, t);
+}
+
+fn render_cutoff_hint(f: &mut ratatui::Frame, area: Rect, t: &Theme) {
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "   ⋯  (card continues above)",
+            Style::default().fg(t.dim),
+        ))),
+        area,
+    );
+}
+
+fn draw_scrollbar(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    offset: u16,
+    viewport: u16,
+    total: u16,
+    t: &Theme,
+) {
+    if area.height == 0 || total <= viewport {
+        return;
+    }
+    // Thumb size proportional to visible/total, min 1 row.
+    let thumb_size = ((viewport as u32 * area.height as u32) / total.max(1) as u32) as u16;
+    let thumb_size = thumb_size.max(1).min(area.height);
+    let track_range = area.height.saturating_sub(thumb_size);
+    let thumb_pos = if total > viewport {
+        (offset as u32 * track_range as u32 / (total - viewport).max(1) as u32) as u16
+    } else {
+        0
+    };
+    for row in 0..area.height {
+        let y = area.y + row;
+        let ch = if row >= thumb_pos && row < thumb_pos + thumb_size {
+            "│"
+        } else {
+            "·"
+        };
+        let style = if row >= thumb_pos && row < thumb_pos + thumb_size {
+            Style::default().fg(t.accent)
+        } else {
+            Style::default().fg(t.dim)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(ch, style))),
+            Rect::new(area.x, y, 1, 1),
+        );
+    }
 }
 
 fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -2634,20 +2960,35 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
             kb("Ctrl+C"),
             Span::raw(" quit"),
         ]
+    } else if app.focus_idx.is_some() {
+        vec![
+            kb("j/k"),
+            Span::raw(" nav · "),
+            kb("Enter"),
+            Span::raw(" expand · "),
+            kb("g/G"),
+            Span::raw(" top/bot · "),
+            kb("Esc"),
+            Span::raw(" exit · "),
+            kb("Ctrl+C"),
+            Span::raw(" quit"),
+        ]
     } else {
         vec![
             kb("Enter"),
             Span::raw(" send · "),
             kb("/"),
             Span::raw(" cmds · "),
+            kb("Ctrl+F"),
+            Span::raw(" focus · "),
             kb("F5"),
             Span::raw(" model · "),
             kb("F6"),
             Span::raw(" think · "),
             kb("F7"),
             Span::raw(" stats · "),
-            kb("F8"),
-            Span::raw(" compact · "),
+            kb("Alt+T"),
+            Span::raw(" theme · "),
             kb("?"),
             Span::raw(" help · "),
             kb("Ctrl+C"),
@@ -2659,21 +3000,20 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
         spans.push(Span::styled(
             format!("• {msg}"),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app.theme.warning)
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    // Extension statuses (keyed by extension) right after hints.
     for (k, v) in &app.ext_ui.statuses {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
             format!("[{k}] "),
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(app.theme.role_thinking),
         ));
-        spans.push(Span::raw(v.clone()));
+        spans.push(Span::styled(v.clone(), Style::default().fg(app.theme.text)));
     }
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().add_modifier(Modifier::DIM)),
+        Paragraph::new(Line::from(spans)).style(Style::default().fg(app.theme.muted)),
         hints,
     );
 }
@@ -2796,7 +3136,49 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+    // For list-style modals, scroll the body so the selected row stays in
+    // the viewport (centered where possible). The body layout puts the
+    // filter on line 0, a blank on line 1, and items starting at line 2.
+    let selected_line = match modal {
+        Modal::Commands(l) => Some(2 + l.selected as u16),
+        Modal::Models(l) => Some(2 + l.selected as u16),
+        Modal::History(l) => Some(2 + l.selected as u16),
+        Modal::Forks(l) => Some(2 + l.selected as u16),
+        Modal::ExtSelect { selected, .. } => Some(*selected as u16),
+        _ => None,
+    };
+
+    let body_owned = body;
+    let total_lines = body_owned.lines.len() as u16;
+    let viewport = inner.height;
+    let scroll_y = if let Some(line) = selected_line {
+        if total_lines > viewport {
+            let half = viewport / 2;
+            line.saturating_sub(half)
+                .min(total_lines.saturating_sub(viewport))
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let main_area = if total_lines > viewport && inner.width > 2 {
+        // Reserve a 1-column scrollbar track on the right.
+        let w = inner.width.saturating_sub(1);
+        let sbar = Rect::new(inner.x + w, inner.y, 1, inner.height);
+        draw_scrollbar(f, sbar, scroll_y, viewport, total_lines, t);
+        Rect::new(inner.x, inner.y, w, inner.height)
+    } else {
+        inner
+    };
+
+    f.render_widget(
+        Paragraph::new(body_owned)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y, 0)),
+        main_area,
+    );
 }
 
 fn help_text(t: &Theme) -> Text<'static> {
