@@ -11,6 +11,7 @@
 //!   cycles the composer between steer / follow-up intent during streaming
 //! - F8 = compact now, F9 = toggle auto-compaction, F10 = toggle auto-retry
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{Stdout, stdout};
 use std::panic;
@@ -53,7 +54,8 @@ use crate::ui::transcript::{
 };
 
 pub async fn run(args: Args) -> Result<()> {
-    install_panic_hook();
+    let caps = crate::term_caps::detect();
+    install_panic_hook(caps.kitty_keyboard);
     enable_raw_mode()?;
     execute!(
         stdout(),
@@ -61,10 +63,32 @@ pub async fn run(args: Args) -> Result<()> {
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
+    if caps.kitty_keyboard {
+        // Ask the terminal for disambiguated modifier + key-release events.
+        // Lets Ctrl+Shift+T (and similar) actually arrive with both flags.
+        use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+        let _ = execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        );
+    }
+    tracing::info!(
+        kind = ?caps.kind,
+        kitty_keyboard = caps.kitty_keyboard,
+        graphics = caps.graphics,
+        "terminal caps"
+    );
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let result = run_inner(&mut terminal, args).await;
 
+    if caps.kitty_keyboard {
+        use crossterm::event::PopKeyboardEnhancementFlags;
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(
         stdout(),
         DisableBracketedPaste,
@@ -77,9 +101,13 @@ pub async fn run(args: Args) -> Result<()> {
     result
 }
 
-fn install_panic_hook() {
+fn install_panic_hook(kitty: bool) {
     let original = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
+        if kitty {
+            use crossterm::event::PopKeyboardEnhancementFlags;
+            let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(
             stdout(),
             DisableBracketedPaste,
@@ -92,6 +120,40 @@ fn install_panic_hook() {
 }
 
 // ───────────────────────────────────────────────────────── state ──
+
+/// Hit-test map populated by `draw_body`. Mouse handlers consult it to map
+/// screen coordinates to transcript entries.
+#[derive(Debug, Default, Clone)]
+struct MouseMap {
+    body_rect: Rect,
+    /// `(y_start, y_end_exclusive, entry_idx)` for each visible card/row.
+    visible: Vec<(u16, u16, usize)>,
+    /// Rect of the "⬇ live tail" chip when visible.
+    live_tail_chip: Option<Rect>,
+}
+
+impl MouseMap {
+    fn clear(&mut self) {
+        self.visible.clear();
+        self.live_tail_chip = None;
+    }
+
+    fn entry_at(&self, x: u16, y: u16) -> Option<usize> {
+        if !rect_contains(self.body_rect, x, y) {
+            return None;
+        }
+        for &(y0, y1, idx) in &self.visible {
+            if y >= y0 && y < y1 {
+                return Some(idx);
+            }
+        }
+        None
+    }
+}
+
+fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerMode {
@@ -183,6 +245,9 @@ struct App {
     // ── V2.2: focus mode (Ctrl+F toggles; j/k navigate cards) ────────────
     focus_idx: Option<usize>,
 
+    // ── V2.4: mouse hit-test map, refreshed on every draw ────────────────
+    mouse_map: RefCell<MouseMap>,
+
     // ── V2.1: live status signals ────────────────────────────────────────
     live: LiveState,
     live_since_tick: u64,
@@ -219,6 +284,7 @@ impl App {
             history: History::load(),
             theme: *theme::default_theme(),
             focus_idx: None,
+            mouse_map: RefCell::new(MouseMap::default()),
             live: LiveState::Idle,
             live_since_tick: 0,
             tool_running: 0,
@@ -871,7 +937,12 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
             }
             app.history.reset_walk();
         }
-        Event::Mouse(MouseEvent { kind, .. }) => match kind {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: _,
+        }) => match kind {
             MouseEventKind::ScrollUp => {
                 let cur = app.scroll.unwrap_or(u16::MAX);
                 app.scroll = Some(cur.saturating_sub(4));
@@ -879,6 +950,9 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
             MouseEventKind::ScrollDown => {
                 let cur = app.scroll.unwrap_or(0);
                 app.scroll = Some(cur.saturating_add(4));
+            }
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                on_mouse_click(column, row, app);
             }
             _ => {}
         },
@@ -927,10 +1001,50 @@ fn handle_focus_key(code: KeyCode, _mods: KeyModifiers, app: &mut App) {
                 app.transcript.toggle_tool_expanded(&id);
             }
         }
+        KeyCode::Char('y') | KeyCode::Char('c') => {
+            // Copy the focused entry to the clipboard.
+            if let Some(entry) = app.transcript.entries().get(cur) {
+                let text = entry_as_plain_text(entry);
+                do_copy(app, &text);
+            }
+        }
         KeyCode::Char('q') => {
             app.focus_idx = None;
         }
         _ => {}
+    }
+}
+
+/// Mouse-click dispatcher: focus on transcript cards, toggle expand on a
+/// tool card's header row (2nd click toggles), re-pin live tail when the
+/// user clicks the ⬇ chip.
+fn on_mouse_click(x: u16, y: u16, app: &mut App) {
+    // Live-tail chip first. Copy out the rect so the Ref<_> is dropped
+    // before we mutate app.
+    let live_tail = app.mouse_map.borrow().live_tail_chip;
+    if let Some(r) = live_tail
+        && rect_contains(r, x, y)
+    {
+        app.scroll = None;
+        app.focus_idx = None;
+        app.flash("re-pinned live tail");
+        return;
+    }
+    // Transcript hit-test.
+    let hit = app.mouse_map.borrow().entry_at(x, y);
+    let Some(idx) = hit else {
+        return;
+    };
+    // If the clicked entry is a tool call AND we're already focused on it
+    // (second click), toggle its expanded state. Otherwise just focus.
+    let is_tool = matches!(app.transcript.entries().get(idx), Some(Entry::ToolCall(_)));
+    if app.focus_idx == Some(idx) && is_tool {
+        if let Some(Entry::ToolCall(tc)) = app.transcript.entries().get(idx) {
+            let id = tc.id.clone();
+            app.transcript.toggle_tool_expanded(&id);
+        }
+    } else {
+        app.focus_idx = Some(idx);
     }
 }
 
@@ -980,6 +1094,18 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
         (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
             if let Some(id) = last_tool_id(&app.transcript) {
                 app.transcript.toggle_tool_expanded(&id);
+            }
+        }
+        (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+            // Copy the most recent assistant message to the clipboard.
+            let last_assistant = app.transcript.entries().iter().rev().find_map(|e| match e {
+                Entry::Assistant(s) => Some(s.clone()),
+                _ => None,
+            });
+            if let Some(text) = last_assistant {
+                do_copy(app, &text);
+            } else {
+                app.flash("nothing to copy yet");
             }
         }
         (KeyCode::Char(' '), KeyModifiers::CONTROL) => {
@@ -1524,6 +1650,55 @@ fn last_tool_id(transcript: &Transcript) -> Option<String> {
     })
 }
 
+/// Copy `text` to the clipboard, reporting outcome via the transient flash.
+fn do_copy(app: &mut App, text: &str) {
+    match crate::clipboard::copy(text) {
+        Ok(ok) => {
+            let tag = match ok.backend {
+                crate::clipboard::Backend::Arboard => "",
+                crate::clipboard::Backend::Osc52 => " (osc52)",
+            };
+            app.flash(format!("✓ copied {} chars{tag}", ok.bytes));
+        }
+        Err(e) => app.flash(format!("copy failed: {e}")),
+    }
+}
+
+/// Plain-text rendering of a transcript entry for clipboard copy.
+fn entry_as_plain_text(e: &Entry) -> String {
+    match e {
+        Entry::User(s) => s.clone(),
+        Entry::Thinking(s) => s.clone(),
+        Entry::Assistant(s) => s.clone(),
+        Entry::ToolCall(tc) => {
+            let mut out = format!("# tool: {}\n", tc.name);
+            if !tc.args.is_null() {
+                out.push_str(&format!(
+                    "args: {}\n",
+                    serde_json::to_string_pretty(&tc.args).unwrap_or_else(|_| tc.args.to_string())
+                ));
+            }
+            if !tc.output.is_empty() {
+                out.push_str("---\n");
+                out.push_str(&crate::ui::ansi::strip(&tc.output));
+            }
+            out
+        }
+        Entry::BashExec(bx) => {
+            let mut out = format!("$ {}\n", bx.command);
+            out.push_str(&crate::ui::ansi::strip(&bx.output));
+            if bx.exit_code != 0 {
+                out.push_str(&format!("\n[exit {}]", bx.exit_code));
+            }
+            out
+        }
+        Entry::Info(s) | Entry::Warn(s) | Entry::Error(s) => s.clone(),
+        Entry::Compaction(c) => format!("compaction: {:?}", c.state),
+        Entry::Retry(r) => format!("retry attempt {}", r.attempt),
+        Entry::TurnMarker { number } => format!("--- turn {number} ---"),
+    }
+}
+
 /// Built-ins first (so they're easy to discover), then pi's own commands.
 fn merged_commands(pi_commands: &[CommandInfo]) -> Vec<CommandInfo> {
     let mut v = crate::ui::commands::builtins();
@@ -1798,10 +1973,7 @@ async fn try_pi_slash(app: &mut App, client: &RpcClient, name: &str, arg: &str) 
                     if text.is_empty() {
                         app.flash("no assistant message yet");
                     } else {
-                        app.flash(format!(
-                            "copied {} chars (clipboard wiring in V2.4)",
-                            text.len()
-                        ));
+                        do_copy(app, text);
                     }
                 }
                 Err(e) => app.flash(format!("copy failed: {e}")),
@@ -2552,10 +2724,34 @@ fn build_visuals(app: &App) -> Vec<Visual> {
                 }
             }
             Entry::Assistant(md) => {
-                let body = markdown::render(md);
+                let mut body = markdown::render(md);
+                // If this is the LAST entry AND pi is still actively
+                // streaming text, append a blinking block cursor to the
+                // final body line so the user can see "it's still going".
+                let is_streaming_tail = app.is_streaming
+                    && matches!(app.live, LiveState::Streaming | LiveState::Llm)
+                    && is_last_assistant(app, md);
+                if is_streaming_tail {
+                    let cursor_on = (app.ticks / 5).is_multiple_of(2);
+                    let cursor_span = Span::styled(
+                        if cursor_on { "▌" } else { " " },
+                        Style::default()
+                            .fg(t.role_assistant)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                    if let Some(last) = body.last_mut() {
+                        last.spans.push(cursor_span);
+                    } else {
+                        body.push(Line::from(cursor_span));
+                    }
+                }
                 out.push(Visual::Card(Card {
                     icon: "✦",
-                    title: "pi".into(),
+                    title: if is_streaming_tail {
+                        "pi · streaming".into()
+                    } else {
+                        "pi".into()
+                    },
                     right_title: Some(app.session.model_label.clone()),
                     body: if body.is_empty() {
                         vec![Line::from(Span::styled("…", Style::default().fg(t.dim)))]
@@ -2615,6 +2811,17 @@ fn build_visuals(app: &App) -> Vec<Visual> {
         }
     }
     out
+}
+
+fn is_last_assistant(app: &App, md: &str) -> bool {
+    app.transcript
+        .entries()
+        .last()
+        .and_then(|e| match e {
+            Entry::Assistant(s) => Some(s.as_str() == md),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 fn plain_paragraph(s: &str, color: Color) -> Vec<Line<'static>> {
@@ -3265,6 +3472,13 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
         }
     };
 
+    // Reset hit-test map for this frame.
+    {
+        let mut mm = app.mouse_map.borrow_mut();
+        mm.clear();
+        mm.body_rect = content;
+    }
+
     // Render visuals that intersect [offset .. offset+viewport).
     let mut y_cursor: u16 = 0;
     let mut draw_y: u16 = content.y;
@@ -3299,10 +3513,13 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
             // follow mode.
             v.render_clipped(f, target, i, app, skip, *h);
             if skip > 0 {
-                // Paint a subtle "continues above" hint on the first visible
-                // row so the user knows there's earlier content.
                 render_cutoff_hint(f, Rect::new(target.x, target.y, target.width, 1), t);
             }
+        }
+        // Record the on-screen rect of this visual for mouse hit-testing.
+        {
+            let mut mm = app.mouse_map.borrow_mut();
+            mm.visible.push((target.y, target.y + target.height, i));
         }
         draw_y = draw_y.saturating_add(draw_h);
         if draw_y >= end_y {
@@ -3329,6 +3546,7 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 ))),
                 rect,
             );
+            app.mouse_map.borrow_mut().live_tail_chip = Some(rect);
         }
     }
 

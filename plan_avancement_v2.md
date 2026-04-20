@@ -186,18 +186,37 @@ Also folds in V2.0 bug fixes the user reported (see "Fixes" below).
 
 ---
 
-## V2.4 — Images + Kitty keyboard + OSC 52
+## V2.4 — Clipboard, Kitty keys, mouse clicks, streaming cursor ✅ (core)
 
-- [ ] Feature-gated `images` (ratatui-image + viuer fallback + text fallback)
-- [ ] Terminal capability probe (`TERM_PROGRAM`, `KITTY_WINDOW_ID`, `TERM`)
-- [ ] Image paste: clipboard → base64 → `ImageContent` attachment
-- [ ] Kitty keyboard protocol enable/disable
-- [ ] OSC 52 clipboard write (SSH)
-- [ ] Mouse drag-select across transcript → OS clipboard
-- [ ] `arboard` primary; OSC 52 fallback
-- [ ] Drag-select region preserved across redraws
+### Delivered
+- [x] **Terminal capability probe** (`src/term_caps.rs`) — sniffs `TERM_PROGRAM`, `KITTY_WINDOW_ID`, `GHOSTTY_RESOURCES_DIR`, `TERM`. Returns `{ kind, kitty_keyboard, graphics }`. Logged at startup.
+- [x] **Kitty keyboard protocol** — enabled at startup when `caps.kitty_keyboard` is true (Kitty / Ghostty / WezTerm); popped on shutdown *and* in the panic hook so the terminal is always left clean. With this on, `Ctrl+Shift+T` now actually reaches us with both modifier flags set; other terminals still have the `Alt+T` / `F12` fallbacks from V2.0.
+- [x] **Real clipboard** (`src/clipboard.rs`) — `arboard` primary (native macOS / Windows / X11 / Wayland), OSC 52 fallback for SSH sessions + headless boxes + tmux with `set-clipboard`. Single `copy(text)` entry point returns a `CopyOutcome { backend, bytes }`.
+- [x] **`/copy` + `Ctrl+Y`** — `/copy` fetches the last assistant text via `GetLastAssistantText` RPC and writes it to the clipboard. `Ctrl+Y` outside focus mode does the same directly from the transcript. In focus mode, `y` (or `c`) copies the focused card's plain-text rendering (user / thinking / assistant / tool-call-with-args / bash-with-output).
+- [x] **Mouse click-to-focus** — new `on_mouse_click` reads the per-frame `MouseMap` populated during `draw_body` and maps (x, y) to an entry index. First click on any transcript card = focus it. Second click on the same tool card = toggle its expanded state.
+- [x] **Click the `⬇ live tail` chip** — the chip's rect is captured in `MouseMap::live_tail_chip`; clicking it re-pins the transcript to the bottom (same as pressing `End`).
+- [x] **Animated streaming cursor** — the last assistant card appends a blinking `▌` (0.5 Hz via `ticks / 5 % 2`) while pi is actively streaming text. The card title flips to `pi · streaming` during that window so the reader instantly sees "still going".
+- [x] **Flash feedback** on copy: `✓ copied 312 chars` or `✓ copied 312 chars (osc52)` depending on backend.
 
-**Notes:** _(to fill in)_
+### New modules
+- `src/term_caps.rs` — `detect()` + `Caps` struct + `TerminalKind` enum. 1 test (smoke).
+- `src/clipboard.rs` — `copy(text)` + `CopyOutcome` + `Backend`. 1 test.
+
+### Deferred (kept for V2.4b / V2.5)
+- [ ] Image paste (clipboard → PNG → base64 → `ImageContent`) — needs a PNG encoder on the critical path. I wired the `arboard::get_image` surface but stubbed the PNG encode; landing the full path wants a small `image` crate inclusion under the `images` feature, which I'd rather bundle with the ratatui-image rendering work.
+- [ ] `ratatui-image` rendering — feature-gated. Scope parked to V2.4b so the default build doesn't take the hit.
+- [ ] Mouse drag-select across transcript — crossterm's drag events are present but building a selection buffer on top of virtualized cards is its own milestone. V2.5 with the buffer-backed render.
+
+### Tests + gates
+- 72/72 pass (V2.3 70 + 1 term_caps + 1 clipboard).
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo fmt --check` clean.
+
+**Notes:**
+- `MouseMap` lives behind a `RefCell<MouseMap>` on `App` so `draw_body` (which takes `&App`) can refresh it without the signature churn of passing `&mut App` through every drawing helper.
+- The streaming cursor uses `anim`'s principles but doesn't need a dedicated `Anim` — the 100 ms tick source already drives `app.ticks`, so `(ticks / 5).is_multiple_of(2)` gives a 2 Hz blink.
+- On the focus-mode hotkey question: `c` is also bound to copy in focus mode (Gmail-style), alongside `y`. Both work.
+- The capability probe is conservative: we only enable Kitty keyboard on known-good terminals rather than probing via escape sequences. If your terminal claims kitty protocol but isn't on the list, set `TERM=xterm-kitty` or file an extra detection env var.
 
 ---
 

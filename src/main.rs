@@ -1,9 +1,11 @@
 mod anim;
 mod app;
 mod cli;
+mod clipboard;
 mod history;
 mod log;
 mod rpc;
+mod term_caps;
 mod theme;
 mod ui;
 

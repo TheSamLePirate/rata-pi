@@ -35,6 +35,10 @@ tracing-appender = "0.2"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 
+# Clipboard (arboard primary, OSC 52 fallback for SSH).
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+base64 = "0.22"
+
 # Rendering
 pulldown-cmark = { version = "0.13", default-features = false }
 syntect = { version = "5", default-features = false, features = [
