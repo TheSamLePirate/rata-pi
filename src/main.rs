@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod log;
 mod rpc;
+mod ui;
 
 use clap::Parser;
 use color_eyre::eyre::Result;

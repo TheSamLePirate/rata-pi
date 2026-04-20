@@ -28,17 +28,25 @@ Goal: async runtime, process spawn, JSONL plumbing, panic-safe terminal restore,
 
 ---
 
-## M1 — MVP chat (Phase 1)
+## M1 — MVP chat (Phase 1) ✅
 
-- [ ] Port all RPC types (commands + events + domain) with serde
-- [ ] `RpcClient` with request/response correlation via oneshot map
-- [ ] Transcript widget — append-only, auto-scroll, user + assistant streaming
-- [ ] Editor widget (single-line first, then multi-line) with Enter submit / Esc abort
-- [ ] Header (model) + footer (working state + spinner)
-- [ ] Bracketed paste (plain text)
-- [ ] Graceful shutdown: abort → drain → kill
+- [x] Port all RPC types — domain (`types.rs`), commands (`commands.rs`), events (`events.rs`)
+- [x] `RpcClient` (actor pattern: writer + reader + stderr-drain tasks, oneshot correlation via `Arc<Mutex<HashMap<id, oneshot::Sender>>>`)
+- [x] Transcript widget with `append_assistant` streaming mutation and `finish_tool` status transition
+- [x] Single-line composer with Enter submit / Esc abort-or-clear-or-quit
+- [x] Header (model label, spinner, idle/streaming/offline state) + footer (context-dependent keybind hints)
+- [x] Bracketed paste support (newlines flattened to spaces in the single-line composer)
+- [x] Graceful shutdown: abort → writer shutdown → 500 ms wait → kill on timeout → task joins
+- [x] CI gates pass: 26/26 tests (codec + types + commands + events), `clippy -D warnings`, `fmt --check`
 
-**Deviations / notes:** _(to fill in)_
+**Deviations / notes:**
+- Added `src/ui/` module (transcript + view helpers). The plan sketched a deep `ui/widgets/*` tree; for M1 a flat module is enough — the widget split lands when rendering grows (M2 markdown + M3 pickers).
+- `message_update.message` and `assistantMessageEvent.partial` stay as `serde_json::Value` rather than deep-typed `AgentMessage`. Rationale: pi emits deltas MANY times per turn and we reconstruct UI state from deltas anyway. Snapshot events (`message_start`, `message_end`, `turn_end`, `agent_end`) use the typed `AgentMessage`. Noted here so M2 knows where to tighten.
+- `ExtensionUiResponse` carries its own top-level `"type":"extension_ui_response"` and is sent raw (not via `Envelope`). The naive design would have duplicated `id` fields; test coverage added to lock the wire shape.
+- Scroll math is approximate: offset counts *source* lines, not wrapped lines. Under auto-follow (the default) this is invisible; under manual scroll with long wrapped lines the bottom edge may drift by a few cells. Fix lands with the virtualized transcript in M5.
+- Kept compile-time `#![allow(dead_code)]` at the top of `rpc/{types,commands,events,process}.rs` and `client.rs` method-level allows because several commands/events/methods aren't surfaced in the UI until later milestones — all documented inline with the M# they belong to.
+- Added two deps omitted from `PLAN.md`'s initial table: `bytes` (required by `tokio-util` codec interface) and `futures` (for `crossterm::EventStream::next`). Worth adding to the plan for the record; functionally neutral.
+- Smoke test: `cargo run -- --help` prints the flags; `cargo build` succeeds on macOS. A full end-to-end smoke against a live `pi` binary hasn't been run yet — that belongs with the mock-pi integration test scheduled for the M2/M3 boundary.
 
 ---
 
