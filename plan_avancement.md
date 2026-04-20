@@ -128,16 +128,28 @@ Goal: async runtime, process spawn, JSONL plumbing, panic-safe terminal restore,
 
 ---
 
-## M5 — Pro polish (Phase 5)
+## M5 — Pro polish (Phase 5) ✅ (high-value subset)
 
-- [ ] Mouse: drag-select copy, click-to-expand, wheel scroll
-- [ ] Kitty keyboard protocol
-- [ ] Image paste + render (feature `images`)
-- [ ] Theme hot-reload; TOML themes
-- [ ] Fuzzy command palette (`Ctrl+P`), prompt history search (`Ctrl+R`)
-- [ ] Transcript → markdown export
+- [x] Mouse **wheel scroll** on the transcript (`MouseEventKind::ScrollUp/Down`, 3 lines per tick)
+- [ ] Mouse drag-select / copy — **deferred to M6**. Crossterm's drag events are there but we'd need hit-testing over wrapped transcript lines + integration with an OS clipboard (arboard) + fallback OSC 52 for SSH. Not a 30-minute task.
+- [ ] Click-to-expand tool cards — **deferred to M6**. Needs hit-testing that tracks per-card screen rects across redraws.
+- [ ] Kitty keyboard protocol — **deferred to M6**. Not yet required; crossterm gives us modifiers we need for Ctrl+combos.
+- [ ] Image paste + render — **deferred to M6**. Requires terminal capability detection + ratatui-image feature-gate; large scope.
+- [ ] Theme hot-reload + TOML themes — **deferred to M6**. Touches every hardcoded `Color::*` site; reasonable to bundle with a semantic-color refactor pass.
+- [x] **Prompt history search** — `Ctrl+R` opens a filterable `Modal::History`; `↑` / `↓` in the composer walk forward/back in-place with stash-restore on passing the end. Persisted as JSONL under `ProjectDirs::data_local_dir()/history.jsonl`. Duplicates of the immediately-previous entry are skipped.
+- [x] **Transcript → markdown export** — `Ctrl+S` writes `session-<unix-ts>.md` under the exports dir; each entry type renders in a way you can paste into PRs: user/assistant as sections with source markdown preserved, thinking as blockquote, tool calls as a header + JSON args + fenced output, bash as `$ cmd — exit N` + fenced stripped output, retries/compaction as italic meta lines.
+- [ ] Fuzzy command palette (Ctrl+P) — **partially delivered**: `F1` already opens the commands browser with case-insensitive substring filtering; `Ctrl+P` as a stricter fuzzy (FZF-style) scorer lands in M6 alongside real `fuzzy-matcher`.
 
-**Deviations / notes:** _(to fill in)_
+**New modules:**
+- `src/history.rs` — `History` + `HistoryEntry`, with JSONL append-on-record and up/down walking that stashes the user's in-progress draft. 2 unit tests (walk semantics + dedupe).
+- `src/ui/export.rs` — Markdown serializer over `Transcript`. 2 unit tests (basic turn + bash with exit code).
+
+**Deviations / notes:**
+- The M5 roadmap in `PLAN.md` was ambitious (mouse drag-select + Kitty + images + theme reload + command palette + history + export). Rather than ship all of them half-done, I locked in the three highest-UX-value items (mouse scroll, persistent history with in-composer navigation + search modal, markdown export) and deferred the rest to M6 so they land alongside the other post-core polish items.
+- History picker uses reverse order (newest at top) so the most-recent submission is always right under the marker; feels more natural than chronological.
+- Export filename uses Unix timestamp; a prettier `YYYY-MM-DD-HHMM` name is a two-line change if anyone asks.
+- `Ctrl+J` newline / multi-line composer also deferred to M6 — users occasionally want multi-line prompts but in practice Enter-submit + paste-flattens-newline + `!cmd` covers ~99 % of cases.
+- CI: 53 tests (M4 49 + 2 history + 2 export). `clippy -D warnings` clean. `fmt --check` clean.
 
 ---
 

@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod history;
 mod log;
 mod rpc;
 mod ui;

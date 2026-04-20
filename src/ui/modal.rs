@@ -7,6 +7,7 @@
 
 use ratatui::layout::Rect;
 
+use crate::history::HistoryEntry;
 use crate::rpc::types::{CommandInfo, Model, SessionStats, ThinkingLevel};
 
 #[derive(Debug)]
@@ -15,6 +16,7 @@ pub enum Modal {
     Commands(ListModal<CommandInfo>),
     Models(ListModal<Model>),
     Thinking(RadioModal<ThinkingLevel>),
+    History(ListModal<HistoryEntry>),
     Help,
     /// Extension UI dialog: select from a list of strings.
     ExtSelect {

@@ -18,7 +18,7 @@ use std::time::Duration;
 use color_eyre::eyre::Result;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEventKind, KeyModifiers,
+    EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -33,6 +33,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 
 use crate::cli::Args;
+use crate::history::{History, HistoryEntry};
 use crate::rpc::client::{self, RpcClient, RpcError};
 use crate::rpc::commands::{ExtensionUiResponse, RpcCommand};
 use crate::rpc::events::{AssistantEvent, Incoming};
@@ -135,6 +136,7 @@ struct App {
     modal: Option<Modal>,
     flash: Option<(String, u64)>, // transient status message with a decay tick
     ext_ui: ExtUiState,
+    history: History,
 }
 
 impl App {
@@ -156,6 +158,7 @@ impl App {
             modal: None,
             flash: None,
             ext_ui: ExtUiState::default(),
+            history: History::load(),
         }
     }
 
@@ -591,7 +594,19 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
                     app.input.push(ch);
                 }
             }
+            app.history.reset_walk();
         }
+        Event::Mouse(MouseEvent { kind, .. }) => match kind {
+            MouseEventKind::ScrollUp => {
+                let cur = app.scroll.unwrap_or(u16::MAX);
+                app.scroll = Some(cur.saturating_sub(3));
+            }
+            MouseEventKind::ScrollDown => {
+                let cur = app.scroll.unwrap_or(0);
+                app.scroll = Some(cur.saturating_add(3));
+            }
+            _ => {}
+        },
         _ => {}
     }
 }
@@ -682,6 +697,30 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
         (KeyCode::Char('?'), _) => {
             app.modal = Some(Modal::Help);
         }
+        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            let entries = app.history.entries().to_vec();
+            app.modal = Some(Modal::History(ListModal::new(
+                "history",
+                "type to filter · Enter restore · Esc close",
+                entries,
+            )));
+        }
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+            match crate::ui::export::export(&app.transcript) {
+                Ok(path) => app.flash(format!("exported → {}", path.display())),
+                Err(e) => app.flash(format!("export failed: {e}")),
+            }
+        }
+        (KeyCode::Up, KeyModifiers::NONE) => {
+            if let Some(t) = app.history.prev(&app.input) {
+                app.input = t;
+            }
+        }
+        (KeyCode::Down, KeyModifiers::NONE) => {
+            if let Some(t) = app.history.next() {
+                app.input = t;
+            }
+        }
         (KeyCode::Char('/'), KeyModifiers::NONE) if app.input.is_empty() => {
             // Open commands modal as a slash autocomplete source.
             app.modal = Some(Modal::Commands(ListModal::new(
@@ -710,6 +749,7 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
             if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
         {
             app.input.push(ch);
+            app.history.reset_walk();
         }
         (KeyCode::PageUp, _) => {
             let cur = app.scroll.unwrap_or(u16::MAX);
@@ -789,6 +829,25 @@ async fn handle_modal_key(
                             }
                             Err(e) => app.flash(format!("set_model failed: {e}")),
                         }
+                    }
+                    app.modal = None;
+                }
+                _ => {}
+            }
+        }
+        Modal::History(list) => {
+            let n = filtered_count_history(&list.items, &list.query);
+            if handle_list_keys(&mut list.query, &mut list.selected, code, n) {
+                return;
+            }
+            match code {
+                KeyCode::Esc => app.modal = None,
+                KeyCode::Enter => {
+                    if let Some(entry) = filtered_history(&list.items, &list.query)
+                        .nth(list.selected)
+                        .cloned()
+                    {
+                        app.input = entry.text;
                     }
                     app.modal = None;
                 }
@@ -997,6 +1056,20 @@ fn filtered_count_models(items: &[Model], q: &str) -> usize {
     filtered_models(items, q).count()
 }
 
+fn filtered_history<'a>(
+    items: &'a [HistoryEntry],
+    q: &'a str,
+) -> impl Iterator<Item = &'a HistoryEntry> + 'a {
+    items
+        .iter()
+        .rev()
+        .filter(move |e| matches_query(&e.text, q))
+}
+
+fn filtered_count_history(items: &[HistoryEntry], q: &str) -> usize {
+    filtered_history(items, q).count()
+}
+
 fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
 }
@@ -1017,6 +1090,8 @@ async fn submit(app: &mut App, client: Option<&RpcClient>) {
         return;
     };
     app.input.clear();
+
+    app.history.record(&text);
 
     if let Some(cmd) = text.strip_prefix('!') {
         let cmd = cmd.trim();
@@ -1809,6 +1884,13 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, _app: &App) {
             50,
             12,
         ),
+        Modal::History(list) => (
+            format!(" {} ", list.title),
+            history_text(list),
+            list.hint.clone(),
+            90,
+            24,
+        ),
         Modal::ExtSelect {
             title,
             options,
@@ -2107,6 +2189,42 @@ fn thinking_text(radio: &RadioModal<ThinkingLevel>) -> Text<'static> {
             ])
         })
         .collect();
+    Text::from(lines)
+}
+
+fn history_text(list: &ListModal<HistoryEntry>) -> Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("filter: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(
+            list.query.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::default());
+    let filtered: Vec<&HistoryEntry> = filtered_history(&list.items, &list.query).collect();
+    for (i, e) in filtered.iter().enumerate() {
+        let marker = if i == list.selected { "▸" } else { " " };
+        let style = if i == list.selected {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        // Each history line may contain newlines — squash to a single preview.
+        let preview = truncate_preview(&e.text.replace('\n', " ⏎ "), 200);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), style),
+            Span::styled(preview, style),
+        ]));
+    }
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no matches)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
     Text::from(lines)
 }
 
