@@ -1,20 +1,19 @@
-use ratatui::{DefaultTerminal, Frame};
+mod app;
+mod cli;
+mod log;
+mod rpc;
 
-fn main() -> color_eyre::Result<()> {
+use clap::Parser;
+use color_eyre::eyre::Result;
+
+fn main() -> Result<()> {
     color_eyre::install()?;
-    ratatui::run(app)?;
-    Ok(())
-}
+    let args = cli::Args::parse();
+    let _log = log::init(args.log_level.as_deref())?;
 
-fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
-    loop {
-        terminal.draw(render)?;
-        if crossterm::event::read()?.is_key_press() {
-            break Ok(());
-        }
-    }
-}
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
 
-fn render(frame: &mut Frame) {
-    frame.render_widget("hello world", frame.area());
+    runtime.block_on(app::run(args))
 }
