@@ -1,15 +1,20 @@
-//! M1 app: streaming chat over RPC.
+//! M2 app: streaming chat with thinking, tool cards, markdown, bash RPC.
 //!
-//! Spawns pi, fires `get_state` to learn the current model, then runs a tokio
-//! `select!` over:
-//! - `Incoming` events from the RPC reader
-//! - `crossterm` key/paste/resize events
-//! - a 100 ms ticker for spinner animation
+//! Events we consume:
+//! - agent_start / agent_end — streaming state + spinner
+//! - message_update{text_delta,thinking_delta,thinking_end,error}
+//! - tool_execution_start/update/end — live tool card with streaming output
+//! - auto_retry_start/end — typed retry row that updates in place
+//! - compaction_start/end — typed compaction row that updates in place
+//! - extension_error — error row
 //!
-//! User input is a single-line composer (multi-line lands in M5). Submitting
-//! fires `prompt`; `Esc` during streaming fires `abort`; `Ctrl+C`/`Ctrl+D`
-//! quits. Streaming assistant text appends to the last transcript entry via
-//! `Transcript::append_assistant`.
+//! User input:
+//! - `Enter` submits a prompt (or steer during streaming)
+//! - Prefix `!cmd` and Enter runs pi's `bash` RPC and inserts a BashExec row
+//! - `Ctrl+T` toggles thinking visibility
+//! - `Ctrl+E` expands/collapses the last tool call
+//! - `Esc` aborts during streaming (or clears, or quits)
+//! - `PgUp/PgDn` scrolls; `End` re-follows tail
 
 use std::io::{Stdout, stdout};
 use std::panic;
@@ -27,7 +32,7 @@ use crossterm::terminal::{
 use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -37,7 +42,11 @@ use crate::rpc::client::{self, RpcClient, RpcError};
 use crate::rpc::commands::RpcCommand;
 use crate::rpc::events::{AssistantEvent, Incoming};
 use crate::rpc::types::{State, StreamingBehavior};
-use crate::ui::transcript::{Entry, ToolStatus, Transcript};
+use crate::ui::markdown;
+use crate::ui::transcript::{
+    BashExec, Compaction, CompactionState, Entry, Retry, RetryState, ToolCall, ToolStatus,
+    Transcript,
+};
 
 pub async fn run(args: Args) -> Result<()> {
     install_panic_hook();
@@ -84,15 +93,12 @@ struct App {
     transcript: Transcript,
     input: String,
     is_streaming: bool,
-    streaming_failed: Option<String>,
     model_label: String,
     ticks: u64,
     quit: bool,
-    /// User-controlled scroll offset from the top of the transcript in source
-    /// lines. `None` means auto-follow the bottom.
+    /// Viewport scroll offset; `None` means auto-follow bottom.
     scroll: Option<u16>,
-    /// Populated when pi couldn't be spawned — the whole UI becomes read-only
-    /// with a banner.
+    show_thinking: bool,
     spawn_error: Option<String>,
 }
 
@@ -102,11 +108,11 @@ impl App {
             transcript: Transcript::default(),
             input: String::new(),
             is_streaming: false,
-            streaming_failed: None,
             model_label,
             ticks: 0,
             quit: false,
             scroll: None,
+            show_thinking: false,
             spawn_error,
         }
     }
@@ -119,13 +125,8 @@ impl App {
 
     fn on_event(&mut self, ev: Incoming) {
         match ev {
-            Incoming::AgentStart => {
-                self.is_streaming = true;
-                self.streaming_failed = None;
-            }
-            Incoming::AgentEnd { .. } => {
-                self.is_streaming = false;
-            }
+            Incoming::AgentStart => self.is_streaming = true,
+            Incoming::AgentEnd { .. } => self.is_streaming = false,
             Incoming::MessageUpdate {
                 assistant_message_event,
                 ..
@@ -133,23 +134,38 @@ impl App {
                 AssistantEvent::TextDelta { delta, .. } => {
                     self.transcript.append_assistant(&delta);
                 }
+                AssistantEvent::ThinkingDelta { delta, .. } => {
+                    self.transcript.append_thinking(&delta);
+                }
                 AssistantEvent::Error { reason, .. } => {
-                    self.streaming_failed = Some(format!("{reason:?}"));
+                    self.transcript
+                        .push(Entry::Warn(format!("stream error: {reason:?}")));
                 }
                 _ => {}
             },
-            Incoming::ToolExecutionStart { tool_name, .. } => {
-                self.transcript.push(Entry::Tool {
-                    name: tool_name,
-                    status: ToolStatus::Running,
-                });
+            Incoming::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => {
+                self.transcript.start_tool(tool_call_id, tool_name, args);
+            }
+            Incoming::ToolExecutionUpdate {
+                tool_call_id,
+                partial_result,
+                ..
+            } => {
+                self.transcript
+                    .update_tool_output(&tool_call_id, &partial_result);
             }
             Incoming::ToolExecutionEnd {
-                tool_name,
+                tool_call_id,
+                result,
                 is_error,
                 ..
             } => {
-                self.transcript.finish_tool(&tool_name, !is_error);
+                self.transcript
+                    .finish_tool(&tool_call_id, &result, is_error);
             }
             Incoming::AutoRetryStart {
                 attempt,
@@ -157,45 +173,46 @@ impl App {
                 delay_ms,
                 error_message,
             } => {
-                self.transcript.push(Entry::Warn(format!(
-                    "retry {attempt}/{max_attempts} in {delay_ms}ms: {}",
-                    error_message.as_deref().unwrap_or("transient error")
-                )));
+                self.transcript.push_retry_waiting(
+                    attempt,
+                    max_attempts,
+                    delay_ms,
+                    error_message.unwrap_or_else(|| "transient error".into()),
+                );
             }
             Incoming::AutoRetryEnd {
                 success,
+                attempt,
                 final_error,
-                ..
             } => {
-                if success {
-                    self.transcript.push(Entry::Info("retry succeeded".into()));
+                let state = if success {
+                    RetryState::Succeeded
                 } else {
-                    self.transcript.push(Entry::Error(format!(
-                        "retry exhausted: {}",
-                        final_error.as_deref().unwrap_or("unknown")
-                    )));
-                }
+                    RetryState::Exhausted(final_error.unwrap_or_else(|| "unknown".into()))
+                };
+                self.transcript.resolve_retry(attempt, state);
             }
             Incoming::CompactionStart { reason } => {
-                self.transcript
-                    .push(Entry::Info(format!("compaction started ({reason:?})")));
+                self.transcript.push_compaction_start(format!("{reason:?}"));
             }
             Incoming::CompactionEnd {
                 reason,
+                result,
                 aborted,
                 error_message,
                 ..
             } => {
-                if aborted {
-                    self.transcript
-                        .push(Entry::Warn(format!("compaction aborted ({reason:?})")));
+                let reason = format!("{reason:?}");
+                let state = if aborted {
+                    CompactionState::Aborted
                 } else if let Some(msg) = error_message {
-                    self.transcript
-                        .push(Entry::Error(format!("compaction failed: {msg}")));
+                    CompactionState::Failed(msg)
                 } else {
-                    self.transcript
-                        .push(Entry::Info("compaction complete".into()));
-                }
+                    CompactionState::Done {
+                        summary: result.map(|r| r.summary),
+                    }
+                };
+                self.transcript.finish_compaction(reason, state);
             }
             Incoming::ExtensionError { error, .. } => {
                 self.transcript.push(Entry::Error(format!(
@@ -203,9 +220,6 @@ impl App {
                     error.as_deref().unwrap_or("(no detail)")
                 )));
             }
-            // Everything else (turn_*, message_start/end, tool_execution_update,
-            // queue_update, extension_ui_request, response) is rendered in
-            // M2/M3/M4; ignoring them here doesn't affect correctness.
             _ => {}
         }
     }
@@ -214,18 +228,15 @@ impl App {
 // ───────────────────────────────────────────────────────── main loop ──
 
 async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: Args) -> Result<()> {
-    // Try to spawn pi. If it fails we still present the UI with a banner so
-    // the user can see what's wrong and quit cleanly.
     let (client_and_io, spawn_error) =
         match client::spawn(&args.pi_bin, &args.pi_argv(), args.debug_rpc) {
             Ok(pair) => (Some(pair), None),
             Err(e) => (None, Some(format!("{e:#}"))),
         };
 
-    let mut app = App::new("unknown model".into(), spawn_error.clone());
+    let mut app = App::new("unknown model".into(), spawn_error);
 
     if let Some((client, mut io)) = client_and_io {
-        // Best-effort fetch of current state for the header.
         match client.call(RpcCommand::GetState).await {
             Ok(ok) => {
                 if let Some(v) = ok.data
@@ -237,7 +248,8 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: Args
             Err(e) => tracing::warn!(error = ?e, "initial get_state failed"),
         }
         app.transcript.push(Entry::Info(
-            "connected to pi — type a message and press Enter. Ctrl+C to quit.".into(),
+            "connected to pi — type a message and press Enter · `!cmd` runs bash · Ctrl+T thinking · Ctrl+C quit"
+                .into(),
         ));
 
         ui_loop(terminal, &mut app, Some(&client), &mut io.events).await?;
@@ -246,15 +258,12 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: Args
             tracing::warn!(error = ?e, "shutdown error");
         }
     } else {
-        // No client; just run the UI until the user quits.
         ui_loop(terminal, &mut app, None, &mut dummy_events()).await?;
     }
 
     Ok(())
 }
 
-/// Returns a receiver that is immediately closed — lets us share the same
-/// `ui_loop` code when pi failed to spawn.
 fn dummy_events() -> tokio::sync::mpsc::Receiver<Incoming> {
     let (_tx, rx) = tokio::sync::mpsc::channel::<Incoming>(1);
     rx
@@ -268,7 +277,6 @@ async fn ui_loop(
 ) -> Result<()> {
     let mut crossterm_events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
-    // First tick is immediate; discard so the spinner matches wall-clock.
     ticker.tick().await;
 
     loop {
@@ -278,18 +286,11 @@ async fn ui_loop(
         }
 
         tokio::select! {
-            Some(msg) = events.recv() => {
-                app.on_event(msg);
-            }
-            Some(Ok(ev)) = crossterm_events.next() => {
-                handle_crossterm(ev, app, client).await;
-            }
-            _ = ticker.tick() => {
-                app.ticks = app.ticks.wrapping_add(1);
-            }
+            Some(msg) = events.recv() => app.on_event(msg),
+            Some(Ok(ev)) = crossterm_events.next() => handle_crossterm(ev, app, client).await,
+            _ = ticker.tick() => app.ticks = app.ticks.wrapping_add(1),
         }
     }
-
     Ok(())
 }
 
@@ -297,8 +298,14 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => match (k.code, k.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL)
-            | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                app.quit = true;
+            | (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
+            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                app.show_thinking = !app.show_thinking;
+            }
+            (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                if let Some(id) = last_tool_id(&app.transcript) {
+                    app.transcript.toggle_tool_expanded(&id);
+                }
             }
             (KeyCode::Esc, _) => {
                 if app.is_streaming {
@@ -312,9 +319,7 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
                     app.quit = true;
                 }
             }
-            (KeyCode::Enter, _) => {
-                submit(app, client).await;
-            }
+            (KeyCode::Enter, _) => submit(app, client).await,
             (KeyCode::Backspace, _) => {
                 app.input.pop();
             }
@@ -331,14 +336,10 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
                 let cur = app.scroll.unwrap_or(0);
                 app.scroll = Some(cur.saturating_add(5));
             }
-            (KeyCode::End, _) => {
-                app.scroll = None;
-            }
+            (KeyCode::End, _) => app.scroll = None,
             _ => {}
         },
         Event::Paste(text) => {
-            // Bracketed paste: insert literally (collapsed newlines to spaces
-            // since the M1 composer is single-line). Multi-line editor in M5.
             for ch in text.chars() {
                 if ch == '\n' || ch == '\r' {
                     app.input.push(' ');
@@ -347,9 +348,15 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
                 }
             }
         }
-        Event::Resize(_, _) => { /* next draw picks up the new size */ }
         _ => {}
     }
+}
+
+fn last_tool_id(transcript: &Transcript) -> Option<String> {
+    transcript.entries().iter().rev().find_map(|e| match e {
+        Entry::ToolCall(tc) => Some(tc.id.clone()),
+        _ => None,
+    })
 }
 
 async fn submit(app: &mut App, client: Option<&RpcClient>) {
@@ -360,24 +367,48 @@ async fn submit(app: &mut App, client: Option<&RpcClient>) {
     let Some(client) = client else {
         return;
     };
-
-    app.transcript.push(Entry::User(text.clone()));
     app.input.clear();
 
-    let cmd = if app.is_streaming {
-        // During streaming we must specify streamingBehavior. Default to
-        // "steer" — deliver after the current turn's tool calls finish.
-        RpcCommand::Prompt {
-            message: text,
-            images: vec![],
-            streaming_behavior: Some(StreamingBehavior::Steer),
+    // Bash prefix `!cmd` — invoke pi's bash RPC directly.
+    if let Some(cmd) = text.strip_prefix('!') {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return;
         }
-    } else {
-        RpcCommand::Prompt {
-            message: text,
-            images: vec![],
-            streaming_behavior: None,
+        let cmd = cmd.to_string();
+        app.transcript.push(Entry::User(format!("!{cmd}")));
+        match client
+            .call(RpcCommand::Bash {
+                command: cmd.clone(),
+            })
+            .await
+        {
+            Ok(ok) => {
+                let value = ok.data.unwrap_or(serde_json::Value::Null);
+                let exec = parse_bash_result(&cmd, &value);
+                app.transcript.push(Entry::BashExec(exec));
+            }
+            Err(e) => {
+                let msg = match e {
+                    RpcError::Remote { message, .. } => message,
+                    other => other.to_string(),
+                };
+                app.transcript
+                    .push(Entry::Error(format!("bash failed: {msg}")));
+            }
         }
+        return;
+    }
+
+    app.transcript.push(Entry::User(text.clone()));
+    let cmd = RpcCommand::Prompt {
+        message: text,
+        images: vec![],
+        streaming_behavior: if app.is_streaming {
+            Some(StreamingBehavior::Steer)
+        } else {
+            None
+        },
     };
     if let Err(e) = client.fire(cmd).await {
         let msg = match e {
@@ -386,6 +417,30 @@ async fn submit(app: &mut App, client: Option<&RpcClient>) {
         };
         app.transcript
             .push(Entry::Error(format!("prompt failed: {msg}")));
+    }
+}
+
+fn parse_bash_result(command: &str, v: &serde_json::Value) -> BashExec {
+    BashExec {
+        command: command.to_string(),
+        output: v
+            .get("output")
+            .and_then(|o| o.as_str())
+            .map(crate::ui::ansi::strip)
+            .unwrap_or_default(),
+        exit_code: v.get("exitCode").and_then(|o| o.as_i64()).unwrap_or(-1) as i32,
+        cancelled: v
+            .get("cancelled")
+            .and_then(|o| o.as_bool())
+            .unwrap_or(false),
+        truncated: v
+            .get("truncated")
+            .and_then(|o| o.as_bool())
+            .unwrap_or(false),
+        full_output_path: v
+            .get("fullOutputPath")
+            .and_then(|o| o.as_str())
+            .map(String::from),
     }
 }
 
@@ -409,7 +464,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     draw_footer(f, footer, app);
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
+fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let spinner = if app.is_streaming {
         Span::styled(
             format!("{} ", SPINNER[(app.ticks as usize) % SPINNER.len()]),
@@ -425,6 +480,11 @@ fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     } else {
         Span::styled("idle", Style::default().add_modifier(Modifier::DIM))
     };
+    let thinking_badge = if app.show_thinking {
+        Span::styled("  think ●", Style::default().fg(Color::Magenta))
+    } else {
+        Span::styled("  think ○", Style::default().add_modifier(Modifier::DIM))
+    };
     let line = Line::from(vec![
         Span::styled(
             " rata-pi ",
@@ -435,23 +495,25 @@ fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
         Span::styled(&app.model_label, Style::default().fg(Color::Magenta)),
         Span::raw("  ·  "),
         status,
+        thinking_badge,
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn entries_to_text(entries: &[Entry]) -> Text<'_> {
-    let mut lines: Vec<Line<'_>> = Vec::with_capacity(entries.len() * 2);
+fn entries_to_lines(entries: &[Entry], show_thinking: bool) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(entries.len() * 4);
     for e in entries {
         match e {
             Entry::User(s) => {
+                let label = Span::styled(
+                    "you › ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                );
                 for (i, part) in s.split('\n').enumerate() {
                     let prefix = if i == 0 {
-                        Span::styled(
-                            "you › ",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
-                        )
+                        label.clone()
                     } else {
                         Span::raw("      ")
                     };
@@ -459,36 +521,60 @@ fn entries_to_text(entries: &[Entry]) -> Text<'_> {
                 }
                 lines.push(Line::default());
             }
-            Entry::Assistant(s) => {
-                for (i, part) in s.split('\n').enumerate() {
-                    let prefix = if i == 0 {
-                        Span::styled(
-                            "pi  › ",
+            Entry::Thinking(s) => {
+                if show_thinking {
+                    for (i, part) in s.split('\n').enumerate() {
+                        let prefix = Span::styled(
+                            if i == 0 { "think › " } else { "        " },
                             Style::default()
-                                .fg(Color::Blue)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        Span::raw("      ")
-                    };
-                    lines.push(Line::from(vec![prefix, Span::raw(part.to_string())]));
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::DIM),
+                        );
+                        lines.push(Line::from(vec![
+                            prefix,
+                            Span::styled(
+                                part.to_string(),
+                                Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+                            ),
+                        ]));
+                    }
+                    lines.push(Line::default());
+                } else {
+                    let count = s.lines().count().max(1);
+                    lines.push(Line::from(Span::styled(
+                        format!("▸ thinking ({count} lines — Ctrl+T to reveal)"),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::DIM),
+                    )));
+                }
+            }
+            Entry::Assistant(md) => {
+                let label = Span::styled(
+                    "pi  › ",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                );
+                let rendered = markdown::render(md);
+                if rendered.is_empty() {
+                    // still streaming: just prefix
+                    lines.push(Line::from(vec![label]));
+                } else {
+                    for (i, mut l) in rendered.into_iter().enumerate() {
+                        let prefix = if i == 0 {
+                            label.clone()
+                        } else {
+                            Span::raw("      ")
+                        };
+                        l.spans.insert(0, prefix);
+                        lines.push(l);
+                    }
                 }
                 lines.push(Line::default());
             }
-            Entry::Tool { name, status } => {
-                let (sym, color) = match status {
-                    ToolStatus::Running => ("…", Color::Yellow),
-                    ToolStatus::Ok => ("✓", Color::Green),
-                    ToolStatus::Err => ("✗", Color::Red),
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {sym} "), Style::default().fg(color)),
-                    Span::styled(
-                        format!("tool: {name}"),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                ]));
-            }
+            Entry::ToolCall(tc) => push_tool_lines(&mut lines, tc),
+            Entry::BashExec(bx) => push_bash_lines(&mut lines, bx),
             Entry::Info(s) => lines.push(Line::from(Span::styled(
                 format!("· {s}"),
                 Style::default().add_modifier(Modifier::DIM),
@@ -501,12 +587,215 @@ fn entries_to_text(entries: &[Entry]) -> Text<'_> {
                 format!("✗ {s}"),
                 Style::default().fg(Color::Red),
             ))),
+            Entry::Compaction(c) => push_compaction_line(&mut lines, c),
+            Entry::Retry(r) => push_retry_line(&mut lines, r),
         }
     }
-    Text::from(lines)
+    lines
 }
 
-fn draw_body(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
+fn push_tool_lines(lines: &mut Vec<Line<'static>>, tc: &ToolCall) {
+    let (sym, color) = match tc.status {
+        ToolStatus::Running => ("…", Color::Yellow),
+        ToolStatus::Ok => ("✓", Color::Green),
+        ToolStatus::Err => ("✗", Color::Red),
+    };
+    let arg_preview = truncate_preview(&args_preview(&tc.args), 60);
+    let header_style = if tc.status == ToolStatus::Err || tc.is_error {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    };
+    let expand_hint = if tc.expanded { "▾" } else { "▸" };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{expand_hint} {sym} {} ", tc.name), header_style),
+        Span::styled(arg_preview, Style::default().add_modifier(Modifier::DIM)),
+    ]));
+    if tc.expanded {
+        let output = crate::ui::ansi::strip(&tc.output);
+        if output.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                "    (no output yet)",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        } else {
+            for part in output.split('\n').take(200) {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(part.to_string(), Style::default().fg(Color::Gray)),
+                ]));
+            }
+        }
+    } else if !tc.output.trim().is_empty() {
+        // One-line preview.
+        let first = tc
+            .output
+            .lines()
+            .next()
+            .map(|s| truncate_preview(s, 80))
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                first,
+                Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+}
+
+fn args_preview(args: &serde_json::Value) -> String {
+    // Prefer a single-line JSON preview of top-level keys.
+    if let Some(obj) = args.as_object() {
+        let mut parts: Vec<String> = obj
+            .iter()
+            .map(|(k, v)| match v {
+                serde_json::Value::String(s) => format!("{k}={:?}", truncate_preview(s, 40)),
+                _ => format!("{k}={v}"),
+            })
+            .collect();
+        parts.truncate(4);
+        parts.join("  ")
+    } else if args.is_null() {
+        String::new()
+    } else {
+        serde_json::to_string(args).unwrap_or_default()
+    }
+}
+
+fn truncate_preview(s: &str, max: usize) -> String {
+    let s: String = s.chars().take(max + 1).collect();
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    } else {
+        s
+    }
+}
+
+fn push_bash_lines(lines: &mut Vec<Line<'static>>, bx: &BashExec) {
+    let status_color = if bx.cancelled {
+        Color::Yellow
+    } else if bx.exit_code == 0 {
+        Color::Green
+    } else {
+        Color::Red
+    };
+    let status_txt = if bx.cancelled {
+        " cancelled ".to_string()
+    } else {
+        format!(" exit {} ", bx.exit_code)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            "$ ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            bx.command.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            status_txt,
+            Style::default()
+                .bg(status_color)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    let body = crate::ui::ansi::strip(&bx.output);
+    for part in body.split('\n').take(200) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(part.to_string(), Style::default().fg(Color::Gray)),
+        ]));
+    }
+    if bx.truncated {
+        let path = bx
+            .full_output_path
+            .as_deref()
+            .unwrap_or("(path not provided)");
+        lines.push(Line::from(Span::styled(
+            format!("  … output truncated — full log: {path}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::default());
+}
+
+fn push_compaction_line(lines: &mut Vec<Line<'static>>, c: &Compaction) {
+    let (sym, color, label) = match &c.state {
+        CompactionState::Running => ("⟲", Color::Cyan, "compacting".to_string()),
+        CompactionState::Done { summary } => {
+            let s = summary
+                .as_deref()
+                .map(|s| truncate_preview(s, 100))
+                .unwrap_or_default();
+            (
+                "⟲",
+                Color::Green,
+                if s.is_empty() {
+                    "compaction complete".to_string()
+                } else {
+                    format!("compaction: {s}")
+                },
+            )
+        }
+        CompactionState::Aborted => ("⟲", Color::Yellow, "compaction aborted".into()),
+        CompactionState::Failed(msg) => ("⟲", Color::Red, format!("compaction failed: {msg}")),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{sym} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(label, Style::default().fg(color)),
+        Span::raw(" "),
+        Span::styled(
+            format!("({})", c.reason),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ]));
+}
+
+fn push_retry_line(lines: &mut Vec<Line<'static>>, r: &Retry) {
+    let (sym, color, label) = match &r.state {
+        RetryState::Waiting { delay_ms, error } => (
+            "↻",
+            Color::Yellow,
+            format!(
+                "retry {}/{} in {}ms — {}",
+                r.attempt,
+                r.max_attempts,
+                delay_ms,
+                truncate_preview(error, 80),
+            ),
+        ),
+        RetryState::Succeeded => ("↻", Color::Green, format!("retry {} succeeded", r.attempt)),
+        RetryState::Exhausted(msg) => (
+            "↻",
+            Color::Red,
+            format!(
+                "retry exhausted at {}: {}",
+                r.attempt,
+                truncate_preview(msg, 80)
+            ),
+        ),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{sym} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(label, Style::default().fg(color)),
+    ]));
+}
+
+fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" transcript ")
@@ -533,12 +822,13 @@ fn draw_body(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
         return;
     }
 
-    let text = entries_to_text(app.transcript.entries());
+    let lines = entries_to_lines(app.transcript.entries(), app.show_thinking);
+    let text = Text::from(lines);
     let line_count = text.lines.len() as u16;
     let viewport = inner.height;
     let max_offset = line_count.saturating_sub(viewport);
     let offset = match app.scroll {
-        None => max_offset, // auto-follow bottom
+        None => max_offset,
         Some(v) => v.min(max_offset),
     };
     let para = Paragraph::new(text)
@@ -547,13 +837,18 @@ fn draw_body(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     f.render_widget(para, inner);
 }
 
-fn draw_editor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let border_color = if app.is_streaming {
+fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let is_bash = app.input.trim_start().starts_with('!');
+    let border_color = if is_bash {
+        Color::Yellow
+    } else if app.is_streaming {
         Color::Cyan
     } else {
         Color::DarkGray
     };
-    let title = if app.is_streaming {
+    let title = if is_bash {
+        " bash (! prefix · Enter run) "
+    } else if app.is_streaming {
         " steer (Esc abort) "
     } else {
         " prompt (Enter submit · Esc clear) "
@@ -565,42 +860,55 @@ fn draw_editor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Simple single-line rendering with a block cursor at end-of-input.
     let mut spans = vec![Span::raw(app.input.as_str())];
     spans.push(Span::styled(
         " ",
         Style::default().add_modifier(Modifier::REVERSED),
     ));
-    let p = Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false });
-    f.render_widget(p, inner);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
-fn draw_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
+fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let hints = if app.is_streaming {
         vec![
-            Span::styled("Esc", Style::default().fg(Color::Cyan)),
+            kb("Esc"),
             Span::raw(" abort  "),
-            Span::styled("Ctrl+C", Style::default().fg(Color::Cyan)),
-            Span::raw(" quit  "),
-            Span::styled("PgUp/PgDn", Style::default().fg(Color::Cyan)),
+            kb("Ctrl+T"),
+            Span::raw(" thinking  "),
+            kb("Ctrl+E"),
+            Span::raw(" expand tool  "),
+            kb("PgUp/PgDn"),
             Span::raw(" scroll  "),
-            Span::styled("End", Style::default().fg(Color::Cyan)),
-            Span::raw(" follow"),
+            kb("End"),
+            Span::raw(" follow  "),
+            kb("Ctrl+C"),
+            Span::raw(" quit"),
         ]
     } else {
         vec![
-            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            kb("Enter"),
             Span::raw(" send  "),
-            Span::styled("Ctrl+C", Style::default().fg(Color::Cyan)),
-            Span::raw(" quit  "),
-            Span::styled("PgUp/PgDn", Style::default().fg(Color::Cyan)),
+            kb("!cmd"),
+            Span::raw(" bash  "),
+            kb("Ctrl+T"),
+            Span::raw(" thinking  "),
+            kb("Ctrl+E"),
+            Span::raw(" expand tool  "),
+            kb("PgUp/PgDn"),
             Span::raw(" scroll  "),
-            Span::styled("End", Style::default().fg(Color::Cyan)),
-            Span::raw(" follow"),
+            kb("Ctrl+C"),
+            Span::raw(" quit"),
         ]
     };
     f.render_widget(
         Paragraph::new(Line::from(hints)).style(Style::default().add_modifier(Modifier::DIM)),
         area,
     );
+}
+
+fn kb(s: &str) -> Span<'static> {
+    Span::styled(s.to_string(), Style::default().fg(Color::Cyan))
 }

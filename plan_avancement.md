@@ -50,18 +50,27 @@ Goal: async runtime, process spawn, JSONL plumbing, panic-safe terminal restore,
 
 ---
 
-## M2 — Full message model (Phase 2)
+## M2 — Full message model (Phase 2) ✅ (core) · deferred items noted
 
-- [ ] Thinking blocks (collapsible)
-- [ ] Tool calls: streaming args + output via `tool_execution_update`
-- [ ] Tool results (success/error styling)
-- [ ] Markdown rendering (pulldown-cmark → Ratatui Text)
-- [ ] Code blocks via syntect
-- [ ] Diff renderer for edit/patch tools
-- [ ] Bash RPC command UI with `BashExecutionMessage`
-- [ ] Auto-retry inline row; compaction timeline entries
+- [x] Thinking blocks — collapsible globally via `Ctrl+T`, collapsed by default with `▸ thinking (N lines)` placeholder
+- [x] Tool calls: `tool_execution_start/update/end` → typed `ToolCall` entry with streaming output accumulation (`partial_result.content` text extraction), status chip (… / ✓ / ✗), args preview, per-tool `expanded` flag
+- [x] Tool results with explicit error styling (red header + red border on the `is_error` path)
+- [x] Markdown rendering via pulldown-cmark — headings, strong/emphasis/strikethrough, inline code, fenced code blocks with language label, lists (bullet + ordered), task lists, block quotes, rules, links (URL appended when ≠ text), soft/hard breaks
+- [ ] Code blocks via syntect — **deferred to M5**. Syntect is a large dep and we chose to ship markdown without it rather than slip the milestone. Code still renders yellow-on-default inside a framed block, just without per-token syntax colors.
+- [ ] Diff renderer for edit/patch tools — **deferred to M3**. Pi's edit/patch tools emit diff text in `tool_execution_end.result.content`; for now it shows as plain gray output in the expanded tool card. A dedicated diff widget with + / – / @@ coloring is a tidy add when we do the tool-detail inspector pane in M3.
+- [x] Bash RPC UI — user types `!cmd` in the composer; Enter runs `RpcCommand::Bash` (blocking call on the client actor); result becomes a `BashExec` entry with exit-code chip, ANSI-stripped output body, and `… truncated — full log: …` footer when `truncated`
+- [x] Auto-retry — typed `Retry` entry that updates in place from Waiting → Succeeded / Exhausted
+- [x] Compaction — typed `Compaction` entry that updates in place from Running → Done{summary} / Aborted / Failed
 
-**Deviations / notes:** _(to fill in)_
+**New modules:**
+- `ui/markdown.rs` — stateful pulldown-cmark walker producing styled `Line<'static>`; 7 round-trip tests
+- `ui/ansi.rs` — dependency-free CSI / OSC / DCS stripper (chose over `ansi-to-tui` which pulled in a duplicate ratatui 0.29 — noted for M5 when we do colored rendering). 5 unit tests.
+
+**Deviations / notes:**
+- Picked `pulldown-cmark = "0.13"` default-features=off to keep the HTML renderer out. Options enabled: `ENABLE_STRIKETHROUGH`, `ENABLE_TABLES`, `ENABLE_TASKLISTS`. Table rendering events are currently ignored (falls through to the catch-all) — good enough for M2 since Pi's assistant rarely emits tables. Will wire in M5 alongside syntect.
+- Event handling: only deltas (`text_delta`, `thinking_delta`) mutate the transcript; we never deep-deserialize `message_update.message` or `partial`. This matches the `RpcIo` design from M1 and keeps streaming cheap under fast token rates.
+- `Ctrl+E` toggles the most-recent tool card's `expanded` flag. When M5 adds mouse support, click-on-card will drive the same toggle.
+- 41 unit tests pass (M1's 26 + 5 ansi + 7 markdown + 3 transcript). `clippy -D warnings` clean. `fmt --check` clean.
 
 ---
 
