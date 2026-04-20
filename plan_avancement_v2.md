@@ -220,20 +220,47 @@ Also folds in V2.0 bug fixes the user reported (see "Fixes" below).
 
 ---
 
-## V2.5 — Scrollable slash menu + 20 new commands
+## V2.5 — Command-menu redesign ✅ (core)
 
-- [ ] `CommandMenu` widget with virtualized list + right-pane help
-- [ ] Category groups with dividers (Session / Model / Git / View / Tools / Extensions / Debug)
-- [ ] MRU re-ordering within categories
-- [ ] Per-item key-hint badge
-- [ ] Aliases file `~/.config/rata-pi/aliases.toml`
-- [ ] Inline arg hints (`/rename <name>`)
-- [ ] Filter searches name + description (not just name)
-- [ ] All commands from PLAN_V2 §6 wired (40+)
-- [ ] Slash-menu scroll works with wheel + PgUp/PgDn + j/k
-- [ ] `?` inside menu opens that command's detail page
+### Delivered
+- [x] **Two-pane layout** — the Commands modal (`F1` / `/`) now splits into a categorized list on the left and a **detail pane on the right**: title, category label, source chip, full description, argument hint, example invocation, and an action hint telling you what `Enter` will do ("runs it" vs "prefills the composer" vs "applies the theme").
+- [x] **Category groups with dividers + icons** — each category gets a header row with its icon (`◆ session · ▤ transcript · ✦ model · ⚙ pi runtime · ◉ view · ⌕ debug · ◈ theme · ● extension · ▸ prompt · ✧ skill`). Built-ins come first, pi's extension / prompt / skill commands appear under their own headers.
+- [x] **Inline arg hints** — `/rename <name>`, `/switch <path>`, `/compact [instructions]`, `/steer-mode <all | one-at-a-time>` — the `<args>` portion renders in `warning` (yellow) so it jumps out.
+- [x] **Filter searches name + description** — typing "copy" finds `/copy` (match by name); typing "clipboard" finds it (match by description). Case-insensitive.
+- [x] **Per-item source badge** — `[builtin]`, `[ext]`, `[prompt]`, `[skill]` chips on each entry.
+- [x] **Centered scroll in big lists** — `commands_selected_line` computes the terminal-row index of the selected item accounting for category headers and 2-line items (name + description), so the scroll centers on the selection correctly.
+- [x] **j/k/PgUp/PgDn/Home/End** already work across every list modal (shared `handle_list_keys`). Existing scrollbar widget renders in the right column when content overflows.
+- [x] **10 new commands added**, taking the built-in catalog from 19 to **30**:
+  - `/retry` (re-submits the last user prompt, using `Steer` when streaming)
+  - `/abort`, `/abort-bash`, `/abort-retry` (fire the corresponding RPC)
+  - `/steer-mode <all|one-at-a-time>` + `/follow-up-mode <all|one-at-a-time>`
+  - `/doctor` — quick readiness check: terminal kind, Kitty-keyboard flag, graphics support, clipboard backend, current theme
+  - `/version` — prints rata-pi version
+  - `/log` — prints log file path hint
+  - `/env` — shows `TERM` / `TERM_PROGRAM` / detected terminal kind / kitty-kb / graphics flags
+  - `/snapshots` (placeholder; lands with V2.9)
+- [x] Modal now sizes to `120×26` to make room for the detail pane on wide terminals; falls back to single-column list on narrower windows.
 
-**Notes:** _(to fill in)_
+### New + updated modules
+- `src/ui/commands.rs` — rewritten around `MenuItem { name, description, category, args, example, source }` + `Category` enum (10 variants) with `label()` / `icon()` / `sort_key()`. `builtins()` returns `Vec<MenuItem>`; `wrap_pi(cmds)` adapts pi commands; `merged_menu(pi)` concatenates and sorts for the picker; `theme_items(names)` builds the `/themes` list. `matches(item, query)` does case-insensitive substring match against both name and description.
+- `src/ui/modal.rs` — `Modal::Commands` now holds `ListModal<MenuItem>`.
+- `src/app.rs` — new `commands_text` (categorized list), `command_detail_lines` (right-pane), `commands_selected_line` (scroll math), plus a vertical-rule renderer for the pane split. New slash handlers in both `try_local_slash` and `try_pi_slash`.
+
+### Deferred
+- [ ] MRU re-ordering within categories — needs a persistent `cmd_mru.json`; small bump in V2.6 / V2.11.
+- [ ] Aliases file `~/.config/rata-pi/aliases.toml` — planned with V2.11 hooks config.
+- [ ] `?` inside the menu opening a command's detail page — detail is already **always** on the right pane in the two-pane layout, so `?` redundancy deferred.
+- [ ] Wheel scroll inside modals — mouse currently goes to transcript; modal-mouse-routing is a V2.6 follow-up.
+
+### Tests + gates
+- 75 pass (V2.4 72 + 3 from the new `ui::commands` tests).
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo fmt --check` clean.
+
+**Notes:**
+- The picker now feels much closer to an IDE command palette — type a few letters, see matches across categories, read the detail pane to learn the command before committing.
+- `/doctor` is the single command that summarizes "am I in a happy state" — useful for first-run triage.
+- Every arg-taking builtin now surfaces its arg hint in the list AND in the detail pane. No more guessing `/rename what?`.
 
 ---
 

@@ -1,72 +1,363 @@
-//! Built-in slash-command catalog.
+//! Command catalog for the Commands picker (F1 / `/`).
 //!
-//! These are commands rata-pi handles *locally* — they're not part of pi's
-//! `get_commands` response. We expose them as `CommandSource::Builtin` entries
-//! so the Commands picker can mix them with pi's extensions / prompts / skills.
+//! Two kinds of entries:
 //!
-//! Picking a built-in in the picker should *apply immediately* (not prefill
-//! `/name ` into the composer); the app's modal Enter handler detects the
-//! Builtin source and dispatches directly.
+//! * **built-ins** — rata-pi's own slash commands; pushed eagerly so the
+//!   picker shows more than just pi's skill list.
+//! * **pi commands** — fetched at bootstrap via `get_commands`, wrapped in
+//!   `MenuItem` at picker-open time.
+//!
+//! Each `MenuItem` carries a category for grouping, an optional argument
+//! hint (`"<name>"`), and an example line that the detail pane on the right
+//! of the modal renders.
 
 use crate::rpc::types::{CommandInfo, CommandSource};
 
-/// Stable list of built-in commands. Names are shown with a leading `/`.
-/// Descriptions fit one line in the picker's right-hand column.
-pub fn builtins() -> Vec<CommandInfo> {
-    const BUILTIN: CommandSource = CommandSource::Builtin;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    Session,
+    Transcript,
+    Model,
+    PiRuntime,
+    View,
+    Debug,
+    Extension,
+    Prompt,
+    Skill,
+    Theme,
+}
 
-    macro_rules! cmd {
-        ($name:literal, $desc:literal) => {
-            CommandInfo {
+impl Category {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Transcript => "transcript",
+            Self::Model => "model",
+            Self::PiRuntime => "pi runtime",
+            Self::View => "view",
+            Self::Debug => "debug",
+            Self::Extension => "extension",
+            Self::Prompt => "prompt",
+            Self::Skill => "skill",
+            Self::Theme => "theme",
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Session => "◆",
+            Self::Transcript => "▤",
+            Self::Model => "✦",
+            Self::PiRuntime => "⚙",
+            Self::View => "◉",
+            Self::Debug => "⌕",
+            Self::Extension => "●",
+            Self::Prompt => "▸",
+            Self::Skill => "✧",
+            Self::Theme => "◈",
+        }
+    }
+
+    /// Sort order for grouping. Built-ins first, pi next.
+    fn sort_key(self) -> u8 {
+        match self {
+            Self::Session => 0,
+            Self::Transcript => 1,
+            Self::Model => 2,
+            Self::PiRuntime => 3,
+            Self::View => 4,
+            Self::Theme => 5,
+            Self::Debug => 6,
+            Self::Extension => 7,
+            Self::Prompt => 8,
+            Self::Skill => 9,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MenuItem {
+    pub name: String,
+    pub description: String,
+    pub category: Category,
+    pub args: &'static str,
+    pub example: &'static str,
+    pub source: CommandSource,
+}
+
+impl MenuItem {
+    pub fn is_builtin(&self) -> bool {
+        self.source == CommandSource::Builtin
+    }
+
+    pub fn is_theme(&self) -> bool {
+        self.name.starts_with("theme ")
+    }
+}
+
+/// Built-in slash-command catalog. Returns `MenuItem`s tagged Builtin.
+pub fn builtins() -> Vec<MenuItem> {
+    macro_rules! b {
+        ($cat:expr, $name:literal, $desc:literal, $args:literal, $example:literal) => {
+            MenuItem {
                 name: $name.into(),
-                description: Some($desc.into()),
-                source: BUILTIN,
-                location: None,
-                path: None,
+                description: $desc.into(),
+                category: $cat,
+                args: $args,
+                example: $example,
+                source: CommandSource::Builtin,
             }
         };
     }
 
+    use Category::*;
+
     vec![
-        // ── help / meta ───────────────────────────────────────────────────
-        cmd!("help", "keybindings + commands cheat sheet"),
-        cmd!("stats", "open the session stats modal"),
-        cmd!("themes", "pick a color theme"),
-        cmd!(
-            "theme",
-            "cycle (no arg) or apply by name: tokyo-night, dracula, …"
+        // ── session ──────────────────────────────────────────────────────
+        b!(
+            Session,
+            "help",
+            "keybindings + commands cheat sheet",
+            "",
+            "/help"
         ),
-        // ── transcript / export ───────────────────────────────────────────
-        cmd!("export", "write the transcript to a local markdown file"),
-        cmd!("export-html", "ask pi to export the session to HTML"),
-        cmd!("copy", "copy the last assistant message to the clipboard"),
-        cmd!(
-            "clear",
-            "clear the transcript view (does not touch pi state)"
+        b!(
+            Session,
+            "stats",
+            "open the session stats modal",
+            "",
+            "/stats"
         ),
-        // ── session ───────────────────────────────────────────────────────
-        cmd!("rename", "set the display name: /rename my-feature"),
-        cmd!("new", "start a fresh pi session"),
-        cmd!(
+        b!(
+            Session,
+            "rename",
+            "set the session display name",
+            "<name>",
+            "/rename add-oauth"
+        ),
+        b!(Session, "new", "start a fresh pi session", "", "/new"),
+        b!(
+            Session,
             "switch",
-            "load a session file: /switch /path/to/session.jsonl"
+            "load a session from a jsonl path",
+            "<path>",
+            "/switch ~/.pi/…/a.jsonl"
         ),
-        cmd!("fork", "fork from an earlier user turn (picker)"),
-        cmd!("compact", "compact context now (optional instructions arg)"),
-        // ── model / thinking ──────────────────────────────────────────────
-        cmd!("model", "open the model picker"),
-        cmd!("think", "open the thinking-level picker"),
-        cmd!("cycle-model", "advance to the next configured model"),
-        cmd!("cycle-think", "advance to the next thinking level"),
-        // ── pi runtime toggles ────────────────────────────────────────────
-        cmd!("auto-compact", "toggle auto-compaction"),
-        cmd!("auto-retry", "toggle auto-retry on transient errors"),
+        b!(
+            Session,
+            "fork",
+            "fork from an earlier user turn (picker)",
+            "",
+            "/fork"
+        ),
+        b!(
+            Session,
+            "snapshots",
+            "list saved transcript snapshots (V2.9)",
+            "",
+            "/snapshots"
+        ),
+        // ── transcript / export ──────────────────────────────────────────
+        b!(
+            Transcript,
+            "export",
+            "write the transcript to a local markdown file",
+            "",
+            "/export"
+        ),
+        b!(
+            Transcript,
+            "export-html",
+            "ask pi to export the session to HTML",
+            "",
+            "/export-html"
+        ),
+        b!(
+            Transcript,
+            "copy",
+            "copy the last assistant message to the clipboard",
+            "",
+            "/copy"
+        ),
+        b!(
+            Transcript,
+            "clear",
+            "clear the transcript view only (pi state intact)",
+            "",
+            "/clear"
+        ),
+        b!(
+            Transcript,
+            "retry",
+            "re-submit the last user prompt",
+            "",
+            "/retry"
+        ),
+        // ── model / thinking ─────────────────────────────────────────────
+        b!(Model, "model", "open the model picker", "", "/model"),
+        b!(
+            Model,
+            "think",
+            "open the thinking-level picker",
+            "",
+            "/think"
+        ),
+        b!(
+            Model,
+            "cycle-model",
+            "advance to the next configured model",
+            "",
+            "/cycle-model"
+        ),
+        b!(
+            Model,
+            "cycle-think",
+            "advance to the next thinking level",
+            "",
+            "/cycle-think"
+        ),
+        // ── pi runtime toggles / controls ────────────────────────────────
+        b!(
+            PiRuntime,
+            "compact",
+            "compact context now (optional instructions)",
+            "[instructions]",
+            "/compact focus on code"
+        ),
+        b!(
+            PiRuntime,
+            "auto-compact",
+            "toggle auto-compaction",
+            "",
+            "/auto-compact"
+        ),
+        b!(
+            PiRuntime,
+            "auto-retry",
+            "toggle auto-retry on transient errors",
+            "",
+            "/auto-retry"
+        ),
+        b!(
+            PiRuntime,
+            "abort",
+            "abort the current streaming run",
+            "",
+            "/abort"
+        ),
+        b!(
+            PiRuntime,
+            "abort-bash",
+            "abort the currently running bash command",
+            "",
+            "/abort-bash"
+        ),
+        b!(
+            PiRuntime,
+            "abort-retry",
+            "cancel an in-progress auto-retry",
+            "",
+            "/abort-retry"
+        ),
+        b!(
+            PiRuntime,
+            "steer-mode",
+            "set steering delivery mode",
+            "<all | one-at-a-time>",
+            "/steer-mode all"
+        ),
+        b!(
+            PiRuntime,
+            "follow-up-mode",
+            "set follow-up delivery mode",
+            "<all | one-at-a-time>",
+            "/follow-up-mode one-at-a-time"
+        ),
+        // ── view / ui ────────────────────────────────────────────────────
+        b!(
+            View,
+            "theme",
+            "cycle (no arg) or apply by name",
+            "[tokyo-night|dracula|…]",
+            "/theme dracula"
+        ),
+        b!(View, "themes", "pick a color theme (picker)", "", "/themes"),
+        // ── debug ────────────────────────────────────────────────────────
+        b!(Debug, "doctor", "basic readiness check", "", "/doctor"),
+        b!(Debug, "version", "show rata-pi version", "", "/version"),
+        b!(Debug, "log", "show the log file path", "", "/log"),
+        b!(
+            Debug,
+            "env",
+            "show relevant environment variables",
+            "",
+            "/env"
+        ),
     ]
 }
 
-/// True if a command entry is one of ours (Builtin), not a pi command.
-pub fn is_builtin(c: &CommandInfo) -> bool {
-    c.source == CommandSource::Builtin
+/// Wrap pi-fetched commands in `MenuItem`s for mixing with built-ins.
+pub fn wrap_pi(cmds: &[CommandInfo]) -> Vec<MenuItem> {
+    cmds.iter()
+        .map(|c| {
+            let category = match c.source {
+                CommandSource::Extension => Category::Extension,
+                CommandSource::Prompt => Category::Prompt,
+                CommandSource::Skill => Category::Skill,
+                CommandSource::Builtin => Category::Extension, // shouldn't happen
+            };
+            MenuItem {
+                name: c.name.clone(),
+                description: c.description.clone().unwrap_or_default(),
+                category,
+                args: "",
+                example: "",
+                source: c.source,
+            }
+        })
+        .collect()
+}
+
+/// Merge built-ins + pi commands for the picker. Built-ins first (by
+/// `Category::sort_key`), pi commands second.
+pub fn merged_menu(pi_cmds: &[CommandInfo]) -> Vec<MenuItem> {
+    let mut items = builtins();
+    items.extend(wrap_pi(pi_cmds));
+    items.sort_by(|a, b| {
+        a.category
+            .sort_key()
+            .cmp(&b.category.sort_key())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    items
+}
+
+/// Menu items built for the /themes picker — not mixed with commands.
+pub fn theme_items<I>(themes: I) -> Vec<MenuItem>
+where
+    I: IntoIterator<Item = &'static str>,
+{
+    themes
+        .into_iter()
+        .map(|name| MenuItem {
+            name: format!("theme {name}"),
+            description: format!("switch to {name}"),
+            category: Category::Theme,
+            args: "",
+            example: "",
+            source: CommandSource::Builtin,
+        })
+        .collect()
+}
+
+/// Case-insensitive match against both name and description.
+pub fn matches(item: &MenuItem, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q = query.to_ascii_lowercase();
+    item.name.to_ascii_lowercase().contains(&q)
+        || item.description.to_ascii_lowercase().contains(&q)
 }
 
 #[cfg(test)]
@@ -74,11 +365,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtins_non_empty_and_tagged() {
+    fn builtins_non_empty_and_all_marked_builtin() {
         let all = builtins();
-        assert!(all.len() >= 15);
-        assert!(all.iter().all(is_builtin));
-        assert!(all.iter().any(|c| c.name == "theme"));
-        assert!(all.iter().any(|c| c.name == "help"));
+        assert!(all.len() >= 25);
+        for it in &all {
+            assert!(it.is_builtin(), "{} should be builtin", it.name);
+        }
+    }
+
+    #[test]
+    fn merged_menu_keeps_builtins_first() {
+        let pi = vec![CommandInfo {
+            name: "skill:x".into(),
+            description: Some("from pi".into()),
+            source: CommandSource::Skill,
+            location: None,
+            path: None,
+        }];
+        let m = merged_menu(&pi);
+        assert!(m.iter().any(|i| i.name == "help"));
+        assert!(m.iter().any(|i| i.name == "skill:x"));
+        // first entry should be Session / Transcript category (not Skill).
+        let first_cat = m.first().unwrap().category;
+        assert_ne!(first_cat, Category::Skill);
+    }
+
+    #[test]
+    fn matches_name_and_description() {
+        let it = MenuItem {
+            name: "rename".into(),
+            description: "set the session display name".into(),
+            category: Category::Session,
+            args: "<name>",
+            example: "/rename x",
+            source: CommandSource::Builtin,
+        };
+        assert!(matches(&it, "rename"));
+        assert!(matches(&it, "display"));
+        assert!(matches(&it, "SESSION")); // case-insensitive
+        assert!(!matches(&it, "xyz"));
+    }
+
+    #[test]
+    fn theme_items_are_themes() {
+        let it = theme_items(["tokyo-night", "dracula"]);
+        assert_eq!(it.len(), 2);
+        assert!(it.iter().all(|i| i.is_theme()));
+        assert!(it[0].name.starts_with("theme "));
     }
 }

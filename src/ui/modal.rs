@@ -8,12 +8,14 @@
 use ratatui::layout::Rect;
 
 use crate::history::HistoryEntry;
-use crate::rpc::types::{CommandInfo, ForkMessage, Model, SessionStats, ThinkingLevel};
+use crate::rpc::types::{ForkMessage, Model, SessionStats, ThinkingLevel};
+use crate::ui::commands::MenuItem;
 
 #[derive(Debug)]
 pub enum Modal {
     Stats(Box<SessionStats>),
-    Commands(ListModal<CommandInfo>),
+    /// Two-pane command menu: categorized list left, detail right.
+    Commands(ListModal<MenuItem>),
     Models(ListModal<Model>),
     Thinking(RadioModal<ThinkingLevel>),
     History(ListModal<HistoryEntry>),

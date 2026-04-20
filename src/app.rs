@@ -1281,28 +1281,23 @@ async fn handle_modal_key(
                         return;
                     };
                     // `/themes` reuses the Commands modal. Entries look like
-                    // "theme <name>" — apply inline instead of prefilling.
-                    if let Some(theme_name) = cmd.name.strip_prefix("theme ") {
+                    // "theme <name>" — apply inline.
+                    if cmd.is_theme() {
+                        let theme_name = cmd.name.strip_prefix("theme ").unwrap_or("");
                         if app.set_theme_by_name(theme_name) {
                             app.flash(format!("theme → {}", app.theme.name));
                         }
                         app.modal = None;
                         return;
                     }
-                    // Built-in slash commands execute inline — no-argument
-                    // commands (like /help, /stats, /export, /theme cycle,
-                    // /new, /compact, /model, /think, /cycle-*, /copy,
-                    // /auto-*) fire immediately; commands that typically need
-                    // an argument still prefill so the user can type it.
-                    if crate::ui::commands::is_builtin(&cmd) {
-                        let needs_arg = matches!(cmd.name.as_str(), "rename" | "switch");
+                    if cmd.is_builtin() {
+                        let needs_arg = !cmd.args.is_empty();
                         if needs_arg {
                             app.input.clear();
                             app.input.push('/');
                             app.input.push_str(&cmd.name);
                             app.input.push(' ');
                         } else {
-                            // Close modal first, then dispatch locally.
                             app.modal = None;
                             let name = cmd.name.clone();
                             if !try_local_slash(app, &name, "") {
@@ -1594,13 +1589,15 @@ fn handle_list_keys(
 }
 
 fn filtered_commands<'a>(
-    items: &'a [CommandInfo],
+    items: &'a [crate::ui::commands::MenuItem],
     q: &'a str,
-) -> impl Iterator<Item = &'a CommandInfo> + 'a {
-    items.iter().filter(move |c| matches_query(&c.name, q))
+) -> impl Iterator<Item = &'a crate::ui::commands::MenuItem> + 'a {
+    items
+        .iter()
+        .filter(move |c| crate::ui::commands::matches(c, q))
 }
 
-fn filtered_count_commands(items: &[CommandInfo], q: &str) -> usize {
+fn filtered_count_commands(items: &[crate::ui::commands::MenuItem], q: &str) -> usize {
     filtered_commands(items, q).count()
 }
 
@@ -1700,10 +1697,8 @@ fn entry_as_plain_text(e: &Entry) -> String {
 }
 
 /// Built-ins first (so they're easy to discover), then pi's own commands.
-fn merged_commands(pi_commands: &[CommandInfo]) -> Vec<CommandInfo> {
-    let mut v = crate::ui::commands::builtins();
-    v.extend_from_slice(pi_commands);
-    v
+fn merged_commands(pi_commands: &[CommandInfo]) -> Vec<crate::ui::commands::MenuItem> {
+    crate::ui::commands::merged_menu(pi_commands)
 }
 
 /// Handle slash commands that do NOT need pi. Returns true if consumed.
@@ -1752,21 +1747,49 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
             true
         }
         "themes" => {
-            let items: Vec<CommandInfo> = theme::builtins()
-                .iter()
-                .map(|t| CommandInfo {
-                    name: format!("theme {}", t.name),
-                    description: Some(format!("switch to {}", t.name)),
-                    source: crate::rpc::types::CommandSource::Builtin,
-                    location: None,
-                    path: None,
-                })
-                .collect();
+            let names: Vec<&'static str> = theme::builtins().iter().map(|t| t.name).collect();
             app.modal = Some(Modal::Commands(ListModal::new(
                 "themes",
                 "type to filter · Enter apply · Esc close",
-                items,
+                crate::ui::commands::theme_items(names),
             )));
+            true
+        }
+        "version" => {
+            app.flash(format!("rata-pi v{}", env!("CARGO_PKG_VERSION")));
+            true
+        }
+        "log" => {
+            let path = crate::history::History::load()
+                .path()
+                .cloned()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(no log path)".into());
+            app.flash(format!("log dir → see tracing file near: {path}"));
+            true
+        }
+        "env" => {
+            let term = std::env::var("TERM").unwrap_or_default();
+            let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+            let caps = crate::term_caps::detect();
+            app.flash(format!(
+                "TERM={term} TERM_PROGRAM={term_program} kind={:?} kb={} gfx={}",
+                caps.kind, caps.kitty_keyboard, caps.graphics
+            ));
+            true
+        }
+        "doctor" => {
+            let caps = crate::term_caps::detect();
+            let cb_ok = arboard::Clipboard::new().is_ok();
+            let mut msg = format!(
+                "doctor → term: {:?}, kitty-kb: {}, gfx: {}, clipboard: {}",
+                caps.kind,
+                caps.kitty_keyboard,
+                caps.graphics,
+                if cb_ok { "arboard" } else { "osc52 fallback" }
+            );
+            msg.push_str(&format!(" · theme: {}", app.theme.name));
+            app.flash(msg);
             true
         }
         _ => false,
@@ -1977,6 +2000,84 @@ async fn try_pi_slash(app: &mut App, client: &RpcClient, name: &str, arg: &str) 
                     }
                 }
                 Err(e) => app.flash(format!("copy failed: {e}")),
+            }
+            true
+        }
+        "retry" => {
+            // Replay the most recent user prompt.
+            let last_user = app.transcript.entries().iter().rev().find_map(|e| match e {
+                Entry::User(s) => Some(s.clone()),
+                _ => None,
+            });
+            if let Some(text) = last_user {
+                let rpc = if app.is_streaming {
+                    RpcCommand::Steer {
+                        message: text,
+                        images: vec![],
+                    }
+                } else {
+                    RpcCommand::Prompt {
+                        message: text,
+                        images: vec![],
+                        streaming_behavior: None,
+                    }
+                };
+                if let Err(e) = client.fire(rpc).await {
+                    app.flash(format!("retry failed: {e}"));
+                } else {
+                    app.flash("retried last prompt");
+                }
+            } else {
+                app.flash("no previous user prompt");
+            }
+            true
+        }
+        "abort" => {
+            let _ = client.fire(RpcCommand::Abort).await;
+            app.flash("aborted");
+            true
+        }
+        "abort-bash" => {
+            let _ = client.fire(RpcCommand::AbortBash).await;
+            app.flash("bash aborted");
+            true
+        }
+        "abort-retry" => {
+            let _ = client.fire(RpcCommand::AbortRetry).await;
+            app.flash("retry aborted");
+            true
+        }
+        "steer-mode" => {
+            let mode = match arg {
+                "all" => crate::rpc::types::SteeringMode::All,
+                "one-at-a-time" => crate::rpc::types::SteeringMode::OneAtATime,
+                _ => {
+                    app.flash("usage: /steer-mode <all | one-at-a-time>");
+                    return true;
+                }
+            };
+            if let Err(e) = client.fire(RpcCommand::SetSteeringMode { mode }).await {
+                app.flash(format!("steer-mode failed: {e}"));
+            } else {
+                app.session.steering_mode = Some(mode);
+                app.flash(format!("steer-mode → {arg}"));
+            }
+            true
+        }
+        "follow-up-mode" => {
+            let mode = match arg {
+                "all" => crate::rpc::types::FollowUpMode::All,
+                "one-at-a-time" => crate::rpc::types::FollowUpMode::OneAtATime,
+                _ => {
+                    app.flash("usage: /follow-up-mode <all | one-at-a-time>");
+                    return true;
+                }
+            };
+            if let Err(e) = client.fire(RpcCommand::SetFollowUpMode { mode }).await {
+                app.flash(format!("follow-up-mode failed: {e}"));
+            } else {
+                app.session.follow_up_mode = Some(mode);
+                app.flash(format!("follow-up-mode → {arg}"));
             }
             true
         }
@@ -3773,8 +3874,8 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             format!(" {} ", list.title),
             commands_text(list, theme),
             list.hint.clone(),
-            80,
-            22,
+            120,
+            26,
         ),
         Modal::Models(list) => (
             format!(" {} ", list.title),
@@ -3865,10 +3966,9 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     f.render_widget(block, rect);
 
     // For list-style modals, scroll the body so the selected row stays in
-    // the viewport (centered where possible). The body layout puts the
-    // filter on line 0, a blank on line 1, and items starting at line 2.
+    // the viewport (centered where possible).
     let selected_line = match modal {
-        Modal::Commands(l) => Some(2 + l.selected as u16),
+        Modal::Commands(l) => Some(commands_selected_line(l)),
         Modal::Models(l) => Some(2 + l.selected as u16),
         Modal::History(l) => Some(2 + l.selected as u16),
         Modal::Forks(l) => Some(2 + l.selected as u16),
@@ -3891,14 +3991,36 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         0
     };
 
-    let main_area = if total_lines > viewport && inner.width > 2 {
-        // Reserve a 1-column scrollbar track on the right.
-        let w = inner.width.saturating_sub(1);
-        let sbar = Rect::new(inner.x + w, inner.y, 1, inner.height);
+    // Two-pane layout when this is a Commands modal AND the terminal is
+    // wide enough: left ~60% = list, right ~40% = detail pane.
+    let (list_area, detail_area) = match modal {
+        Modal::Commands(_) if inner.width >= 80 => {
+            let left_w = (inner.width * 6) / 10;
+            let right_w = inner.width - left_w - 1; // 1 col vertical rule
+            let list_rect = Rect::new(inner.x, inner.y, left_w, inner.height);
+            let rule_rect = Rect::new(inner.x + left_w, inner.y, 1, inner.height);
+            let detail_rect = Rect::new(inner.x + left_w + 1, inner.y, right_w, inner.height);
+            // Vertical rule between the panes.
+            for dy in 0..inner.height {
+                let r = Rect::new(rule_rect.x, rule_rect.y + dy, 1, 1);
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled("│", Style::default().fg(t.dim)))),
+                    r,
+                );
+            }
+            (list_rect, Some(detail_rect))
+        }
+        _ => (inner, None),
+    };
+
+    // List pane, with its own scrollbar.
+    let main_area = if total_lines > viewport && list_area.width > 2 {
+        let w = list_area.width.saturating_sub(1);
+        let sbar = Rect::new(list_area.x + w, list_area.y, 1, list_area.height);
         draw_scrollbar(f, sbar, scroll_y, viewport, total_lines, t);
-        Rect::new(inner.x, inner.y, w, inner.height)
+        Rect::new(list_area.x, list_area.y, w, list_area.height)
     } else {
-        inner
+        list_area
     };
 
     f.render_widget(
@@ -3907,6 +4029,43 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             .scroll((scroll_y, 0)),
         main_area,
     );
+
+    // Detail pane (Commands modal only).
+    if let (Some(da), Modal::Commands(list)) = (detail_area, modal) {
+        let detail = command_detail_lines(list, t);
+        f.render_widget(
+            Paragraph::new(Text::from(detail)).wrap(Wrap { trim: false }),
+            da,
+        );
+    }
+}
+
+/// Compute the terminal-row index of the selected item in `commands_text`.
+/// Mirrors the category-grouping + description-line layout so the scroll
+/// computation can keep the selected item centered.
+fn commands_selected_line(list: &ListModal<crate::ui::commands::MenuItem>) -> u16 {
+    let filtered: Vec<&crate::ui::commands::MenuItem> =
+        filtered_commands(&list.items, &list.query).collect();
+    // filter + blank line above the list.
+    let mut line: u16 = 2;
+    let mut last_cat: Option<crate::ui::commands::Category> = None;
+    for (i, it) in filtered.iter().enumerate() {
+        if last_cat != Some(it.category) {
+            if last_cat.is_some() {
+                line = line.saturating_add(1); // inter-group blank
+            }
+            line = line.saturating_add(1); // header row
+            last_cat = Some(it.category);
+        }
+        if i == list.selected {
+            return line;
+        }
+        line = line.saturating_add(1); // item row
+        if !it.description.is_empty() {
+            line = line.saturating_add(1); // description row
+        }
+    }
+    line
 }
 
 fn help_text(t: &Theme) -> Text<'static> {
@@ -4056,44 +4215,208 @@ fn label_value(k: &str, v: impl Into<String>, t: &Theme) -> Line<'static> {
     ])
 }
 
-fn commands_text(list: &ListModal<CommandInfo>, t: &Theme) -> Text<'static> {
+/// Categorized, two-pane body text for the Commands modal.
+///
+/// Line layout:
+///   line 0:  "filter: <query>    (N items)"
+///   line 1:  blank
+///   line 2+: list — category headers (not selectable; dim) and items.
+///            Item lines include source badge + icon + name + args + description.
+///
+/// The caller (draw_modal) renders this `Text` in the LEFT pane and uses
+/// `command_detail_lines` to populate the RIGHT pane with the focused
+/// item's description + argument + example.
+fn commands_text(list: &ListModal<crate::ui::commands::MenuItem>, t: &Theme) -> Text<'static> {
+    use crate::ui::commands::Category;
+
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let filtered: Vec<&crate::ui::commands::MenuItem> =
+        filtered_commands(&list.items, &list.query).collect();
+
     lines.push(Line::from(vec![
         Span::styled("filter: ", Style::default().fg(t.dim)),
         Span::styled(
             list.query.clone(),
             Style::default().fg(t.text).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(
+            format!("   ({} items)", filtered.len()),
+            Style::default().fg(t.dim),
+        ),
     ]));
     lines.push(Line::default());
-    let filtered: Vec<&CommandInfo> = filtered_commands(&list.items, &list.query).collect();
-    for (i, c) in filtered.iter().enumerate() {
-        let marker = if i == list.selected { "▸" } else { " " };
-        let badge = match c.source {
-            crate::rpc::types::CommandSource::Extension => "ext",
-            crate::rpc::types::CommandSource::Prompt => "prompt",
-            crate::rpc::types::CommandSource::Skill => "skill",
-            crate::rpc::types::CommandSource::Builtin => "builtin",
-        };
-        let style = if i == list.selected {
-            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(t.text)
-        };
-        let desc = c.description.as_deref().unwrap_or("");
-        lines.push(Line::from(vec![
-            Span::styled(format!("{marker} /{} ", c.name), style),
-            Span::styled(format!("[{badge}] "), Style::default().fg(t.warning)),
-            Span::styled(desc.to_string(), Style::default().fg(t.dim)),
-        ]));
-    }
+
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no matches)",
             Style::default().fg(t.dim),
         )));
+        return Text::from(lines);
+    }
+
+    let mut last_cat: Option<Category> = None;
+    for (i, it) in filtered.iter().enumerate() {
+        // Category divider on boundary.
+        if last_cat != Some(it.category) {
+            if last_cat.is_some() {
+                lines.push(Line::default());
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", it.category.icon()),
+                    Style::default().fg(t.accent),
+                ),
+                Span::styled(
+                    it.category.label().to_string(),
+                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            last_cat = Some(it.category);
+        }
+
+        let is_sel = i == list.selected;
+        let marker = if is_sel { "▸" } else { " " };
+        let name_style = if is_sel {
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.text)
+        };
+        let badge = match it.source {
+            crate::rpc::types::CommandSource::Extension => "ext",
+            crate::rpc::types::CommandSource::Prompt => "prompt",
+            crate::rpc::types::CommandSource::Skill => "skill",
+            crate::rpc::types::CommandSource::Builtin => "builtin",
+        };
+        let mut spans = vec![Span::styled(format!("  {marker} /{}", it.name), name_style)];
+        if !it.args.is_empty() {
+            spans.push(Span::styled(
+                format!(" {}", it.args),
+                Style::default().fg(t.warning),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("   [{badge}]"),
+            Style::default().fg(t.dim),
+        ));
+        lines.push(Line::from(spans));
+        // Sub-line description dimmed (wraps naturally if too long).
+        if !it.description.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("      {}", it.description),
+                Style::default().fg(t.dim),
+            )));
+        }
     }
     Text::from(lines)
+}
+
+/// Right-pane detail lines for the currently-selected item.
+fn command_detail_lines(
+    list: &ListModal<crate::ui::commands::MenuItem>,
+    t: &Theme,
+) -> Vec<Line<'static>> {
+    let filtered: Vec<&crate::ui::commands::MenuItem> =
+        filtered_commands(&list.items, &list.query).collect();
+    let Some(it) = filtered.get(list.selected) else {
+        return vec![Line::from(Span::styled(
+            "(no selection)",
+            Style::default().fg(t.dim),
+        ))];
+    };
+
+    let mut lines = Vec::new();
+    // Title row.
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {} ", it.category.icon()),
+            Style::default().fg(t.accent),
+        ),
+        Span::styled(
+            format!("/{}", it.name),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if it.args.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", it.args)
+            },
+            Style::default().fg(t.warning),
+        ),
+    ]));
+    // Category + source chip.
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {}", it.category.label()),
+            Style::default().fg(t.dim),
+        ),
+        Span::styled(
+            format!(
+                " · {}",
+                match it.source {
+                    crate::rpc::types::CommandSource::Extension => "extension",
+                    crate::rpc::types::CommandSource::Prompt => "prompt template",
+                    crate::rpc::types::CommandSource::Skill => "skill",
+                    crate::rpc::types::CommandSource::Builtin => "built-in",
+                }
+            ),
+            Style::default().fg(t.muted),
+        ),
+    ]));
+    lines.push(Line::default());
+
+    // Description (wrapped).
+    if !it.description.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "description",
+            Style::default().fg(t.dim).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(it.description.clone(), Style::default().fg(t.text)),
+        ]));
+        lines.push(Line::default());
+    }
+
+    if !it.args.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "arguments",
+            Style::default().fg(t.dim).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(it.args.to_string(), Style::default().fg(t.warning)),
+        ]));
+        lines.push(Line::default());
+    }
+
+    if !it.example.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "example",
+            Style::default().fg(t.dim).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(it.example.to_string(), Style::default().fg(t.accent_strong)),
+        ]));
+        lines.push(Line::default());
+    }
+
+    let action_hint = if it.is_theme() {
+        "Enter applies the theme · Esc closes"
+    } else if it.is_builtin() && it.args.is_empty() {
+        "Enter runs it · Esc closes"
+    } else if it.is_builtin() {
+        "Enter prefills the composer · Esc closes"
+    } else {
+        "Enter prefills /name · Esc closes"
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  {action_hint}"),
+        Style::default().fg(t.dim),
+    )));
+
+    lines
 }
 
 fn models_text(list: &ListModal<Model>, t: &Theme) -> Text<'static> {
