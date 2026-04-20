@@ -41,6 +41,7 @@ use crate::rpc::types::{
     AgentMessage, AssistantBlock, CommandInfo, ContentBlock, FollowUpMode, ForkMessage, Model,
     SessionStats, State, SteeringMode, ThinkingLevel, ToolResultPayload, UserContent,
 };
+use crate::theme::{self, Theme};
 use crate::ui::ext_ui::{ExtReq, ExtUiState, NotifyKind, WidgetPlacement, parse as parse_ext};
 use crate::ui::markdown;
 use crate::ui::modal::{ListModal, Modal, RadioModal, centered, matches_query};
@@ -137,6 +138,7 @@ struct App {
     flash: Option<(String, u64)>, // transient status message with a decay tick
     ext_ui: ExtUiState,
     history: History,
+    theme: Theme,
 }
 
 impl App {
@@ -159,7 +161,23 @@ impl App {
             flash: None,
             ext_ui: ExtUiState::default(),
             history: History::load(),
+            theme: *theme::default_theme(),
         }
+    }
+
+    fn cycle_theme(&mut self) {
+        let all = theme::builtins();
+        let i = theme::index_of(&self.theme);
+        let next = (i + 1) % all.len();
+        self.theme = all[next];
+    }
+
+    fn set_theme_by_name(&mut self, name: &str) -> bool {
+        if let Some(t) = theme::find(name) {
+            self.theme = *t;
+            return true;
+        }
+        false
     }
 
     fn flash(&mut self, msg: impl Into<String>) {
@@ -390,9 +408,10 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: Args
 
     if let Some((client, mut io)) = client_and_io {
         bootstrap(&client, &mut app).await;
-        app.transcript.push(Entry::Info(
-            "connected — F1 commands · F5 model · F6 thinking · F7 stats · / slash · ? help".into(),
-        ));
+        app.transcript.push(Entry::Info(format!(
+            "connected — theme: {} · F1 cmds · F5 model · F6 think · F7 stats · /theme · ? help",
+            app.theme.name
+        )));
         ui_loop(terminal, &mut app, Some(&client), &mut io.events).await?;
         if let Err(e) = client::shutdown(client, io).await {
             tracing::warn!(error = ?e, "shutdown error");
@@ -614,6 +633,14 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
 async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Option<&RpcClient>) {
     match (code, mods) {
         (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
+        // Ctrl+Shift+T cycles theme — check first since it also matches
+        // KeyCode::Char('T'), KeyModifiers::CONTROL | SHIFT on many terminals.
+        (KeyCode::Char('t') | KeyCode::Char('T'), m)
+            if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+        {
+            app.cycle_theme();
+            app.flash(format!("theme → {}", app.theme.name));
+        }
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
             app.show_thinking = !app.show_thinking;
         }
@@ -792,6 +819,15 @@ async fn handle_modal_key(
                     else {
                         return;
                     };
+                    // `/themes` reuses the Commands modal. Entries look like
+                    // "theme <name>" — apply inline instead of prefilling.
+                    if let Some(theme_name) = cmd.name.strip_prefix("theme ") {
+                        if app.set_theme_by_name(theme_name) {
+                            app.flash(format!("theme → {}", app.theme.name));
+                        }
+                        app.modal = None;
+                        return;
+                    }
                     app.input.clear();
                     app.input.push('/');
                     app.input.push_str(&cmd.name);
@@ -1277,6 +1313,43 @@ async fn submit(app: &mut App, client: Option<&RpcClient>) {
                 app.flash("compacting…");
                 return;
             }
+            "theme" => {
+                if arg.is_empty() {
+                    app.cycle_theme();
+                    app.flash(format!("theme → {}", app.theme.name));
+                } else if app.set_theme_by_name(arg) {
+                    app.flash(format!("theme → {}", app.theme.name));
+                } else {
+                    app.flash(format!(
+                        "unknown theme: {arg} — try one of: {}",
+                        theme::builtins()
+                            .iter()
+                            .map(|t| t.name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                return;
+            }
+            "themes" => {
+                // Build a picker list from built-ins (as CommandInfo for reuse).
+                let items: Vec<CommandInfo> = theme::builtins()
+                    .iter()
+                    .map(|t| CommandInfo {
+                        name: format!("theme {}", t.name),
+                        description: Some(format!("switch to {}", t.name)),
+                        source: crate::rpc::types::CommandSource::Extension,
+                        location: None,
+                        path: None,
+                    })
+                    .collect();
+                app.modal = Some(Modal::Commands(ListModal::new(
+                    "themes",
+                    "type to filter · Enter apply · Esc close",
+                    items,
+                )));
+                return;
+            }
             _ => {
                 // Unknown local slash — fall through to pi so extension /
                 // prompt / skill commands still work.
@@ -1435,7 +1508,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     }
     draw_footer(f, footer, app);
 
-    draw_toasts(f, area, &app.ext_ui.toasts);
+    draw_toasts(f, area, &app.ext_ui.toasts, &app.theme);
 
     if let Some(modal) = &app.modal {
         draw_modal(f, area, modal, app);
@@ -1464,11 +1537,11 @@ fn draw_toasts(
     f: &mut ratatui::Frame,
     area: Rect,
     toasts: &std::collections::VecDeque<crate::ui::ext_ui::Toast>,
+    theme: &Theme,
 ) {
     if toasts.is_empty() {
         return;
     }
-    // Stack in the bottom-right corner.
     let max_w = area.width.saturating_mul(5) / 10;
     let width = max_w.min(area.width);
     let n = toasts.len() as u16;
@@ -1477,16 +1550,16 @@ fn draw_toasts(
         return;
     }
     let x = area.x + area.width.saturating_sub(width);
-    let y = area.y + area.height.saturating_sub(height + 3); // leave room for footer
+    let y = area.y + area.height.saturating_sub(height + 3);
     let rect = Rect::new(x, y, width, height);
     f.render_widget(Clear, rect);
     let lines: Vec<Line<'static>> = toasts
         .iter()
         .map(|t| {
             let color = match t.kind {
-                NotifyKind::Info => Color::Cyan,
-                NotifyKind::Warning => Color::Yellow,
-                NotifyKind::Error => Color::Red,
+                NotifyKind::Info => theme.accent_strong,
+                NotifyKind::Warning => theme.warning,
+                NotifyKind::Error => theme.error,
             };
             Line::from(vec![
                 Span::styled(
@@ -1500,7 +1573,7 @@ fn draw_toasts(
                     ),
                     Style::default()
                         .bg(color)
-                        .fg(Color::Black)
+                        .fg(Color::Rgb(0, 0, 0))
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
@@ -1512,25 +1585,26 @@ fn draw_toasts(
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let spinner = if app.is_streaming {
         Span::styled(
             format!("{} ", SPINNER[(app.ticks as usize) % SPINNER.len()]),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(t.accent_strong),
         )
     } else {
         Span::raw("  ")
     };
     let status = if app.is_streaming {
-        Span::styled("streaming", Style::default().fg(Color::Cyan))
+        Span::styled("streaming", Style::default().fg(t.accent_strong))
     } else if app.spawn_error.is_some() {
-        Span::styled("pi offline", Style::default().fg(Color::Red))
+        Span::styled("pi offline", Style::default().fg(t.error))
     } else {
-        Span::styled("idle", Style::default().add_modifier(Modifier::DIM))
+        Span::styled("idle", Style::default().fg(t.muted))
     };
     let thinking_badge = if app.show_thinking {
-        Span::styled("  think ●", Style::default().fg(Color::Magenta))
+        Span::styled("  think ●", Style::default().fg(t.role_thinking))
     } else {
-        Span::styled("  think ○", Style::default().add_modifier(Modifier::DIM))
+        Span::styled("  think ○", Style::default().fg(t.dim))
     };
     let queue = format!(
         "  steer:{} · follow-up:{}",
@@ -1547,24 +1621,23 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let line = Line::from(vec![
         Span::styled(
             " rata-pi ",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            Style::default()
+                .fg(t.text)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         ),
         Span::raw("  "),
         spinner,
-        Span::styled(
-            &app.session.model_label,
-            Style::default().fg(Color::Magenta),
-        ),
-        Span::styled(session_name, Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(&app.session.model_label, Style::default().fg(t.accent)),
+        Span::styled(session_name, Style::default().fg(t.dim)),
         Span::raw("  ·  "),
         status,
         thinking_badge,
-        Span::styled(queue, Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(queue, Style::default().fg(t.dim)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn entries_to_lines(entries: &[Entry], show_thinking: bool) -> Vec<Line<'static>> {
+fn entries_to_lines(entries: &[Entry], show_thinking: bool, t: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(entries.len() * 4);
     for e in entries {
         match e {
@@ -1572,7 +1645,7 @@ fn entries_to_lines(entries: &[Entry], show_thinking: bool) -> Vec<Line<'static>
                 let label = Span::styled(
                     "you › ",
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(t.role_user)
                         .add_modifier(Modifier::BOLD),
                 );
                 for (i, part) in s.split('\n').enumerate() {
@@ -1590,15 +1663,13 @@ fn entries_to_lines(entries: &[Entry], show_thinking: bool) -> Vec<Line<'static>
                     for (i, part) in s.split('\n').enumerate() {
                         let prefix = Span::styled(
                             if i == 0 { "think › " } else { "        " },
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::DIM),
+                            Style::default().fg(t.role_thinking),
                         );
                         lines.push(Line::from(vec![
                             prefix,
                             Span::styled(
                                 part.to_string(),
-                                Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+                                Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
                             ),
                         ]));
                     }
@@ -1607,9 +1678,7 @@ fn entries_to_lines(entries: &[Entry], show_thinking: bool) -> Vec<Line<'static>
                     let count = s.lines().count().max(1);
                     lines.push(Line::from(Span::styled(
                         format!("▸ thinking ({count} lines — Ctrl+T to reveal)"),
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::DIM),
+                        Style::default().fg(t.role_thinking),
                     )));
                 }
             }
@@ -1617,7 +1686,7 @@ fn entries_to_lines(entries: &[Entry], show_thinking: bool) -> Vec<Line<'static>
                 let label = Span::styled(
                     "pi  › ",
                     Style::default()
-                        .fg(Color::Blue)
+                        .fg(t.role_assistant)
                         .add_modifier(Modifier::BOLD),
                 );
                 let rendered = markdown::render(md);
@@ -1636,58 +1705,58 @@ fn entries_to_lines(entries: &[Entry], show_thinking: bool) -> Vec<Line<'static>
                 }
                 lines.push(Line::default());
             }
-            Entry::ToolCall(tc) => push_tool_lines(&mut lines, tc),
-            Entry::BashExec(bx) => push_bash_lines(&mut lines, bx),
+            Entry::ToolCall(tc) => push_tool_lines(&mut lines, tc, t),
+            Entry::BashExec(bx) => push_bash_lines(&mut lines, bx, t),
             Entry::Info(s) => lines.push(Line::from(Span::styled(
                 format!("· {s}"),
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().fg(t.dim),
             ))),
             Entry::Warn(s) => lines.push(Line::from(Span::styled(
                 format!("⚠ {s}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(t.warning),
             ))),
             Entry::Error(s) => lines.push(Line::from(Span::styled(
                 format!("✗ {s}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(t.error),
             ))),
-            Entry::Compaction(c) => push_compaction_line(&mut lines, c),
-            Entry::Retry(r) => push_retry_line(&mut lines, r),
+            Entry::Compaction(c) => push_compaction_line(&mut lines, c, t),
+            Entry::Retry(r) => push_retry_line(&mut lines, r, t),
         }
     }
     lines
 }
 
-fn push_tool_lines(lines: &mut Vec<Line<'static>>, tc: &ToolCall) {
+fn push_tool_lines(lines: &mut Vec<Line<'static>>, tc: &ToolCall, t: &Theme) {
     let (sym, color) = match tc.status {
-        ToolStatus::Running => ("…", Color::Yellow),
-        ToolStatus::Ok => ("✓", Color::Green),
-        ToolStatus::Err => ("✗", Color::Red),
+        ToolStatus::Running => ("…", t.role_tool),
+        ToolStatus::Ok => ("✓", t.success),
+        ToolStatus::Err => ("✗", t.error),
     };
     let arg_preview = truncate_preview(&args_preview(&tc.args), 60);
     let header_style = if tc.status == ToolStatus::Err || tc.is_error {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        Style::default().fg(t.error).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(color).add_modifier(Modifier::BOLD)
     };
     let expand_hint = if tc.expanded { "▾" } else { "▸" };
     lines.push(Line::from(vec![
         Span::styled(format!("{expand_hint} {sym} {} ", tc.name), header_style),
-        Span::styled(arg_preview, Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(arg_preview, Style::default().fg(t.dim)),
     ]));
     if tc.expanded {
         let output = crate::ui::ansi::strip(&tc.output);
         if output.trim().is_empty() {
             lines.push(Line::from(Span::styled(
                 "    (no output yet)",
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().fg(t.dim),
             )));
         } else {
             let diff_like = looks_like_diff(&output);
             for part in output.split('\n').take(200) {
                 let styled = if diff_like {
-                    diff_style_for(part)
+                    diff_style_for(part, t)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(t.muted)
                 };
                 lines.push(Line::from(vec![
                     Span::raw("    "),
@@ -1704,10 +1773,7 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, tc: &ToolCall) {
             .unwrap_or_default();
         lines.push(Line::from(vec![
             Span::raw("    "),
-            Span::styled(
-                first,
-                Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
-            ),
+            Span::styled(first, Style::default().fg(t.dim)),
         ]));
     }
     lines.push(Line::default());
@@ -1742,19 +1808,19 @@ fn looks_like_diff(s: &str) -> bool {
     false
 }
 
-fn diff_style_for(line: &str) -> Style {
+fn diff_style_for(line: &str, t: &Theme) -> Style {
     if line.starts_with("+++ ") || line.starts_with("--- ") {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(t.diff_file)
             .add_modifier(Modifier::BOLD)
     } else if line.starts_with("@@") {
-        Style::default().fg(Color::Magenta)
+        Style::default().fg(t.diff_hunk)
     } else if line.starts_with('+') {
-        Style::default().fg(Color::Green)
+        Style::default().fg(t.diff_add)
     } else if line.starts_with('-') {
-        Style::default().fg(Color::Red)
+        Style::default().fg(t.diff_remove)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(t.muted)
     }
 }
 
@@ -1768,13 +1834,13 @@ fn truncate_preview(s: &str, max: usize) -> String {
     }
 }
 
-fn push_bash_lines(lines: &mut Vec<Line<'static>>, bx: &BashExec) {
+fn push_bash_lines(lines: &mut Vec<Line<'static>>, bx: &BashExec, t: &Theme) {
     let status_color = if bx.cancelled {
-        Color::Yellow
+        t.warning
     } else if bx.exit_code == 0 {
-        Color::Green
+        t.success
     } else {
-        Color::Red
+        t.error
     };
     let status_txt = if bx.cancelled {
         " cancelled ".to_string()
@@ -1785,19 +1851,19 @@ fn push_bash_lines(lines: &mut Vec<Line<'static>>, bx: &BashExec) {
         Span::styled(
             "$ ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(t.role_bash)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             bx.command.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
             status_txt,
             Style::default()
                 .bg(status_color)
-                .fg(Color::Black)
+                .fg(Color::Rgb(0, 0, 0))
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -1805,7 +1871,7 @@ fn push_bash_lines(lines: &mut Vec<Line<'static>>, bx: &BashExec) {
     for part in body.split('\n').take(200) {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(part.to_string(), Style::default().fg(Color::Gray)),
+            Span::styled(part.to_string(), Style::default().fg(t.muted)),
         ]));
     }
     if bx.truncated {
@@ -1815,15 +1881,15 @@ fn push_bash_lines(lines: &mut Vec<Line<'static>>, bx: &BashExec) {
             .unwrap_or("(path not provided)");
         lines.push(Line::from(Span::styled(
             format!("  … output truncated — full log: {path}"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(t.warning),
         )));
     }
     lines.push(Line::default());
 }
 
-fn push_compaction_line(lines: &mut Vec<Line<'static>>, c: &Compaction) {
+fn push_compaction_line(lines: &mut Vec<Line<'static>>, c: &Compaction, t: &Theme) {
     let (sym, color, label) = match &c.state {
-        CompactionState::Running => ("⟲", Color::Cyan, "compacting".to_string()),
+        CompactionState::Running => ("⟲", t.accent_strong, "compacting".to_string()),
         CompactionState::Done { summary } => {
             let s = summary
                 .as_deref()
@@ -1831,7 +1897,7 @@ fn push_compaction_line(lines: &mut Vec<Line<'static>>, c: &Compaction) {
                 .unwrap_or_default();
             (
                 "⟲",
-                Color::Green,
+                t.success,
                 if s.is_empty() {
                     "compaction complete".to_string()
                 } else {
@@ -1839,8 +1905,8 @@ fn push_compaction_line(lines: &mut Vec<Line<'static>>, c: &Compaction) {
                 },
             )
         }
-        CompactionState::Aborted => ("⟲", Color::Yellow, "compaction aborted".into()),
-        CompactionState::Failed(msg) => ("⟲", Color::Red, format!("compaction failed: {msg}")),
+        CompactionState::Aborted => ("⟲", t.warning, "compaction aborted".into()),
+        CompactionState::Failed(msg) => ("⟲", t.error, format!("compaction failed: {msg}")),
     };
     lines.push(Line::from(vec![
         Span::styled(
@@ -1849,18 +1915,15 @@ fn push_compaction_line(lines: &mut Vec<Line<'static>>, c: &Compaction) {
         ),
         Span::styled(label, Style::default().fg(color)),
         Span::raw(" "),
-        Span::styled(
-            format!("({})", c.reason),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
+        Span::styled(format!("({})", c.reason), Style::default().fg(t.dim)),
     ]));
 }
 
-fn push_retry_line(lines: &mut Vec<Line<'static>>, r: &Retry) {
+fn push_retry_line(lines: &mut Vec<Line<'static>>, r: &Retry, t: &Theme) {
     let (sym, color, label) = match &r.state {
         RetryState::Waiting { delay_ms, error } => (
             "↻",
-            Color::Yellow,
+            t.warning,
             format!(
                 "retry {}/{} in {}ms — {}",
                 r.attempt,
@@ -1869,10 +1932,10 @@ fn push_retry_line(lines: &mut Vec<Line<'static>>, r: &Retry) {
                 truncate_preview(error, 80),
             ),
         ),
-        RetryState::Succeeded => ("↻", Color::Green, format!("retry {} succeeded", r.attempt)),
+        RetryState::Succeeded => ("↻", t.success, format!("retry {} succeeded", r.attempt)),
         RetryState::Exhausted(msg) => (
             "↻",
-            Color::Red,
+            t.error,
             format!(
                 "retry exhausted at {}: {}",
                 r.attempt,
@@ -1901,14 +1964,16 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
         let msg = Paragraph::new(Text::from(vec![
             Line::from(Span::styled(
                 "⚠ pi is not available",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(app.theme.error)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::default(),
             Line::from(err.clone()),
             Line::default(),
             Line::from(Span::styled(
                 "press q or Ctrl+C to quit",
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().fg(app.theme.dim),
             )),
         ]))
         .wrap(Wrap { trim: false });
@@ -1916,7 +1981,7 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
         return;
     }
 
-    let lines = entries_to_lines(app.transcript.entries(), app.show_thinking);
+    let lines = entries_to_lines(app.transcript.entries(), app.show_thinking, &app.theme);
     let text = Text::from(lines);
     let line_count = text.lines.len() as u16;
     let viewport = inner.height;
@@ -1932,21 +1997,22 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let is_bash = app.input.trim_start().starts_with('!');
     let (color, title) = if is_bash {
-        (Color::Yellow, " bash (! prefix · Enter run) ".to_string())
+        (t.role_bash, " bash (! prefix · Enter run) ".to_string())
     } else if app.is_streaming {
         let label = match app.composer_mode {
             ComposerMode::Steer | ComposerMode::Prompt => "steer",
             ComposerMode::FollowUp => "follow-up",
         };
         (
-            Color::Cyan,
+            t.border_active,
             format!(" {label} (Ctrl+Space cycle · Esc abort) "),
         )
     } else {
         (
-            Color::DarkGray,
+            t.border_idle,
             " prompt (Enter submit · / commands · Esc clear) ".to_string(),
         )
     };
@@ -1958,7 +2024,7 @@ fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     let spans = vec![
-        Span::raw(app.input.as_str()),
+        Span::styled(app.input.as_str(), Style::default().fg(t.text)),
         Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
     ];
     f.render_widget(
@@ -1992,13 +2058,7 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
     } else {
         (0.0, "context: —".to_string())
     };
-    let gauge_color = if pct > 0.85 {
-        Color::Red
-    } else if pct > 0.65 {
-        Color::Yellow
-    } else {
-        Color::Green
-    };
+    let gauge_color = theme::gauge_color(&app.theme, pct);
     let gauge = Gauge::default()
         .gauge_style(Style::default().fg(gauge_color).bg(Color::Reset))
         .ratio(pct)
@@ -2071,53 +2131,54 @@ fn kb(s: &str) -> Span<'static> {
 
 // ───────────────────────────────────────────────────────── modals ──
 
-fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, _app: &App) {
+fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
+    let theme = &app.theme;
     let (title, body, hint, max_w, max_h) = match modal {
         Modal::Help => (
             " help ".to_string(),
-            help_text(),
+            help_text(theme),
             "Esc close".to_string(),
             70,
             22,
         ),
         Modal::Stats(s) => (
             " stats ".to_string(),
-            stats_text(s),
+            stats_text(s, theme),
             "Esc close".to_string(),
             70,
             18,
         ),
         Modal::Commands(list) => (
             format!(" {} ", list.title),
-            commands_text(list),
+            commands_text(list, theme),
             list.hint.clone(),
             80,
             22,
         ),
         Modal::Models(list) => (
             format!(" {} ", list.title),
-            models_text(list),
+            models_text(list, theme),
             list.hint.clone(),
             80,
             22,
         ),
         Modal::Thinking(radio) => (
             format!(" {} ", radio.title),
-            thinking_text(radio),
+            thinking_text(radio, theme),
             "↑↓ · Enter set · Esc close".to_string(),
             50,
             12,
         ),
         Modal::History(list) => (
             format!(" {} ", list.title),
-            history_text(list),
+            history_text(list, theme),
             list.hint.clone(),
             90,
             24,
         ),
         Modal::Forks(list) => (
             format!(" {} ", list.title),
-            forks_text(list),
+            forks_text(list, theme),
             list.hint.clone(),
             90,
             24,
@@ -2129,7 +2190,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, _app: &App) {
             ..
         } => (
             format!(" ext: {title} "),
-            ext_select_text(options, *selected),
+            ext_select_text(options, *selected, theme),
             "↑↓ · Enter pick · Esc cancel".to_string(),
             70,
             20,
@@ -2141,7 +2202,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, _app: &App) {
             ..
         } => (
             format!(" ext: {title} "),
-            ext_confirm_text(message.as_deref(), *selected),
+            ext_confirm_text(message.as_deref(), *selected, theme),
             "Y/N · ←→ · Enter · Esc".to_string(),
             60,
             10,
@@ -2153,29 +2214,30 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, _app: &App) {
             ..
         } => (
             format!(" ext: {title} "),
-            ext_input_text(placeholder.as_deref(), value),
+            ext_input_text(placeholder.as_deref(), value, theme),
             "Enter submit · Esc cancel".to_string(),
             70,
             8,
         ),
         Modal::ExtEditor { title, value, .. } => (
             format!(" ext: {title} "),
-            ext_input_text(None, value),
+            ext_input_text(None, value, theme),
             "Enter submit · Esc cancel".to_string(),
             80,
             14,
         ),
     };
 
+    let t = &app.theme;
     let rect = centered(area, max_w, max_h);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
         .title_bottom(Line::from(Span::styled(
             format!(" {hint} "),
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().fg(t.dim),
         )))
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(Style::default().fg(t.border_modal));
 
     f.render_widget(Clear, rect);
     let inner = block.inner(rect);
@@ -2184,7 +2246,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, _app: &App) {
     f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
 }
 
-fn help_text() -> Text<'static> {
+fn help_text(t: &Theme) -> Text<'static> {
     Text::from(vec![
         Line::from(vec![
             kb("Enter"),
@@ -2199,10 +2261,10 @@ fn help_text() -> Text<'static> {
             Span::raw(" commands"),
         ]),
         Line::from(vec![
-            Span::styled("  slash: ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("  slash: ", Style::default().fg(t.dim)),
             Span::styled(
-                "/help /stats /export /export-html /rename <n> /new /switch <p> /fork /compact",
-                Style::default().fg(Color::Yellow),
+                "/help /stats /export /export-html /rename <n> /new /switch <p> /fork /compact /theme",
+                Style::default().fg(t.warning),
             ),
         ]),
         Line::from(vec![
@@ -2220,7 +2282,14 @@ fn help_text() -> Text<'static> {
             Span::raw(" history"),
         ]),
         Line::default(),
-        Line::from(vec![kb("Ctrl+T"), Span::raw(" toggle thinking blocks")]),
+        Line::from(vec![
+            kb("Ctrl+T"),
+            Span::raw(" thinking · "),
+            kb("Ctrl+Shift+T"),
+            Span::raw(" cycle theme · "),
+            kb("/theme <name>"),
+            Span::raw(" pick"),
+        ]),
         Line::from(vec![
             kb("Ctrl+E"),
             Span::raw(" expand/collapse last tool card"),
@@ -2262,15 +2331,16 @@ fn help_text() -> Text<'static> {
     ])
 }
 
-fn stats_text(s: &SessionStats) -> Text<'static> {
+fn stats_text(s: &SessionStats, t: &Theme) -> Text<'static> {
     let mut lines = vec![
-        label_value("session", s.session_name_opt()),
+        label_value("session", s.session_name_opt(), t),
         label_value(
             "messages",
             format!(
                 "{} user · {} assistant · {} tools",
                 s.user_messages, s.assistant_messages, s.tool_calls
             ),
+            t,
         ),
         label_value(
             "tokens",
@@ -2282,8 +2352,9 @@ fn stats_text(s: &SessionStats) -> Text<'static> {
                 s.tokens.cache_write,
                 s.tokens.total
             ),
+            t,
         ),
-        label_value("cost", format!("${:.4}", s.cost)),
+        label_value("cost", format!("${:.4}", s.cost), t),
     ];
     if let Some(ctx) = &s.context_usage {
         lines.push(label_value(
@@ -2294,13 +2365,14 @@ fn stats_text(s: &SessionStats) -> Text<'static> {
                 ctx.context_window,
                 ctx.percent.map(|p| format!("{p:.0}")).unwrap_or_default()
             ),
+            t,
         ));
     }
     if let Some(file) = &s.session_file {
-        lines.push(label_value("file", file.clone()));
+        lines.push(label_value("file", file.clone(), t));
     }
     if let Some(id) = &s.session_id {
-        lines.push(label_value("id", id.clone()));
+        lines.push(label_value("id", id.clone(), t));
     }
     Text::from(lines)
 }
@@ -2314,25 +2386,20 @@ impl SessionStatsExt for SessionStats {
     }
 }
 
-fn label_value(k: &str, v: impl Into<String>) -> Line<'static> {
+fn label_value(k: &str, v: impl Into<String>, t: &Theme) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("{:>12}  ", k),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::DIM),
-        ),
-        Span::raw(v.into()),
+        Span::styled(format!("{:>12}  ", k), Style::default().fg(t.accent)),
+        Span::styled(v.into(), Style::default().fg(t.text)),
     ])
 }
 
-fn commands_text(list: &ListModal<CommandInfo>) -> Text<'static> {
+fn commands_text(list: &ListModal<CommandInfo>, t: &Theme) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("filter: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("filter: ", Style::default().fg(t.dim)),
         Span::styled(
             list.query.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::default());
@@ -2345,38 +2412,33 @@ fn commands_text(list: &ListModal<CommandInfo>) -> Text<'static> {
             crate::rpc::types::CommandSource::Skill => "skill",
         };
         let style = if i == list.selected {
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            Style::default().fg(t.text)
         };
         let desc = c.description.as_deref().unwrap_or("");
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} /{} ", c.name), style),
-            Span::styled(format!("[{badge}] "), Style::default().fg(Color::Yellow)),
-            Span::styled(
-                desc.to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
+            Span::styled(format!("[{badge}] "), Style::default().fg(t.warning)),
+            Span::styled(desc.to_string(), Style::default().fg(t.dim)),
         ]));
     }
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no matches)",
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().fg(t.dim),
         )));
     }
     Text::from(lines)
 }
 
-fn models_text(list: &ListModal<Model>) -> Text<'static> {
+fn models_text(list: &ListModal<Model>, t: &Theme) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("filter: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("filter: ", Style::default().fg(t.dim)),
         Span::styled(
             list.query.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::default());
@@ -2384,11 +2446,9 @@ fn models_text(list: &ListModal<Model>) -> Text<'static> {
     for (i, m) in filtered.iter().enumerate() {
         let marker = if i == list.selected { "▸" } else { " " };
         let style = if i == list.selected {
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            Style::default().fg(t.text)
         };
         let cw = m
             .context_window
@@ -2397,23 +2457,20 @@ fn models_text(list: &ListModal<Model>) -> Text<'static> {
         let reasoning = if m.reasoning { " · reasoning" } else { "" };
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} "), style),
-            Span::styled(format!("{}/{}", m.provider, m.id), style.fg(Color::Magenta)),
-            Span::styled(
-                format!("{cw}{reasoning}"),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
+            Span::styled(format!("{}/{}", m.provider, m.id), style),
+            Span::styled(format!("{cw}{reasoning}"), Style::default().fg(t.dim)),
         ]));
     }
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no matches)",
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().fg(t.dim),
         )));
     }
     Text::from(lines)
 }
 
-fn thinking_text(radio: &RadioModal<ThinkingLevel>) -> Text<'static> {
+fn thinking_text(radio: &RadioModal<ThinkingLevel>, t: &Theme) -> Text<'static> {
     let lines: Vec<Line<'static>> = radio
         .options
         .iter()
@@ -2422,12 +2479,10 @@ fn thinking_text(radio: &RadioModal<ThinkingLevel>) -> Text<'static> {
             let (marker, style) = if i == radio.selected {
                 (
                     "◉",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
                 )
             } else {
-                ("○", Style::default().add_modifier(Modifier::DIM))
+                ("○", Style::default().fg(t.dim))
             };
             Line::from(vec![
                 Span::styled(format!("{marker} "), style),
@@ -2438,13 +2493,13 @@ fn thinking_text(radio: &RadioModal<ThinkingLevel>) -> Text<'static> {
     Text::from(lines)
 }
 
-fn forks_text(list: &ListModal<ForkMessage>) -> Text<'static> {
+fn forks_text(list: &ListModal<ForkMessage>, t: &Theme) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("filter: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("filter: ", Style::default().fg(t.dim)),
         Span::styled(
             list.query.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::default());
@@ -2452,17 +2507,15 @@ fn forks_text(list: &ListModal<ForkMessage>) -> Text<'static> {
     for (i, f) in filtered.iter().enumerate() {
         let marker = if i == list.selected { "▸" } else { " " };
         let style = if i == list.selected {
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            Style::default().fg(t.text)
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} "), style),
             Span::styled(
                 truncate_preview(&f.entry_id, 10),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(t.warning),
             ),
             Span::raw("  "),
             Span::styled(truncate_preview(&f.text.replace('\n', " ⏎ "), 200), style),
@@ -2471,19 +2524,19 @@ fn forks_text(list: &ListModal<ForkMessage>) -> Text<'static> {
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no fork candidates)",
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().fg(t.dim),
         )));
     }
     Text::from(lines)
 }
 
-fn history_text(list: &ListModal<HistoryEntry>) -> Text<'static> {
+fn history_text(list: &ListModal<HistoryEntry>, t: &Theme) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("filter: ", Style::default().add_modifier(Modifier::DIM)),
         Span::styled(
             list.query.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::default());
@@ -2491,13 +2544,10 @@ fn history_text(list: &ListModal<HistoryEntry>) -> Text<'static> {
     for (i, e) in filtered.iter().enumerate() {
         let marker = if i == list.selected { "▸" } else { " " };
         let style = if i == list.selected {
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            Style::default().fg(t.text)
         };
-        // Each history line may contain newlines — squash to a single preview.
         let preview = truncate_preview(&e.text.replace('\n', " ⏎ "), 200);
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} "), style),
@@ -2507,24 +2557,22 @@ fn history_text(list: &ListModal<HistoryEntry>) -> Text<'static> {
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no matches)",
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().fg(t.dim),
         )));
     }
     Text::from(lines)
 }
 
-fn ext_select_text(options: &[String], selected: usize) -> Text<'static> {
+fn ext_select_text(options: &[String], selected: usize, t: &Theme) -> Text<'static> {
     let lines: Vec<Line<'static>> = options
         .iter()
         .enumerate()
         .map(|(i, o)| {
             let marker = if i == selected { "▸" } else { " " };
             let style = if i == selected {
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(t.text)
             };
             Line::from(vec![
                 Span::styled(format!("{marker} "), style),
@@ -2535,30 +2583,31 @@ fn ext_select_text(options: &[String], selected: usize) -> Text<'static> {
     Text::from(lines)
 }
 
-fn ext_confirm_text(message: Option<&str>, selected: usize) -> Text<'static> {
+fn ext_confirm_text(message: Option<&str>, selected: usize, t: &Theme) -> Text<'static> {
     let mut lines = Vec::new();
     if let Some(m) = message {
-        lines.push(Line::from(Span::raw(m.to_string())));
+        lines.push(Line::from(Span::styled(
+            m.to_string(),
+            Style::default().fg(t.text),
+        )));
         lines.push(Line::default());
     }
     let sel_yes = selected == 1;
     let yes_style = if sel_yes {
         Style::default()
-            .bg(Color::Green)
-            .fg(Color::Black)
+            .bg(t.success)
+            .fg(Color::Rgb(0, 0, 0))
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(t.success).add_modifier(Modifier::DIM)
     };
     let no_style = if !sel_yes {
         Style::default()
-            .bg(Color::Red)
-            .fg(Color::Black)
+            .bg(t.error)
+            .fg(Color::Rgb(0, 0, 0))
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Red).add_modifier(Modifier::DIM)
+        Style::default().fg(t.error).add_modifier(Modifier::DIM)
     };
     lines.push(Line::from(vec![
         Span::styled("  [ No ]  ", no_style),
@@ -2568,12 +2617,12 @@ fn ext_confirm_text(message: Option<&str>, selected: usize) -> Text<'static> {
     Text::from(lines)
 }
 
-fn ext_input_text(placeholder: Option<&str>, value: &str) -> Text<'static> {
+fn ext_input_text(placeholder: Option<&str>, value: &str, t: &Theme) -> Text<'static> {
     let mut lines = Vec::new();
     if let Some(p) = placeholder {
         lines.push(Line::from(Span::styled(
             format!("({p})"),
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().fg(t.dim),
         )));
         lines.push(Line::default());
     }
@@ -2584,7 +2633,7 @@ fn ext_input_text(placeholder: Option<&str>, value: &str) -> Text<'static> {
         )])
     } else {
         Line::from(vec![
-            Span::raw(value.to_string()),
+            Span::styled(value.to_string(), Style::default().fg(t.text)),
             Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
         ])
     };

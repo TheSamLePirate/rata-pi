@@ -1,8 +1,10 @@
+mod anim;
 mod app;
 mod cli;
 mod history;
 mod log;
 mod rpc;
+mod theme;
 mod ui;
 
 use clap::Parser;
