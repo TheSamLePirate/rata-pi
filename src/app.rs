@@ -1,20 +1,15 @@
-//! M2 app: streaming chat with thinking, tool cards, markdown, bash RPC.
+//! M3 app: chat + modals + session state.
 //!
-//! Events we consume:
-//! - agent_start / agent_end — streaming state + spinner
-//! - message_update{text_delta,thinking_delta,thinking_end,error}
-//! - tool_execution_start/update/end — live tool card with streaming output
-//! - auto_retry_start/end — typed retry row that updates in place
-//! - compaction_start/end — typed compaction row that updates in place
-//! - extension_error — error row
-//!
-//! User input:
-//! - `Enter` submits a prompt (or steer during streaming)
-//! - Prefix `!cmd` and Enter runs pi's `bash` RPC and inserts a BashExec row
-//! - `Ctrl+T` toggles thinking visibility
-//! - `Ctrl+E` expands/collapses the last tool call
-//! - `Esc` aborts during streaming (or clears, or quits)
-//! - `PgUp/PgDn` scrolls; `End` re-follows tail
+//! Adds on top of M2:
+//! - Transcript bootstrap from `get_messages`
+//! - Modal system: Commands (F1), Models (F5), Thinking (F6), Stats (F7), Help (?)
+//! - Slash-trigger (typing `/` in an empty composer) opens the Commands modal
+//!   with a live filter preloaded from the first char
+//! - Periodic `get_session_stats` polling drives a context-window gauge in the
+//!   header and populates the Stats modal
+//! - Queue state from `queue_update` appears as a header chip; `Ctrl+Space`
+//!   cycles the composer between steer / follow-up intent during streaming
+//! - F8 = compact now, F9 = toggle auto-compaction, F10 = toggle auto-retry
 
 use std::io::{Stdout, stdout};
 use std::panic;
@@ -35,14 +30,18 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 
 use crate::cli::Args;
 use crate::rpc::client::{self, RpcClient, RpcError};
 use crate::rpc::commands::RpcCommand;
 use crate::rpc::events::{AssistantEvent, Incoming};
-use crate::rpc::types::{State, StreamingBehavior};
+use crate::rpc::types::{
+    AgentMessage, AssistantBlock, CommandInfo, ContentBlock, FollowUpMode, Model, SessionStats,
+    State, SteeringMode, ThinkingLevel, ToolResultPayload, UserContent,
+};
 use crate::ui::markdown;
+use crate::ui::modal::{ListModal, Modal, RadioModal, centered, matches_query};
 use crate::ui::transcript::{
     BashExec, Compaction, CompactionState, Entry, Retry, RetryState, ToolCall, ToolStatus,
     Transcript,
@@ -89,44 +88,97 @@ fn install_panic_hook() {
 
 // ───────────────────────────────────────────────────────── state ──
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerMode {
+    Prompt,
+    Steer,
+    FollowUp,
+}
+
+impl ComposerMode {
+    fn cycle_stream(self) -> Self {
+        match self {
+            Self::Prompt | Self::FollowUp => Self::Steer,
+            Self::Steer => Self::FollowUp,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SessionState {
+    model_label: String,
+    thinking: Option<ThinkingLevel>,
+    steering_mode: Option<SteeringMode>,
+    follow_up_mode: Option<FollowUpMode>,
+    auto_compaction: Option<bool>,
+    auto_retry: Option<bool>,
+    session_name: Option<String>,
+    queue_steering: Vec<String>,
+    queue_follow_up: Vec<String>,
+    available_models: Vec<Model>,
+    commands: Vec<CommandInfo>,
+    stats: Option<SessionStats>,
+}
+
 struct App {
     transcript: Transcript,
     input: String,
     is_streaming: bool,
-    model_label: String,
     ticks: u64,
     quit: bool,
-    /// Viewport scroll offset; `None` means auto-follow bottom.
     scroll: Option<u16>,
     show_thinking: bool,
     spawn_error: Option<String>,
+    composer_mode: ComposerMode,
+    session: SessionState,
+    modal: Option<Modal>,
+    flash: Option<(String, u64)>, // transient status message with a decay tick
 }
 
 impl App {
-    fn new(model_label: String, spawn_error: Option<String>) -> Self {
+    fn new(spawn_error: Option<String>) -> Self {
         Self {
             transcript: Transcript::default(),
             input: String::new(),
             is_streaming: false,
-            model_label,
             ticks: 0,
             quit: false,
             scroll: None,
             show_thinking: false,
             spawn_error,
+            composer_mode: ComposerMode::Prompt,
+            session: SessionState {
+                model_label: "unknown model".into(),
+                ..Default::default()
+            },
+            modal: None,
+            flash: None,
         }
+    }
+
+    fn flash(&mut self, msg: impl Into<String>) {
+        self.flash = Some((msg.into(), self.ticks));
     }
 
     fn apply_state(&mut self, s: &State) {
         if let Some(m) = &s.model {
-            self.model_label = format!("{}/{}", m.provider, m.id);
+            self.session.model_label = format!("{}/{}", m.provider, m.id);
         }
+        self.session.thinking = Some(s.thinking_level);
+        self.session.steering_mode = Some(s.steering_mode);
+        self.session.follow_up_mode = Some(s.follow_up_mode);
+        self.session.auto_compaction = Some(s.auto_compaction_enabled);
+        self.session.session_name = s.session_name.clone();
     }
 
     fn on_event(&mut self, ev: Incoming) {
         match ev {
             Incoming::AgentStart => self.is_streaming = true,
-            Incoming::AgentEnd { .. } => self.is_streaming = false,
+            Incoming::AgentEnd { .. } => {
+                self.is_streaming = false;
+                // Composer returns to Prompt outside streaming.
+                self.composer_mode = ComposerMode::Prompt;
+            }
             Incoming::MessageUpdate {
                 assistant_message_event,
                 ..
@@ -147,39 +199,33 @@ impl App {
                 tool_call_id,
                 tool_name,
                 args,
-            } => {
-                self.transcript.start_tool(tool_call_id, tool_name, args);
-            }
+            } => self.transcript.start_tool(tool_call_id, tool_name, args),
             Incoming::ToolExecutionUpdate {
                 tool_call_id,
                 partial_result,
                 ..
-            } => {
-                self.transcript
-                    .update_tool_output(&tool_call_id, &partial_result);
-            }
+            } => self
+                .transcript
+                .update_tool_output(&tool_call_id, &partial_result),
             Incoming::ToolExecutionEnd {
                 tool_call_id,
                 result,
                 is_error,
                 ..
-            } => {
-                self.transcript
-                    .finish_tool(&tool_call_id, &result, is_error);
-            }
+            } => self
+                .transcript
+                .finish_tool(&tool_call_id, &result, is_error),
             Incoming::AutoRetryStart {
                 attempt,
                 max_attempts,
                 delay_ms,
                 error_message,
-            } => {
-                self.transcript.push_retry_waiting(
-                    attempt,
-                    max_attempts,
-                    delay_ms,
-                    error_message.unwrap_or_else(|| "transient error".into()),
-                );
-            }
+            } => self.transcript.push_retry_waiting(
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message.unwrap_or_else(|| "transient error".into()),
+            ),
             Incoming::AutoRetryEnd {
                 success,
                 attempt,
@@ -220,8 +266,108 @@ impl App {
                     error.as_deref().unwrap_or("(no detail)")
                 )));
             }
+            Incoming::QueueUpdate {
+                steering,
+                follow_up,
+            } => {
+                self.session.queue_steering = steering;
+                self.session.queue_follow_up = follow_up;
+            }
             _ => {}
         }
+    }
+}
+
+// ───────────────────────────────────────────────────────── bootstrap ──
+
+fn import_messages(app: &mut App, messages: Vec<AgentMessage>) {
+    for m in messages {
+        match m {
+            AgentMessage::User { content, .. } => {
+                let text = user_content_text(&content);
+                app.transcript.push(Entry::User(text));
+            }
+            AgentMessage::Assistant { content, .. } => {
+                let mut thinking = String::new();
+                let mut assistant_text = String::new();
+                let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
+                for block in content {
+                    match block {
+                        AssistantBlock::Thinking { thinking: t } => {
+                            if !thinking.is_empty() {
+                                thinking.push('\n');
+                            }
+                            thinking.push_str(&t);
+                        }
+                        AssistantBlock::Text { text } => {
+                            if !assistant_text.is_empty() {
+                                assistant_text.push('\n');
+                            }
+                            assistant_text.push_str(&text);
+                        }
+                        AssistantBlock::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => tool_calls.push((id, name, arguments)),
+                    }
+                }
+                if !thinking.is_empty() {
+                    app.transcript.push(Entry::Thinking(thinking));
+                }
+                if !assistant_text.is_empty() {
+                    app.transcript.push(Entry::Assistant(assistant_text));
+                }
+                for (id, name, args) in tool_calls {
+                    app.transcript.start_tool(id, name, args);
+                }
+            }
+            AgentMessage::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => {
+                let payload = ToolResultPayload {
+                    content,
+                    details: serde_json::Value::Null,
+                };
+                app.transcript
+                    .finish_tool(&tool_call_id, &payload, is_error);
+            }
+            AgentMessage::BashExecution {
+                command,
+                output,
+                exit_code,
+                cancelled,
+                truncated,
+                full_output_path,
+                ..
+            } => {
+                app.transcript.push(Entry::BashExec(BashExec {
+                    command,
+                    output: crate::ui::ansi::strip(&output),
+                    exit_code,
+                    cancelled,
+                    truncated,
+                    full_output_path,
+                }));
+            }
+        }
+    }
+}
+
+fn user_content_text(c: &UserContent) -> String {
+    match c {
+        UserContent::Text(s) => s.clone(),
+        UserContent::Blocks(bs) => bs
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text { text } => text.clone(),
+                ContentBlock::Image { .. } => "[image]".into(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -234,34 +380,70 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: Args
             Err(e) => (None, Some(format!("{e:#}"))),
         };
 
-    let mut app = App::new("unknown model".into(), spawn_error);
+    let mut app = App::new(spawn_error);
 
     if let Some((client, mut io)) = client_and_io {
-        match client.call(RpcCommand::GetState).await {
-            Ok(ok) => {
-                if let Some(v) = ok.data
-                    && let Ok(state) = serde_json::from_value::<State>(v)
-                {
-                    app.apply_state(&state);
-                }
-            }
-            Err(e) => tracing::warn!(error = ?e, "initial get_state failed"),
-        }
+        bootstrap(&client, &mut app).await;
         app.transcript.push(Entry::Info(
-            "connected to pi — type a message and press Enter · `!cmd` runs bash · Ctrl+T thinking · Ctrl+C quit"
-                .into(),
+            "connected — F1 commands · F5 model · F6 thinking · F7 stats · / slash · ? help".into(),
         ));
-
         ui_loop(terminal, &mut app, Some(&client), &mut io.events).await?;
-
         if let Err(e) = client::shutdown(client, io).await {
             tracing::warn!(error = ?e, "shutdown error");
         }
     } else {
         ui_loop(terminal, &mut app, None, &mut dummy_events()).await?;
     }
-
     Ok(())
+}
+
+async fn bootstrap(client: &RpcClient, app: &mut App) {
+    if let Ok(ok) = client.call(RpcCommand::GetState).await
+        && let Some(v) = ok.data
+        && let Ok(s) = serde_json::from_value::<State>(v)
+    {
+        app.apply_state(&s);
+    }
+    if let Ok(ok) = client.call(RpcCommand::GetMessages).await
+        && let Some(v) = ok.data
+        && let Some(arr) = v.get("messages").and_then(|x| x.as_array())
+    {
+        let mut messages: Vec<AgentMessage> = Vec::with_capacity(arr.len());
+        for m in arr {
+            if let Ok(msg) = serde_json::from_value::<AgentMessage>(m.clone()) {
+                messages.push(msg);
+            }
+        }
+        import_messages(app, messages);
+    }
+    if let Ok(ok) = client.call(RpcCommand::GetCommands).await
+        && let Some(v) = ok.data
+        && let Some(arr) = v.get("commands").and_then(|x| x.as_array())
+    {
+        app.session.commands = arr
+            .iter()
+            .filter_map(|m| serde_json::from_value::<CommandInfo>(m.clone()).ok())
+            .collect();
+    }
+    if let Ok(ok) = client.call(RpcCommand::GetAvailableModels).await
+        && let Some(v) = ok.data
+        && let Some(arr) = v.get("models").and_then(|x| x.as_array())
+    {
+        app.session.available_models = arr
+            .iter()
+            .filter_map(|m| serde_json::from_value::<Model>(m.clone()).ok())
+            .collect();
+    }
+    refresh_stats(client, app).await;
+}
+
+async fn refresh_stats(client: &RpcClient, app: &mut App) {
+    if let Ok(ok) = client.call(RpcCommand::GetSessionStats).await
+        && let Some(v) = ok.data
+        && let Ok(s) = serde_json::from_value::<SessionStats>(v)
+    {
+        app.session.stats = Some(s);
+    }
 }
 
 fn dummy_events() -> tokio::sync::mpsc::Receiver<Incoming> {
@@ -276,8 +458,10 @@ async fn ui_loop(
     events: &mut tokio::sync::mpsc::Receiver<Incoming>,
 ) -> Result<()> {
     let mut crossterm_events = EventStream::new();
-    let mut ticker = tokio::time::interval(Duration::from_millis(100));
-    ticker.tick().await;
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.tick().await;
+    let mut stats_tick = tokio::time::interval(Duration::from_secs(5));
+    stats_tick.tick().await;
 
     loop {
         terminal.draw(|f| draw(f, app))?;
@@ -288,57 +472,38 @@ async fn ui_loop(
         tokio::select! {
             Some(msg) = events.recv() => app.on_event(msg),
             Some(Ok(ev)) = crossterm_events.next() => handle_crossterm(ev, app, client).await,
-            _ = ticker.tick() => app.ticks = app.ticks.wrapping_add(1),
+            _ = tick.tick() => {
+                app.ticks = app.ticks.wrapping_add(1);
+                // Expire flash after ~1.5s.
+                if let Some((_, at)) = app.flash
+                    && app.ticks.wrapping_sub(at) > 15 {
+                    app.flash = None;
+                }
+            }
+            _ = stats_tick.tick() => {
+                if let Some(c) = client { refresh_stats(c, app).await; }
+            }
         }
     }
     Ok(())
 }
 
+// ───────────────────────────────────────────────────────── input ──
+
 async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) {
+    // If a modal is open, route input to it first.
+    if app.modal.is_some()
+        && let Event::Key(k) = ev
+        && k.kind == KeyEventKind::Press
+    {
+        handle_modal_key(k.code, k.modifiers, app, client).await;
+        return;
+    }
+
     match ev {
-        Event::Key(k) if k.kind == KeyEventKind::Press => match (k.code, k.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL)
-            | (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
-            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                app.show_thinking = !app.show_thinking;
-            }
-            (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-                if let Some(id) = last_tool_id(&app.transcript) {
-                    app.transcript.toggle_tool_expanded(&id);
-                }
-            }
-            (KeyCode::Esc, _) => {
-                if app.is_streaming {
-                    if let Some(c) = client {
-                        let _ = c.fire(RpcCommand::Abort).await;
-                        app.transcript.push(Entry::Warn("aborted".into()));
-                    }
-                } else if !app.input.is_empty() {
-                    app.input.clear();
-                } else {
-                    app.quit = true;
-                }
-            }
-            (KeyCode::Enter, _) => submit(app, client).await,
-            (KeyCode::Backspace, _) => {
-                app.input.pop();
-            }
-            (KeyCode::Char(ch), m)
-                if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
-            {
-                app.input.push(ch);
-            }
-            (KeyCode::PageUp, _) => {
-                let cur = app.scroll.unwrap_or(u16::MAX);
-                app.scroll = Some(cur.saturating_sub(5));
-            }
-            (KeyCode::PageDown, _) => {
-                let cur = app.scroll.unwrap_or(0);
-                app.scroll = Some(cur.saturating_add(5));
-            }
-            (KeyCode::End, _) => app.scroll = None,
-            _ => {}
-        },
+        Event::Key(k) if k.kind == KeyEventKind::Press => {
+            handle_key(k.code, k.modifiers, app, client).await;
+        }
         Event::Paste(text) => {
             for ch in text.chars() {
                 if ch == '\n' || ch == '\r' {
@@ -350,6 +515,294 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
         }
         _ => {}
     }
+}
+
+async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Option<&RpcClient>) {
+    match (code, mods) {
+        (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
+        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+            app.show_thinking = !app.show_thinking;
+        }
+        (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+            if let Some(id) = last_tool_id(&app.transcript) {
+                app.transcript.toggle_tool_expanded(&id);
+            }
+        }
+        (KeyCode::Char(' '), KeyModifiers::CONTROL) => {
+            if app.is_streaming {
+                app.composer_mode = app.composer_mode.cycle_stream();
+                app.flash(format!("composer: {:?}", app.composer_mode));
+            }
+        }
+        (KeyCode::F(1), _) => {
+            app.modal = Some(Modal::Commands(ListModal::new(
+                "commands",
+                "↑↓ pick · Enter insert · Esc close",
+                app.session.commands.clone(),
+            )));
+        }
+        (KeyCode::F(5), _) => {
+            app.modal = Some(Modal::Models(ListModal::new(
+                "model",
+                "↑↓ pick · Enter set · Esc close",
+                app.session.available_models.clone(),
+            )));
+        }
+        (KeyCode::F(6), _) => {
+            let cur = app.session.thinking.unwrap_or(ThinkingLevel::Medium);
+            let opts = [
+                (ThinkingLevel::Off, "off"),
+                (ThinkingLevel::Minimal, "minimal"),
+                (ThinkingLevel::Low, "low"),
+                (ThinkingLevel::Medium, "medium"),
+                (ThinkingLevel::High, "high"),
+                (ThinkingLevel::Xhigh, "xhigh"),
+            ];
+            let selected = opts.iter().position(|(l, _)| *l == cur).unwrap_or(3);
+            app.modal = Some(Modal::Thinking(RadioModal::new(
+                "thinking level",
+                opts.to_vec(),
+                selected,
+            )));
+        }
+        (KeyCode::F(7), _) => {
+            if let Some(stats) = &app.session.stats {
+                app.modal = Some(Modal::Stats(Box::new(stats.clone())));
+            } else {
+                app.flash("no stats yet");
+            }
+        }
+        (KeyCode::F(8), _) => {
+            if let Some(c) = client {
+                app.flash("compacting…");
+                let _ = c
+                    .fire(RpcCommand::Compact {
+                        custom_instructions: None,
+                    })
+                    .await;
+            }
+        }
+        (KeyCode::F(9), _) => {
+            let next = !app.session.auto_compaction.unwrap_or(true);
+            app.session.auto_compaction = Some(next);
+            if let Some(c) = client {
+                let _ = c
+                    .fire(RpcCommand::SetAutoCompaction { enabled: next })
+                    .await;
+            }
+            app.flash(format!("auto-compact {}", on_off(next)));
+        }
+        (KeyCode::F(10), _) => {
+            let next = !app.session.auto_retry.unwrap_or(true);
+            app.session.auto_retry = Some(next);
+            if let Some(c) = client {
+                let _ = c.fire(RpcCommand::SetAutoRetry { enabled: next }).await;
+            }
+            app.flash(format!("auto-retry {}", on_off(next)));
+        }
+        (KeyCode::Char('?'), _) => {
+            app.modal = Some(Modal::Help);
+        }
+        (KeyCode::Char('/'), KeyModifiers::NONE) if app.input.is_empty() => {
+            // Open commands modal as a slash autocomplete source.
+            app.modal = Some(Modal::Commands(ListModal::new(
+                "/ commands",
+                "type to filter · Enter insert · Esc close",
+                app.session.commands.clone(),
+            )));
+        }
+        (KeyCode::Esc, _) => {
+            if app.is_streaming {
+                if let Some(c) = client {
+                    let _ = c.fire(RpcCommand::Abort).await;
+                    app.transcript.push(Entry::Warn("aborted".into()));
+                }
+            } else if !app.input.is_empty() {
+                app.input.clear();
+            } else {
+                app.quit = true;
+            }
+        }
+        (KeyCode::Enter, _) => submit(app, client).await,
+        (KeyCode::Backspace, _) => {
+            app.input.pop();
+        }
+        (KeyCode::Char(ch), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            app.input.push(ch);
+        }
+        (KeyCode::PageUp, _) => {
+            let cur = app.scroll.unwrap_or(u16::MAX);
+            app.scroll = Some(cur.saturating_sub(5));
+        }
+        (KeyCode::PageDown, _) => {
+            let cur = app.scroll.unwrap_or(0);
+            app.scroll = Some(cur.saturating_add(5));
+        }
+        (KeyCode::End, _) => app.scroll = None,
+        _ => {}
+    }
+}
+
+async fn handle_modal_key(
+    code: KeyCode,
+    _mods: KeyModifiers,
+    app: &mut App,
+    client: Option<&RpcClient>,
+) {
+    let Some(modal) = app.modal.as_mut() else {
+        return;
+    };
+    match modal {
+        Modal::Stats(_) | Modal::Help => match code {
+            KeyCode::Esc | KeyCode::Enter => app.modal = None,
+            _ => {}
+        },
+        Modal::Commands(list) => {
+            let n = filtered_count_commands(&list.items, &list.query);
+            if handle_list_keys(&mut list.query, &mut list.selected, code, n) {
+                return;
+            }
+            match code {
+                KeyCode::Esc => app.modal = None,
+                KeyCode::Enter => {
+                    let Some(cmd) = filtered_commands(&list.items, &list.query)
+                        .nth(list.selected)
+                        .cloned()
+                    else {
+                        return;
+                    };
+                    app.input.clear();
+                    app.input.push('/');
+                    app.input.push_str(&cmd.name);
+                    app.input.push(' ');
+                    app.modal = None;
+                }
+                _ => {}
+            }
+        }
+        Modal::Models(list) => {
+            let n = filtered_count_models(&list.items, &list.query);
+            if handle_list_keys(&mut list.query, &mut list.selected, code, n) {
+                return;
+            }
+            match code {
+                KeyCode::Esc => app.modal = None,
+                KeyCode::Enter => {
+                    let Some(m) = filtered_models(&list.items, &list.query)
+                        .nth(list.selected)
+                        .cloned()
+                    else {
+                        return;
+                    };
+                    if let Some(c) = client {
+                        match c
+                            .call(RpcCommand::SetModel {
+                                provider: m.provider.clone(),
+                                model_id: m.id.clone(),
+                            })
+                            .await
+                        {
+                            Ok(_) => {
+                                app.session.model_label = format!("{}/{}", m.provider, m.id);
+                                app.flash(format!("model → {}/{}", m.provider, m.id));
+                            }
+                            Err(e) => app.flash(format!("set_model failed: {e}")),
+                        }
+                    }
+                    app.modal = None;
+                }
+                _ => {}
+            }
+        }
+        Modal::Thinking(radio) => match code {
+            KeyCode::Esc => app.modal = None,
+            KeyCode::Up => {
+                if radio.selected > 0 {
+                    radio.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if radio.selected + 1 < radio.options.len() {
+                    radio.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let (level, _label) = radio.options[radio.selected];
+                if let Some(c) = client {
+                    match c.call(RpcCommand::SetThinkingLevel { level }).await {
+                        Ok(_) => {
+                            app.session.thinking = Some(level);
+                            app.flash(format!("thinking → {level:?}"));
+                        }
+                        Err(e) => app.flash(format!("set_thinking_level failed: {e}")),
+                    }
+                }
+                app.modal = None;
+            }
+            _ => {}
+        },
+    }
+}
+
+/// Shared list key handler. Returns `true` if the key was consumed here.
+fn handle_list_keys(
+    query: &mut String,
+    selected: &mut usize,
+    code: KeyCode,
+    visible_count: usize,
+) -> bool {
+    match code {
+        KeyCode::Up => {
+            if *selected > 0 {
+                *selected -= 1;
+            }
+            true
+        }
+        KeyCode::Down => {
+            if visible_count > 0 && *selected + 1 < visible_count {
+                *selected += 1;
+            }
+            true
+        }
+        KeyCode::Char(ch) => {
+            query.push(ch);
+            *selected = 0;
+            true
+        }
+        KeyCode::Backspace => {
+            query.pop();
+            *selected = 0;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn filtered_commands<'a>(
+    items: &'a [CommandInfo],
+    q: &'a str,
+) -> impl Iterator<Item = &'a CommandInfo> + 'a {
+    items.iter().filter(move |c| matches_query(&c.name, q))
+}
+
+fn filtered_count_commands(items: &[CommandInfo], q: &str) -> usize {
+    filtered_commands(items, q).count()
+}
+
+fn filtered_models<'a>(items: &'a [Model], q: &'a str) -> impl Iterator<Item = &'a Model> + 'a {
+    items
+        .iter()
+        .filter(move |m| matches_query(&m.id, q) || matches_query(&m.provider, q))
+}
+
+fn filtered_count_models(items: &[Model], q: &str) -> usize {
+    filtered_models(items, q).count()
+}
+
+fn on_off(b: bool) -> &'static str {
+    if b { "on" } else { "off" }
 }
 
 fn last_tool_id(transcript: &Transcript) -> Option<String> {
@@ -369,7 +822,6 @@ async fn submit(app: &mut App, client: Option<&RpcClient>) {
     };
     app.input.clear();
 
-    // Bash prefix `!cmd` — invoke pi's bash RPC directly.
     if let Some(cmd) = text.strip_prefix('!') {
         let cmd = cmd.trim();
         if cmd.is_empty() {
@@ -401,22 +853,28 @@ async fn submit(app: &mut App, client: Option<&RpcClient>) {
     }
 
     app.transcript.push(Entry::User(text.clone()));
-    let cmd = RpcCommand::Prompt {
-        message: text,
-        images: vec![],
-        streaming_behavior: if app.is_streaming {
-            Some(StreamingBehavior::Steer)
-        } else {
-            None
+    let rpc = match (app.is_streaming, app.composer_mode) {
+        (false, _) => RpcCommand::Prompt {
+            message: text,
+            images: vec![],
+            streaming_behavior: None,
+        },
+        (true, ComposerMode::Steer | ComposerMode::Prompt) => RpcCommand::Steer {
+            message: text,
+            images: vec![],
+        },
+        (true, ComposerMode::FollowUp) => RpcCommand::FollowUp {
+            message: text,
+            images: vec![],
         },
     };
-    if let Err(e) = client.fire(cmd).await {
+    if let Err(e) = client.fire(rpc).await {
         let msg = match e {
             RpcError::Remote { message, .. } => message,
             other => other.to_string(),
         };
         app.transcript
-            .push(Entry::Error(format!("prompt failed: {msg}")));
+            .push(Entry::Error(format!("submit failed: {msg}")));
     }
 }
 
@@ -454,7 +912,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(3),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(area);
 
@@ -462,6 +920,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     draw_body(f, body, app);
     draw_editor(f, editor_area, app);
     draw_footer(f, footer, app);
+
+    if let Some(modal) = &app.modal {
+        draw_modal(f, area, modal, app);
+    }
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -485,6 +947,18 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
     } else {
         Span::styled("  think ○", Style::default().add_modifier(Modifier::DIM))
     };
+    let queue = format!(
+        "  steer:{} · follow-up:{}",
+        app.session.queue_steering.len(),
+        app.session.queue_follow_up.len(),
+    );
+    let session_name = app
+        .session
+        .session_name
+        .as_deref()
+        .map(|n| format!("  [{n}]"))
+        .unwrap_or_default();
+
     let line = Line::from(vec![
         Span::styled(
             " rata-pi ",
@@ -492,10 +966,15 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
         ),
         Span::raw("  "),
         spinner,
-        Span::styled(&app.model_label, Style::default().fg(Color::Magenta)),
+        Span::styled(
+            &app.session.model_label,
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::styled(session_name, Style::default().add_modifier(Modifier::DIM)),
         Span::raw("  ·  "),
         status,
         thinking_badge,
+        Span::styled(queue, Style::default().add_modifier(Modifier::DIM)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -558,7 +1037,6 @@ fn entries_to_lines(entries: &[Entry], show_thinking: bool) -> Vec<Line<'static>
                 );
                 let rendered = markdown::render(md);
                 if rendered.is_empty() {
-                    // still streaming: just prefix
                     lines.push(Line::from(vec![label]));
                 } else {
                     for (i, mut l) in rendered.into_iter().enumerate() {
@@ -627,7 +1105,6 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, tc: &ToolCall) {
             }
         }
     } else if !tc.output.trim().is_empty() {
-        // One-line preview.
         let first = tc
             .output
             .lines()
@@ -646,7 +1123,6 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, tc: &ToolCall) {
 }
 
 fn args_preview(args: &serde_json::Value) -> String {
-    // Prefer a single-line JSON preview of top-level keys.
     if let Some(obj) = args.as_object() {
         let mut parts: Vec<String> = obj
             .iter()
@@ -839,32 +1315,34 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
 fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let is_bash = app.input.trim_start().starts_with('!');
-    let border_color = if is_bash {
-        Color::Yellow
+    let (color, title) = if is_bash {
+        (Color::Yellow, " bash (! prefix · Enter run) ".to_string())
     } else if app.is_streaming {
-        Color::Cyan
+        let label = match app.composer_mode {
+            ComposerMode::Steer | ComposerMode::Prompt => "steer",
+            ComposerMode::FollowUp => "follow-up",
+        };
+        (
+            Color::Cyan,
+            format!(" {label} (Ctrl+Space cycle · Esc abort) "),
+        )
     } else {
-        Color::DarkGray
-    };
-    let title = if is_bash {
-        " bash (! prefix · Enter run) "
-    } else if app.is_streaming {
-        " steer (Esc abort) "
-    } else {
-        " prompt (Enter submit · Esc clear) "
+        (
+            Color::DarkGray,
+            " prompt (Enter submit · / commands · Esc clear) ".to_string(),
+        )
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(color));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut spans = vec![Span::raw(app.input.as_str())];
-    spans.push(Span::styled(
-        " ",
-        Style::default().add_modifier(Modifier::REVERSED),
-    ));
+    let spans = vec![
+        Span::raw(app.input.as_str()),
+        Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
+    ];
     f.render_widget(
         Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
         inner,
@@ -872,43 +1350,391 @@ fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
-    let hints = if app.is_streaming {
+    let [bar, hints] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+
+    // Context gauge row.
+    let (pct, label) = if let Some(ctx) = app
+        .session
+        .stats
+        .as_ref()
+        .and_then(|s| s.context_usage.as_ref())
+    {
+        let pct = ctx.percent.unwrap_or(0.0).clamp(0.0, 100.0);
+        let tokens = ctx.tokens.unwrap_or(0);
+        (
+            pct / 100.0,
+            format!(
+                "{:>3.0}% · {}k / {}k tok · ${:.2}",
+                pct,
+                tokens / 1000,
+                ctx.context_window / 1000,
+                app.session.stats.as_ref().map(|s| s.cost).unwrap_or(0.0),
+            ),
+        )
+    } else {
+        (0.0, "context: —".to_string())
+    };
+    let gauge_color = if pct > 0.85 {
+        Color::Red
+    } else if pct > 0.65 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(gauge_color).bg(Color::Reset))
+        .ratio(pct)
+        .label(label);
+    f.render_widget(gauge, bar);
+
+    // Hints + flash message row.
+    let mut spans = if app.is_streaming {
         vec![
             kb("Esc"),
-            Span::raw(" abort  "),
+            Span::raw(" abort · "),
+            kb("Ctrl+Space"),
+            Span::raw(" cycle · "),
+            kb("F7"),
+            Span::raw(" stats · "),
             kb("Ctrl+T"),
-            Span::raw(" thinking  "),
-            kb("Ctrl+E"),
-            Span::raw(" expand tool  "),
+            Span::raw(" thinking · "),
             kb("PgUp/PgDn"),
-            Span::raw(" scroll  "),
-            kb("End"),
-            Span::raw(" follow  "),
+            Span::raw(" scroll · "),
             kb("Ctrl+C"),
             Span::raw(" quit"),
         ]
     } else {
         vec![
             kb("Enter"),
-            Span::raw(" send  "),
-            kb("!cmd"),
-            Span::raw(" bash  "),
-            kb("Ctrl+T"),
-            Span::raw(" thinking  "),
-            kb("Ctrl+E"),
-            Span::raw(" expand tool  "),
-            kb("PgUp/PgDn"),
-            Span::raw(" scroll  "),
+            Span::raw(" send · "),
+            kb("/"),
+            Span::raw(" cmds · "),
+            kb("F5"),
+            Span::raw(" model · "),
+            kb("F6"),
+            Span::raw(" think · "),
+            kb("F7"),
+            Span::raw(" stats · "),
+            kb("F8"),
+            Span::raw(" compact · "),
+            kb("?"),
+            Span::raw(" help · "),
             kb("Ctrl+C"),
             Span::raw(" quit"),
         ]
     };
+    if let Some((msg, _)) = &app.flash {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!("• {msg}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     f.render_widget(
-        Paragraph::new(Line::from(hints)).style(Style::default().add_modifier(Modifier::DIM)),
-        area,
+        Paragraph::new(Line::from(spans)).style(Style::default().add_modifier(Modifier::DIM)),
+        hints,
     );
 }
 
 fn kb(s: &str) -> Span<'static> {
     Span::styled(s.to_string(), Style::default().fg(Color::Cyan))
+}
+
+// ───────────────────────────────────────────────────────── modals ──
+
+fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, _app: &App) {
+    let (title, body, hint, max_w, max_h) = match modal {
+        Modal::Help => (
+            " help ".to_string(),
+            help_text(),
+            "Esc close".to_string(),
+            70,
+            22,
+        ),
+        Modal::Stats(s) => (
+            " stats ".to_string(),
+            stats_text(s),
+            "Esc close".to_string(),
+            70,
+            18,
+        ),
+        Modal::Commands(list) => (
+            format!(" {} ", list.title),
+            commands_text(list),
+            list.hint.clone(),
+            80,
+            22,
+        ),
+        Modal::Models(list) => (
+            format!(" {} ", list.title),
+            models_text(list),
+            list.hint.clone(),
+            80,
+            22,
+        ),
+        Modal::Thinking(radio) => (
+            format!(" {} ", radio.title),
+            thinking_text(radio),
+            "↑↓ · Enter set · Esc close".to_string(),
+            50,
+            12,
+        ),
+    };
+
+    let rect = centered(area, max_w, max_h);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom(Line::from(Span::styled(
+            format!(" {hint} "),
+            Style::default().add_modifier(Modifier::DIM),
+        )))
+        .border_style(Style::default().fg(Color::Magenta));
+
+    f.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+}
+
+fn help_text() -> Text<'static> {
+    Text::from(vec![
+        Line::from(vec![
+            kb("Enter"),
+            Span::raw(" submit   "),
+            kb("Shift+Enter"),
+            Span::raw(" newline (M5)"),
+        ]),
+        Line::from(vec![
+            kb("!cmd"),
+            Span::raw(" run bash RPC · "),
+            kb("/"),
+            Span::raw(" commands"),
+        ]),
+        Line::from(vec![
+            kb("Esc"),
+            Span::raw(" abort/clear/quit · "),
+            kb("Ctrl+C"),
+            Span::raw(" quit"),
+        ]),
+        Line::default(),
+        Line::from(vec![kb("Ctrl+T"), Span::raw(" toggle thinking blocks")]),
+        Line::from(vec![
+            kb("Ctrl+E"),
+            Span::raw(" expand/collapse last tool card"),
+        ]),
+        Line::from(vec![
+            kb("Ctrl+Space"),
+            Span::raw(" cycle composer mode (steer / follow-up)"),
+        ]),
+        Line::default(),
+        Line::from(vec![
+            kb("F1"),
+            Span::raw(" commands   "),
+            kb("F5"),
+            Span::raw(" model   "),
+            kb("F6"),
+            Span::raw(" thinking"),
+        ]),
+        Line::from(vec![
+            kb("F7"),
+            Span::raw(" stats   "),
+            kb("F8"),
+            Span::raw(" compact now   "),
+            kb("F9"),
+            Span::raw(" auto-compact"),
+        ]),
+        Line::from(vec![
+            kb("F10"),
+            Span::raw(" auto-retry   "),
+            kb("?"),
+            Span::raw(" this help"),
+        ]),
+        Line::default(),
+        Line::from(vec![
+            kb("PgUp/PgDn"),
+            Span::raw(" scroll · "),
+            kb("End"),
+            Span::raw(" auto-follow"),
+        ]),
+    ])
+}
+
+fn stats_text(s: &SessionStats) -> Text<'static> {
+    let mut lines = vec![
+        label_value("session", s.session_name_opt()),
+        label_value(
+            "messages",
+            format!(
+                "{} user · {} assistant · {} tools",
+                s.user_messages, s.assistant_messages, s.tool_calls
+            ),
+        ),
+        label_value(
+            "tokens",
+            format!(
+                "in {} · out {} · cache R {} · cache W {} · total {}",
+                s.tokens.input,
+                s.tokens.output,
+                s.tokens.cache_read,
+                s.tokens.cache_write,
+                s.tokens.total
+            ),
+        ),
+        label_value("cost", format!("${:.4}", s.cost)),
+    ];
+    if let Some(ctx) = &s.context_usage {
+        lines.push(label_value(
+            "context",
+            format!(
+                "{} / {} tokens ({}%)",
+                ctx.tokens.unwrap_or(0),
+                ctx.context_window,
+                ctx.percent.map(|p| format!("{p:.0}")).unwrap_or_default()
+            ),
+        ));
+    }
+    if let Some(file) = &s.session_file {
+        lines.push(label_value("file", file.clone()));
+    }
+    if let Some(id) = &s.session_id {
+        lines.push(label_value("id", id.clone()));
+    }
+    Text::from(lines)
+}
+
+trait SessionStatsExt {
+    fn session_name_opt(&self) -> String;
+}
+impl SessionStatsExt for SessionStats {
+    fn session_name_opt(&self) -> String {
+        self.session_id.clone().unwrap_or_else(|| "—".into())
+    }
+}
+
+fn label_value(k: &str, v: impl Into<String>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{:>12}  ", k),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::raw(v.into()),
+    ])
+}
+
+fn commands_text(list: &ListModal<CommandInfo>) -> Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("filter: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(
+            list.query.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::default());
+    let filtered: Vec<&CommandInfo> = filtered_commands(&list.items, &list.query).collect();
+    for (i, c) in filtered.iter().enumerate() {
+        let marker = if i == list.selected { "▸" } else { " " };
+        let badge = match c.source {
+            crate::rpc::types::CommandSource::Extension => "ext",
+            crate::rpc::types::CommandSource::Prompt => "prompt",
+            crate::rpc::types::CommandSource::Skill => "skill",
+        };
+        let style = if i == list.selected {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let desc = c.description.as_deref().unwrap_or("");
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} /{} ", c.name), style),
+            Span::styled(format!("[{badge}] "), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                desc.to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no matches)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+    Text::from(lines)
+}
+
+fn models_text(list: &ListModal<Model>) -> Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("filter: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(
+            list.query.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::default());
+    let filtered: Vec<&Model> = filtered_models(&list.items, &list.query).collect();
+    for (i, m) in filtered.iter().enumerate() {
+        let marker = if i == list.selected { "▸" } else { " " };
+        let style = if i == list.selected {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let cw = m
+            .context_window
+            .map(|c| format!(" · {}k ctx", c / 1000))
+            .unwrap_or_default();
+        let reasoning = if m.reasoning { " · reasoning" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), style),
+            Span::styled(format!("{}/{}", m.provider, m.id), style.fg(Color::Magenta)),
+            Span::styled(
+                format!("{cw}{reasoning}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no matches)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+    Text::from(lines)
+}
+
+fn thinking_text(radio: &RadioModal<ThinkingLevel>) -> Text<'static> {
+    let lines: Vec<Line<'static>> = radio
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, (_, label))| {
+            let (marker, style) = if i == radio.selected {
+                (
+                    "◉",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("○", Style::default().add_modifier(Modifier::DIM))
+            };
+            Line::from(vec![
+                Span::styled(format!("{marker} "), style),
+                Span::styled((*label).to_string(), style),
+            ])
+        })
+        .collect();
+    Text::from(lines)
 }

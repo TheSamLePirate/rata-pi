@@ -74,16 +74,31 @@ Goal: async runtime, process spawn, JSONL plumbing, panic-safe terminal restore,
 
 ---
 
-## M3 — Session & state (Phase 3)
+## M3 — Session & state (Phase 3) ✅ (core) · session-switcher/fork-picker deferred
 
-- [ ] Bootstrap `get_state` + `get_messages` on start, restore transcript
-- [ ] Session switcher (F3), fork picker (F4)
-- [ ] Session name setter, `export_html`, `new_session`
-- [ ] Stats panel + animated context gauge
-- [ ] Commands panel (`/` autocomplete) from `get_commands`
-- [ ] Queue panel; `steer` / `follow_up` composition with live mode indicator
+- [x] Bootstrap — on connect, call `get_state` + `get_messages` + `get_commands` + `get_available_models` + `get_session_stats`. Transcript is rebuilt by translating `AgentMessage` variants into our `Entry` types (ANSI-strip on bash output).
+- [ ] Session switcher (F3) — **deferred**. Needs filesystem walking of pi's session dir for the picker preview. Track-only defer to M6 with fork-picker.
+- [ ] Fork picker (F4) — **deferred**. Same bucket as session switcher (needs preview-of-message UX).
+- [ ] Session name setter / `export_html` / `new_session` — **deferred to M6** (require a generic text-input modal + confirm modal). `set_auto_compaction` / `set_auto_retry` are reachable now via F9/F10 instead.
+- [x] Stats modal (F7) with periodic `get_session_stats` polling every 5 s — populates the modal and a context gauge in the footer that turns amber > 65 %, red > 85 %.
+- [x] Commands browser (F1) — filterable list sourced from `get_commands`; Enter inserts `/name ` in the composer. Typing `/` in an empty composer opens the same modal as a slash-autocomplete.
+- [x] Model picker (F5) — filterable list from `get_available_models`; Enter calls `set_model`.
+- [x] Thinking-level picker (F6) — radio list; Enter calls `set_thinking_level`.
+- [x] Help modal (?) — keybinding cheat sheet.
+- [x] Queue state — `queue_update` event populates header chip `steer:N · follow-up:N`.
+- [x] Composer mode cycle (`Ctrl+Space`) — toggles between **steer** and **follow-up** intent during streaming; routes submit to `RpcCommand::Steer` or `::FollowUp` appropriately. Editor border/title reflect the mode.
+- [x] F8 compact now (fire-and-forget); F9 toggle auto-compaction; F10 toggle auto-retry. All surface a transient "flash" message in the footer for ~1.5 s.
 
-**Deviations / notes:** _(to fill in)_
+**New module:** `ui/modal.rs` — `Modal` enum + `ListModal<T>` + `RadioModal<T>` + `centered(area, max_w, max_h)` helper + case-insensitive `matches_query`.
+
+**Deviations / notes:**
+- The deferred items (session switcher, fork picker, text-input/confirm modals) are pushed to M6. Rationale: they need a generic overlay-input pattern that's a better fit once mouse drag-select and text-input refactors land in M5.
+- Modal input routing is intentionally simple (priority-over-app when open). Tab-cycle between multi-field modals isn't needed yet since all current modals have a single focus target.
+- Commands modal: the badge shown per row is `ext` / `prompt` / `skill`. On Enter we currently just prefill the composer with `/name `; if the command takes an argument, the user completes it themselves. Skill commands (`skill:brave-search`) insert with their full name preserved.
+- Context gauge label intentionally truncates tokens to thousands (`60k / 200k tok`) for readability.
+- Editor title shows `steer` vs `follow-up` depending on composer mode when streaming; idle editor title shows `prompt (Enter submit · / commands · Esc clear)`.
+- Cleanup target for M6: replace `serde_json::from_value<AgentMessage>` with direct array deserialization (serde already does the right thing) — current per-element loop is defensive against malformed entries.
+- CI: 41 tests, clippy -D warnings clean, fmt clean. (No new tests added for modals — they're plumbing; golden snapshot tests land with `insta` in M5.)
 
 ---
 
