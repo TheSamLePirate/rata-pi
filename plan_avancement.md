@@ -102,15 +102,29 @@ Goal: async runtime, process spawn, JSONL plumbing, panic-safe terminal restore,
 
 ---
 
-## M4 — Extension UI protocol (Phase 4)
+## M4 — Extension UI protocol (Phase 4) ✅ (core) · timeout countdown deferred
 
-- [ ] `extension_ui_request` router → dialog components
-- [ ] `select` / `confirm` / `input` / `editor` with timeout countdown
-- [ ] `notify` → toast stack
-- [ ] `setStatus` / `setWidget` / `setTitle` / `set_editor_text`
-- [ ] Correctly send `extension_ui_response` with matching `id`
+- [x] `extension_ui_request` router (`handle_incoming` → `handle_ext_request`)
+- [x] `select` → `Modal::ExtSelect` with arrow-key nav + Enter value / Esc cancelled
+- [x] `confirm` → `Modal::ExtConfirm` with Y/N shortcuts, ←→/Tab toggle, Enter submit, Esc cancelled. Safer default is No (selected=0).
+- [x] `input` → `Modal::ExtInput` with placeholder, live text; Enter returns value, Esc cancelled
+- [x] `editor` → `Modal::ExtEditor` (single-line M4; multi-line in M5)
+- [ ] `timeout` countdown UI — **deferred to M5** alongside the animation pipeline. Agent-side auto-resolve still fires per spec; the client just doesn't render the countdown.
+- [x] `notify` → toast stack (bottom-right). Info 3 s, Warning 6 s, Error 12 s. Capped at 6 entries. Styled with `ℹ` / `⚠` / `✗` chips in matching colors.
+- [x] `setStatus` → keyed `statuses: HashMap<key, text>` rendered in the footer hints row; empty / absent text clears the entry
+- [x] `setWidget` → keyed `widgets: HashMap<key, Widget>` with `AboveEditor` / `BelowEditor` placement. The draw layout inserts extra strips above / below the editor dynamically (capped at 8 lines each) so widgets never push the editor off-screen.
+- [x] `setTitle` → `crossterm::terminal::SetTitle` writes the OSC 0/2 terminal title; we also cache it for future restore
+- [x] `set_editor_text` → prefills the composer (non-destructive when the user hasn't typed; overwrites otherwise per spec)
+- [x] `extension_ui_response` replies preserve the request `id` as the top-level id (never wrapped in an outer `Envelope`), matching the spec quirk locked in by M1's serialization tests
 
-**Deviations / notes:** _(to fill in)_
+**New module:** `ui/ext_ui.rs` — `NotifyKind` / `WidgetPlacement` / `Toast` / `Widget` / `ExtReq` / `ExtUiState`. Eight unit tests covering parse of select/confirm/notify/setWidget (both placements and clear-on-empty), the unknown-method fallthrough, toast TTL expiry, and status clear-on-None.
+
+**Deviations / notes:**
+- Timeout countdown deferred. If pi sends `timeout: 10000`, we don't yet render a "9 …" decrementing ring; the agent-side auto-resolves on expiry and our dialog just closes when the next request displaces it (or the user dismisses). Low-risk, high-polish feature — batched with animations in M5.
+- Dialog displacement: if the user has a user-opened modal (commands/models/thinking/stats/help) and an extension dialog arrives, the extension wins. Rationale: extensions are typically acting on behalf of a tool-call that's blocking pi; user-opened modals can be reopened.
+- `setWidget` layout math: each placement group sums its total lines (min 0, capped 8). If above+below = 12, editor still has its 3 rows since body is `Min(3)` and flex takes from the transcript.
+- Unknown methods are logged-and-skipped; we don't have the request id after parse, so we can't send a cancel response — the agent-side auto-resolves per spec. Acceptable: the TS example client in pi's own examples does the same thing for unrecognized methods.
+- 49/49 tests (M3 41 + 8 ext_ui). clippy -D warnings clean. fmt clean.
 
 ---
 

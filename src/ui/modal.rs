@@ -16,6 +16,34 @@ pub enum Modal {
     Models(ListModal<Model>),
     Thinking(RadioModal<ThinkingLevel>),
     Help,
+    /// Extension UI dialog: select from a list of strings.
+    ExtSelect {
+        request_id: String,
+        title: String,
+        options: Vec<String>,
+        selected: usize,
+    },
+    /// Extension UI dialog: yes/no confirmation.
+    ExtConfirm {
+        request_id: String,
+        title: String,
+        message: Option<String>,
+        selected: usize, // 0 = No, 1 = Yes (safer default)
+    },
+    /// Extension UI dialog: free-form single-line input.
+    ExtInput {
+        request_id: String,
+        title: String,
+        placeholder: Option<String>,
+        value: String,
+    },
+    /// Extension UI dialog: editor. Treated as single-line until the
+    /// multi-line composer lands in M5.
+    ExtEditor {
+        request_id: String,
+        title: String,
+        value: String,
+    },
 }
 
 /// A scrollable, filterable list of items.

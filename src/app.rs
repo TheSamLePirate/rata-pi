@@ -34,12 +34,13 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 
 use crate::cli::Args;
 use crate::rpc::client::{self, RpcClient, RpcError};
-use crate::rpc::commands::RpcCommand;
+use crate::rpc::commands::{ExtensionUiResponse, RpcCommand};
 use crate::rpc::events::{AssistantEvent, Incoming};
 use crate::rpc::types::{
     AgentMessage, AssistantBlock, CommandInfo, ContentBlock, FollowUpMode, Model, SessionStats,
     State, SteeringMode, ThinkingLevel, ToolResultPayload, UserContent,
 };
+use crate::ui::ext_ui::{ExtReq, ExtUiState, NotifyKind, WidgetPlacement, parse as parse_ext};
 use crate::ui::markdown;
 use crate::ui::modal::{ListModal, Modal, RadioModal, centered, matches_query};
 use crate::ui::transcript::{
@@ -133,6 +134,7 @@ struct App {
     session: SessionState,
     modal: Option<Modal>,
     flash: Option<(String, u64)>, // transient status message with a decay tick
+    ext_ui: ExtUiState,
 }
 
 impl App {
@@ -153,6 +155,7 @@ impl App {
             },
             modal: None,
             flash: None,
+            ext_ui: ExtUiState::default(),
         }
     }
 
@@ -451,6 +454,81 @@ fn dummy_events() -> tokio::sync::mpsc::Receiver<Incoming> {
     rx
 }
 
+/// Route a single RPC event. Extension UI requests are handled here so we
+/// have access to the client (to send responses for dialogs and to set the
+/// terminal title via crossterm); everything else delegates to `App::on_event`.
+async fn handle_incoming(msg: Incoming, app: &mut App, client: Option<&RpcClient>) {
+    if let Incoming::ExtensionUiRequest { id, method, rest } = &msg {
+        let req = parse_ext(method, id, rest);
+        handle_ext_request(req, app, client).await;
+        return;
+    }
+    app.on_event(msg);
+}
+
+async fn handle_ext_request(req: ExtReq, app: &mut App, client: Option<&RpcClient>) {
+    match req {
+        ExtReq::Select { id, title, options } => {
+            app.modal = Some(Modal::ExtSelect {
+                request_id: id,
+                title,
+                options,
+                selected: 0,
+            });
+        }
+        ExtReq::Confirm { id, title, message } => {
+            app.modal = Some(Modal::ExtConfirm {
+                request_id: id,
+                title,
+                message,
+                selected: 0,
+            });
+        }
+        ExtReq::Input {
+            id,
+            title,
+            placeholder,
+        } => {
+            app.modal = Some(Modal::ExtInput {
+                request_id: id,
+                title,
+                placeholder,
+                value: String::new(),
+            });
+        }
+        ExtReq::Editor { id, title, prefill } => {
+            app.modal = Some(Modal::ExtEditor {
+                request_id: id,
+                title,
+                value: prefill,
+            });
+        }
+        ExtReq::Notify { message, kind } => {
+            app.ext_ui.push_toast(message, kind, app.ticks);
+        }
+        ExtReq::SetStatus { key, text } => app.ext_ui.set_status(key, text),
+        ExtReq::SetWidget { key, widget } => app.ext_ui.set_widget(key, widget),
+        ExtReq::SetTitle { title } => {
+            use crossterm::terminal::SetTitle;
+            // Best-effort — if writing to the tty fails we just log.
+            if let Err(e) = crossterm::execute!(stdout(), SetTitle(&title)) {
+                tracing::warn!(error = ?e, "SetTitle failed");
+            }
+            app.ext_ui.terminal_title = Some(title);
+        }
+        ExtReq::SetEditorText { text } => {
+            app.input = text;
+        }
+        ExtReq::Unknown(m) => {
+            // We've lost the id by the time we get here (parse only keeps it
+            // for recognized dialog methods). Log only — the dialog, if any,
+            // will time out on pi's side per the spec.
+            tracing::warn!(method = %m, "unknown extension_ui_request method");
+            let _ = client; // suppress unused-variable warning when no dialog
+        }
+    }
+}
+
 async fn ui_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -470,7 +548,7 @@ async fn ui_loop(
         }
 
         tokio::select! {
-            Some(msg) = events.recv() => app.on_event(msg),
+            Some(msg) = events.recv() => handle_incoming(msg, app, client).await,
             Some(Ok(ev)) = crossterm_events.next() => handle_crossterm(ev, app, client).await,
             _ = tick.tick() => {
                 app.ticks = app.ticks.wrapping_add(1);
@@ -479,6 +557,7 @@ async fn ui_loop(
                     && app.ticks.wrapping_sub(at) > 15 {
                     app.flash = None;
                 }
+                app.ext_ui.expire_toasts(app.ticks);
             }
             _ = stats_tick.tick() => {
                 if let Some(c) = client { refresh_stats(c, app).await; }
@@ -743,6 +822,123 @@ async fn handle_modal_key(
             }
             _ => {}
         },
+        Modal::ExtSelect {
+            request_id,
+            options,
+            selected,
+            ..
+        } => match code {
+            KeyCode::Up => {
+                if *selected > 0 {
+                    *selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if !options.is_empty() && *selected + 1 < options.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let value = options.get(*selected).cloned();
+                let req_id = request_id.clone();
+                app.modal = None;
+                if let (Some(c), Some(v)) = (client, value) {
+                    let _ = c
+                        .send_ext_ui_response(ExtensionUiResponse::value(req_id, v))
+                        .await;
+                }
+            }
+            KeyCode::Esc => {
+                let req_id = request_id.clone();
+                app.modal = None;
+                if let Some(c) = client {
+                    let _ = c
+                        .send_ext_ui_response(ExtensionUiResponse::cancelled(req_id))
+                        .await;
+                }
+            }
+            _ => {}
+        },
+        Modal::ExtConfirm {
+            request_id,
+            selected,
+            ..
+        } => match code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                *selected = 1 - *selected;
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let req_id = request_id.clone();
+                app.modal = None;
+                if let Some(c) = client {
+                    let _ = c
+                        .send_ext_ui_response(ExtensionUiResponse::confirmed(req_id, true))
+                        .await;
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                let req_id = request_id.clone();
+                app.modal = None;
+                if let Some(c) = client {
+                    let _ = c
+                        .send_ext_ui_response(ExtensionUiResponse::confirmed(req_id, false))
+                        .await;
+                }
+            }
+            KeyCode::Enter => {
+                let confirmed = *selected == 1;
+                let req_id = request_id.clone();
+                app.modal = None;
+                if let Some(c) = client {
+                    let _ = c
+                        .send_ext_ui_response(ExtensionUiResponse::confirmed(req_id, confirmed))
+                        .await;
+                }
+            }
+            KeyCode::Esc => {
+                let req_id = request_id.clone();
+                app.modal = None;
+                if let Some(c) = client {
+                    let _ = c
+                        .send_ext_ui_response(ExtensionUiResponse::cancelled(req_id))
+                        .await;
+                }
+            }
+            _ => {}
+        },
+        Modal::ExtInput {
+            request_id, value, ..
+        }
+        | Modal::ExtEditor {
+            request_id, value, ..
+        } => match code {
+            KeyCode::Char(ch) => {
+                value.push(ch);
+            }
+            KeyCode::Backspace => {
+                value.pop();
+            }
+            KeyCode::Enter => {
+                let req_id = request_id.clone();
+                let v = std::mem::take(value);
+                app.modal = None;
+                if let Some(c) = client {
+                    let _ = c
+                        .send_ext_ui_response(ExtensionUiResponse::value(req_id, v))
+                        .await;
+                }
+            }
+            KeyCode::Esc => {
+                let req_id = request_id.clone();
+                app.modal = None;
+                if let Some(c) = client {
+                    let _ = c
+                        .send_ext_ui_response(ExtensionUiResponse::cancelled(req_id))
+                        .await;
+                }
+            }
+            _ => {}
+        },
     }
 }
 
@@ -908,22 +1104,145 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
     let area = f.area();
-    let [header, body, editor_area, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(3),
-        Constraint::Length(2),
-    ])
-    .areas(area);
+
+    // Ext-ui widgets above/below the editor get their own strips.
+    let above_widgets = app.ext_ui.widgets_at(WidgetPlacement::AboveEditor);
+    let below_widgets = app.ext_ui.widgets_at(WidgetPlacement::BelowEditor);
+    let above_h: u16 = above_widgets
+        .iter()
+        .map(|w| w.lines.len() as u16)
+        .sum::<u16>()
+        .min(8);
+    let below_h: u16 = below_widgets
+        .iter()
+        .map(|w| w.lines.len() as u16)
+        .sum::<u16>()
+        .min(8);
+
+    let constraints: Vec<Constraint> = {
+        let mut c = vec![
+            Constraint::Length(1), // header
+            Constraint::Min(3),    // body
+        ];
+        if above_h > 0 {
+            c.push(Constraint::Length(above_h));
+        }
+        c.push(Constraint::Length(3)); // editor
+        if below_h > 0 {
+            c.push(Constraint::Length(below_h));
+        }
+        c.push(Constraint::Length(2)); // footer
+        c
+    };
+    let rects = Layout::vertical(constraints).split(area);
+    let mut idx = 0;
+    let header = rects[idx];
+    idx += 1;
+    let body = rects[idx];
+    idx += 1;
+    let above_rect = if above_h > 0 {
+        let r = rects[idx];
+        idx += 1;
+        Some(r)
+    } else {
+        None
+    };
+    let editor_area = rects[idx];
+    idx += 1;
+    let below_rect = if below_h > 0 {
+        let r = rects[idx];
+        idx += 1;
+        Some(r)
+    } else {
+        None
+    };
+    let footer = rects[idx];
 
     draw_header(f, header, app);
     draw_body(f, body, app);
+    if let Some(r) = above_rect {
+        draw_widgets(f, r, &above_widgets);
+    }
     draw_editor(f, editor_area, app);
+    if let Some(r) = below_rect {
+        draw_widgets(f, r, &below_widgets);
+    }
     draw_footer(f, footer, app);
+
+    draw_toasts(f, area, &app.ext_ui.toasts);
 
     if let Some(modal) = &app.modal {
         draw_modal(f, area, modal, app);
     }
+}
+
+fn draw_widgets(f: &mut ratatui::Frame, area: Rect, widgets: &[&crate::ui::ext_ui::Widget]) {
+    use crate::ui::ext_ui::Widget as ExtWidget;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, w) in widgets.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::default());
+        }
+        let w: &ExtWidget = w;
+        for ln in &w.lines {
+            lines.push(Line::from(Span::raw(ln.clone())));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_toasts(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    toasts: &std::collections::VecDeque<crate::ui::ext_ui::Toast>,
+) {
+    if toasts.is_empty() {
+        return;
+    }
+    // Stack in the bottom-right corner.
+    let max_w = area.width.saturating_mul(5) / 10;
+    let width = max_w.min(area.width);
+    let n = toasts.len() as u16;
+    let height = n.min(area.height);
+    if width < 10 || height == 0 {
+        return;
+    }
+    let x = area.x + area.width.saturating_sub(width);
+    let y = area.y + area.height.saturating_sub(height + 3); // leave room for footer
+    let rect = Rect::new(x, y, width, height);
+    f.render_widget(Clear, rect);
+    let lines: Vec<Line<'static>> = toasts
+        .iter()
+        .map(|t| {
+            let color = match t.kind {
+                NotifyKind::Info => Color::Cyan,
+                NotifyKind::Warning => Color::Yellow,
+                NotifyKind::Error => Color::Red,
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        " {} ",
+                        match t.kind {
+                            NotifyKind::Info => "ℹ",
+                            NotifyKind::Warning => "⚠",
+                            NotifyKind::Error => "✗",
+                        }
+                    ),
+                    Style::default()
+                        .bg(color)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(t.text.clone(), Style::default().fg(color)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(Text::from(lines)), rect);
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -1432,6 +1751,15 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    // Extension statuses (keyed by extension) right after hints.
+    for (k, v) in &app.ext_ui.statuses {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!("[{k}] "),
+            Style::default().fg(Color::Magenta),
+        ));
+        spans.push(Span::raw(v.clone()));
+    }
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().add_modifier(Modifier::DIM)),
         hints,
@@ -1480,6 +1808,49 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, _app: &App) {
             "↑↓ · Enter set · Esc close".to_string(),
             50,
             12,
+        ),
+        Modal::ExtSelect {
+            title,
+            options,
+            selected,
+            ..
+        } => (
+            format!(" ext: {title} "),
+            ext_select_text(options, *selected),
+            "↑↓ · Enter pick · Esc cancel".to_string(),
+            70,
+            20,
+        ),
+        Modal::ExtConfirm {
+            title,
+            message,
+            selected,
+            ..
+        } => (
+            format!(" ext: {title} "),
+            ext_confirm_text(message.as_deref(), *selected),
+            "Y/N · ←→ · Enter · Esc".to_string(),
+            60,
+            10,
+        ),
+        Modal::ExtInput {
+            title,
+            placeholder,
+            value,
+            ..
+        } => (
+            format!(" ext: {title} "),
+            ext_input_text(placeholder.as_deref(), value),
+            "Enter submit · Esc cancel".to_string(),
+            70,
+            8,
+        ),
+        Modal::ExtEditor { title, value, .. } => (
+            format!(" ext: {title} "),
+            ext_input_text(None, value),
+            "Enter submit · Esc cancel".to_string(),
+            80,
+            14,
         ),
     };
 
@@ -1736,5 +2107,84 @@ fn thinking_text(radio: &RadioModal<ThinkingLevel>) -> Text<'static> {
             ])
         })
         .collect();
+    Text::from(lines)
+}
+
+fn ext_select_text(options: &[String], selected: usize) -> Text<'static> {
+    let lines: Vec<Line<'static>> = options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let marker = if i == selected { "▸" } else { " " };
+            let style = if i == selected {
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(format!("{marker} "), style),
+                Span::styled(o.clone(), style),
+            ])
+        })
+        .collect();
+    Text::from(lines)
+}
+
+fn ext_confirm_text(message: Option<&str>, selected: usize) -> Text<'static> {
+    let mut lines = Vec::new();
+    if let Some(m) = message {
+        lines.push(Line::from(Span::raw(m.to_string())));
+        lines.push(Line::default());
+    }
+    let sel_yes = selected == 1;
+    let yes_style = if sel_yes {
+        Style::default()
+            .bg(Color::Green)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::DIM)
+    };
+    let no_style = if !sel_yes {
+        Style::default()
+            .bg(Color::Red)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::DIM)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  [ No ]  ", no_style),
+        Span::raw("     "),
+        Span::styled("  [ Yes ]  ", yes_style),
+    ]));
+    Text::from(lines)
+}
+
+fn ext_input_text(placeholder: Option<&str>, value: &str) -> Text<'static> {
+    let mut lines = Vec::new();
+    if let Some(p) = placeholder {
+        lines.push(Line::from(Span::styled(
+            format!("({p})"),
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+        lines.push(Line::default());
+    }
+    let display = if value.is_empty() {
+        Line::from(vec![Span::styled(
+            " ",
+            Style::default().add_modifier(Modifier::REVERSED),
+        )])
+    } else {
+        Line::from(vec![
+            Span::raw(value.to_string()),
+            Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
+        ])
+    };
+    lines.push(display);
     Text::from(lines)
 }
