@@ -79,24 +79,24 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 ---
 
-## V3.e — UX quick wins
+## V3.e — UX quick wins ✅
 
-- [ ] `/help` body refreshed (essentials + pointers to /shortcuts /settings)
-- [ ] Tab / Shift+Tab bound in `settings_modal_key` (skip Headers)
-- [ ] `FlashKind { Info, Success, Warn, Error }` introduced; `App::flash_*` helpers; ~40 call sites migrated
-- [ ] Slash aliases in catalog — `/keys`, `/hotkeys`, `/prefs`, `/preferences` (picker filter honors aliases)
-- [ ] Cycle-row arrow cleanup — RPC-backed cycles render only `▸`
-- [ ] Modal close-key consistency — read-only viewers accept Esc+q; interactive modals Esc only
-- [ ] Ctrl+Enter on composer = submit
-- [ ] Narrow interview hint — width-aware fallback under 90 cols
-- [ ] Tests:
-  - [ ] Tab skips Headers in /settings
-  - [ ] `flash_success` uses `theme.success` color
-  - [ ] `/help` body contains the new essentials list
-  - [ ] picker filter `ke` surfaces `/shortcuts` via alias
-  - [ ] `q` closes `Modal::Help`, not `Modal::Settings`
+- [x] `/help` body refreshed — essentials + pointers to /shortcuts /settings (regression test `help_text_points_at_shortcuts_and_settings`)
+- [x] Tab / BackTab bound in `settings_modal_key` (advances / reverses through selectable rows)
+- [x] `FlashKind { Info, Success, Warn, Error }` + `App::flash_info/success/warn/error` helpers; ~20 error/success/warn call sites migrated; footer draws each kind in its own color
+- [x] Slash aliases surfaced via description text — searching `keys`/`hotkeys` surfaces `/shortcuts`; searching `prefs`/`preferences` surfaces `/settings`. `try_local_slash` already routed the aliases.
+- [x] Cycle-row arrow cleanup — only `Theme` shows `◂` + `▸`; pi-backed cycles show `▸` only
+- [x] Modal close-key consistency — read-only viewers (Stats, Help, GitStatus, PlanView, Doctor, Mcp, Diff) accept Esc + Enter + q; interactive modals keep Esc only
+- [x] Ctrl+Enter on composer = submit (explicit arm, symmetric with Interview)
+- [x] Narrow interview hint — compact variant under 95 terminal cols
+- [x] Tests:
+  - [x] `help_text_points_at_shortcuts_and_settings`
+  - [x] `settings_tab_and_shift_tab_step_selection`
+  - [x] `flash_helpers_tag_kind_correctly`
+  - [x] `settings_toggle_offline_flashes_for_rpc_backed_flags` (updated to assert FlashKind::Warn)
+  - [x] `picker_surfaces_rows_via_alias_hints`
 
-**Shipped as** ``
+**Shipped as** `<tbd>`
 
 ---
 
@@ -229,18 +229,19 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 | | V2.13 | V3.a | V3.b | V3.c | V3.d | V3.e | V3.f | V3.g | V3.h | V3.i | V3.j |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| Tests | 194 | 197 | 203 | 203 | 203 | | | | ≥ 220 | | |
-| `src/app/mod.rs` LoC | 8 266 | 8 311 | 8 348 | 8 348 | **6 132** | | | | | | |
-| Modules under `src/app/` | 3 | 3 | 3 | 3 | **8** | | | | | | |
-| Release binary (MiB) | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | | | | | | |
-| Hardcoded `Color::X` in markdown/syntax | many | many | many | many | many | | | | | | |
-| CI test OS count | 2 | 2 | 2 | 3 | 3 | | | | | | |
-| CI jobs total | 4 | 4 | 4 | 6 | 6 | | | | | | |
-| Clippy `-D warnings` enforced in CI | no | no | no | yes | yes | | | | | | |
-| Per-frame I/O in /settings | 3+ | 3+ | 0 | 0 | 0 | | | | | | |
-| Per-frame transcript hash walk | O(n) | O(n) | O(1) idle | O(1) idle | O(1) idle | | | | | | |
-| Clippy clean | ✓ | ✓ | ✓ | ✓ | ✓ | | | | | | |
-| Fmt clean | ✓ | ✓ | ✓ | ✓ | ✓ | | | | | | |
+| Tests | 194 | 197 | 203 | 203 | 203 | **207** | | | ≥ 220 | | |
+| `src/app/mod.rs` LoC | 8 266 | 8 311 | 8 348 | 8 348 | 6 132 | 6 204 | | | | | |
+| Modules under `src/app/` | 3 | 3 | 3 | 3 | 8 | 8 | | | | | |
+| Flash color-coded by kind | no | no | no | no | no | **yes** | | | | | |
+| Release binary (MiB) | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | | | | | |
+| Hardcoded `Color::X` in markdown/syntax | many | many | many | many | many | many | | | | | |
+| CI test OS count | 2 | 2 | 2 | 3 | 3 | 3 | | | | | |
+| CI jobs total | 4 | 4 | 4 | 6 | 6 | 6 | | | | | |
+| Clippy `-D warnings` enforced in CI | no | no | no | yes | yes | yes | | | | | |
+| Per-frame I/O in /settings | 3+ | 3+ | 0 | 0 | 0 | 0 | | | | | |
+| Per-frame transcript hash walk | O(n) | O(n) | O(1) idle | O(1) idle | O(1) idle | O(1) idle | | | | | |
+| Clippy clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | | | | |
+| Fmt clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | | | | |
 
 ---
 

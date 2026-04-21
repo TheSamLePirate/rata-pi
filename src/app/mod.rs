@@ -330,7 +330,11 @@ pub(super) struct App {
     composer_mode: ComposerMode,
     session: SessionState,
     modal: Option<Modal>,
-    flash: Option<(String, u64)>, // transient status message with a decay tick
+    /// Transient footer toast. `(text, decay_tick, kind)` — the kind
+    /// chooses the render color in the footer. V3.e.3 added the kind
+    /// field so "✓ copied" (success) no longer shares the warning color
+    /// with "commit failed" (error).
+    flash: Option<(String, u64, FlashKind)>,
     ext_ui: ExtUiState,
     history: History,
     theme: Theme,
@@ -418,6 +422,16 @@ struct AppCaps {
     state_dir: String,
     package_version: &'static str,
     platform: String,
+}
+
+/// V3.e.3 · kind of toast shown in the footer. Drives the text color so
+/// success/warn/error messages are visually distinguishable from info.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlashKind {
+    Info,
+    Success,
+    Warn,
+    Error,
 }
 
 fn probe_app_caps() -> AppCaps {
@@ -661,8 +675,33 @@ impl App {
         false
     }
 
-    fn flash(&mut self, msg: impl Into<String>) {
-        self.flash = Some((msg.into(), self.ticks));
+    /// Show a neutral info flash. Equivalent to `flash_info`.
+    pub(super) fn flash(&mut self, msg: impl Into<String>) {
+        self.flash_with(msg, FlashKind::Info);
+    }
+
+    /// Explicit Info-kind entry point. `flash()` is the common default, so
+    /// this exists mainly for call sites that want to be explicit about
+    /// the kind — e.g. for symmetry with `flash_success` / `flash_error`.
+    #[allow(dead_code)]
+    pub(super) fn flash_info(&mut self, msg: impl Into<String>) {
+        self.flash_with(msg, FlashKind::Info);
+    }
+
+    pub(super) fn flash_success(&mut self, msg: impl Into<String>) {
+        self.flash_with(msg, FlashKind::Success);
+    }
+
+    pub(super) fn flash_warn(&mut self, msg: impl Into<String>) {
+        self.flash_with(msg, FlashKind::Warn);
+    }
+
+    pub(super) fn flash_error(&mut self, msg: impl Into<String>) {
+        self.flash_with(msg, FlashKind::Error);
+    }
+
+    fn flash_with(&mut self, msg: impl Into<String>, kind: FlashKind) {
+        self.flash = Some((msg.into(), self.ticks, kind));
     }
 
     fn apply_state(&mut self, s: &State) {
@@ -1085,7 +1124,7 @@ async fn ui_loop(
                 app.ticks = app.ticks.wrapping_add(1);
                 app.tick_status();
                 app.clamp_focus();
-                if let Some((_, at)) = app.flash
+                if let Some((_, at, _)) = app.flash
                     && app.ticks.wrapping_sub(at) > 15 {
                     app.flash = None;
                 }
@@ -1174,11 +1213,15 @@ async fn handle_modal_key(
         | Modal::PlanView
         | Modal::Doctor(_)
         | Modal::Mcp(_) => match code {
-            KeyCode::Esc | KeyCode::Enter => app.modal = None,
+            // V3.e.6 · read-only viewers accept Esc, Enter, AND q (less-
+            // style) so every dismissal keystroke the user might try
+            // works. Interactive modals (Settings, Commands, Interview,
+            // GitLog, Files, …) keep Esc-only to avoid eating `q`.
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.modal = None,
             _ => {}
         },
         Modal::Diff(d) => match code {
-            KeyCode::Esc => app.modal = None,
+            KeyCode::Esc | KeyCode::Char('q') => app.modal = None,
             KeyCode::Char('j') | KeyCode::Down => {
                 d.scroll = d.scroll.saturating_add(1);
             }
@@ -1286,8 +1329,8 @@ async fn handle_modal_key(
                     app.modal = None;
                     if let Some(name) = pick {
                         match crate::git::switch(&name).await {
-                            Ok(_) => app.flash(format!("switched to {name}")),
-                            Err(e) => app.flash(format!("switch failed: {e}")),
+                            Ok(_) => app.flash_success(format!("switched to {name}")),
+                            Err(e) => app.flash_error(format!("switch failed: {e}")),
                         }
                     }
                 }
@@ -1377,7 +1420,7 @@ async fn handle_modal_key(
                                 app.session.model_label = format!("{}/{}", m.provider, m.id);
                                 app.flash(format!("model → {}/{}", m.provider, m.id));
                             }
-                            Err(e) => app.flash(format!("set_model failed: {e}")),
+                            Err(e) => app.flash_error(format!("set_model failed: {e}")),
                         }
                     }
                     app.modal = None;
@@ -1424,10 +1467,13 @@ async fn handle_modal_key(
                             .await
                         {
                             Ok(_) => {
-                                app.flash(format!("forked at {}", truncate_preview(&f.text, 40)));
+                                app.flash_success(format!(
+                                    "forked at {}",
+                                    truncate_preview(&f.text, 40)
+                                ));
                                 bootstrap(c, app).await;
                             }
-                            Err(e) => app.flash(format!("fork failed: {e}")),
+                            Err(e) => app.flash_error(format!("fork failed: {e}")),
                         }
                     }
                 }
@@ -1484,7 +1530,7 @@ async fn handle_modal_key(
                             app.session.thinking = Some(level);
                             app.flash(format!("thinking → {level:?}"));
                         }
-                        Err(e) => app.flash(format!("set_thinking_level failed: {e}")),
+                        Err(e) => app.flash_error(format!("set_thinking_level failed: {e}")),
                     }
                 }
                 app.modal = None;
@@ -1788,7 +1834,7 @@ fn handle_plan_slash(app: &mut App, arg: &str) {
             }
         }
         "done" => match app.plan.mark_done() {
-            Some(t) => app.flash(format!("✓ step: {}", truncate_preview(&t, 40))),
+            Some(t) => app.flash_success(format!("✓ step: {}", truncate_preview(&t, 40))),
             None => app.flash("no active step"),
         },
         "fail" => {
@@ -1798,7 +1844,9 @@ fn handle_plan_slash(app: &mut App, arg: &str) {
                 rest.to_string()
             };
             match app.plan.mark_fail(reason.clone()) {
-                Some(t) => app.flash(format!("✗ step: {} — {reason}", truncate_preview(&t, 40))),
+                Some(t) => {
+                    app.flash_error(format!("✗ step: {} — {reason}", truncate_preview(&t, 40)))
+                }
                 None => app.flash("no active step"),
             }
         }
@@ -1808,7 +1856,7 @@ fn handle_plan_slash(app: &mut App, arg: &str) {
         },
         "clear" => {
             app.plan.clear();
-            app.flash("plan cleared");
+            app.flash_success("plan cleared");
         }
         "auto" => match rest.to_ascii_lowercase().as_str() {
             "on" | "true" | "1" | "yes" => {
@@ -1870,9 +1918,9 @@ pub(super) fn do_copy(app: &mut App, text: &str) {
                 crate::clipboard::Backend::Arboard => "",
                 crate::clipboard::Backend::Osc52 => " (osc52)",
             };
-            app.flash(format!("✓ copied {} chars{tag}", ok.bytes));
+            app.flash_success(format!("✓ copied {} chars{tag}", ok.bytes));
         }
-        Err(e) => app.flash(format!("copy failed: {e}")),
+        Err(e) => app.flash_error(format!("copy failed: {e}")),
     }
 }
 
@@ -1927,14 +1975,14 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
             if let Some(stats) = &app.session.stats {
                 app.modal = Some(Modal::Stats(Box::new(stats.clone())));
             } else {
-                app.flash("no stats yet — try again once pi has responded");
+                app.flash_warn("no stats yet — try again once pi has responded");
             }
             true
         }
         "export" => {
             match crate::ui::export::export(&app.transcript) {
-                Ok(p) => app.flash(format!("exported → {}", p.display())),
-                Err(e) => app.flash(format!("export failed: {e}")),
+                Ok(p) => app.flash_success(format!("exported → {}", p.display())),
+                Err(e) => app.flash_error(format!("export failed: {e}")),
             }
             true
         }
@@ -2036,7 +2084,7 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
                         scroll: 0,
                     }));
                 }
-                Err(e) => app.flash(format!("git diff failed: {e}")),
+                Err(e) => app.flash_error(format!("git diff failed: {e}")),
             }
             true
         }
@@ -2053,7 +2101,7 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
                         selected: 0,
                     }));
                 }
-                Err(e) => app.flash(format!("git log failed: {e}")),
+                Err(e) => app.flash_error(format!("git log failed: {e}")),
             }
             true
         }
@@ -2066,7 +2114,7 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
                         selected: 0,
                     }));
                 }
-                Err(e) => app.flash(format!("git branch failed: {e}")),
+                Err(e) => app.flash_error(format!("git branch failed: {e}")),
             }
             true
         }
@@ -2075,8 +2123,8 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
                 app.flash("usage: /switch-branch <name>");
             } else {
                 match crate::git::switch(arg).await {
-                    Ok(_) => app.flash(format!("switched to {arg}")),
-                    Err(e) => app.flash(format!("switch failed: {e}")),
+                    Ok(_) => app.flash_success(format!("switched to {arg}")),
+                    Err(e) => app.flash_error(format!("switch failed: {e}")),
                 }
             }
             true
@@ -2088,9 +2136,9 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
                 match crate::git::commit_all(arg).await {
                     Ok(o) => {
                         let head = o.lines().next().unwrap_or("committed");
-                        app.flash(format!("commit: {head}"));
+                        app.flash_success(format!("commit: {head}"));
                     }
-                    Err(e) => app.flash(format!("commit failed: {e}")),
+                    Err(e) => app.flash_error(format!("commit failed: {e}")),
                 }
             }
             true
@@ -2098,7 +2146,7 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
         "stash" => {
             match crate::git::stash().await {
                 Ok(o) => app.flash(o.lines().next().unwrap_or("stashed").to_string()),
-                Err(e) => app.flash(format!("stash failed: {e}")),
+                Err(e) => app.flash_error(format!("stash failed: {e}")),
             }
             true
         }
@@ -2146,9 +2194,9 @@ async fn try_pi_slash(app: &mut App, client: &RpcClient, name: &str, arg: &str) 
             {
                 Ok(_) => {
                     app.session.session_name = Some(name_str.clone());
-                    app.flash(format!("session renamed → {name_str}"));
+                    app.flash_success(format!("session renamed → {name_str}"));
                 }
-                Err(e) => app.flash(format!("rename failed: {e}")),
+                Err(e) => app.flash_error(format!("rename failed: {e}")),
             }
             true
         }
@@ -2161,9 +2209,9 @@ async fn try_pi_slash(app: &mut App, client: &RpcClient, name: &str, arg: &str) 
             {
                 Ok(_) => {
                     app.transcript = Transcript::default();
-                    app.flash("new session started");
+                    app.flash_success("new session started");
                 }
-                Err(e) => app.flash(format!("new session failed: {e}")),
+                Err(e) => app.flash_error(format!("new session failed: {e}")),
             }
             true
         }
@@ -2180,7 +2228,7 @@ async fn try_pi_slash(app: &mut App, client: &RpcClient, name: &str, arg: &str) 
                         .and_then(|v| v.as_str())
                         .unwrap_or("(no path)")
                         .to_string();
-                    app.flash(format!("html → {path}"));
+                    app.flash_success(format!("html → {path}"));
                 }
                 Err(e) => app.flash(format!("export-html failed: {e}")),
             }
@@ -2201,7 +2249,7 @@ async fn try_pi_slash(app: &mut App, client: &RpcClient, name: &str, arg: &str) 
                     app.flash(format!("switched → {arg}"));
                     bootstrap(client, app).await;
                 }
-                Err(e) => app.flash(format!("switch failed: {e}")),
+                Err(e) => app.flash_error(format!("switch failed: {e}")),
             }
             true
         }
@@ -2332,7 +2380,7 @@ async fn try_pi_slash(app: &mut App, client: &RpcClient, name: &str, arg: &str) 
                         do_copy(app, text);
                     }
                 }
-                Err(e) => app.flash(format!("copy failed: {e}")),
+                Err(e) => app.flash_error(format!("copy failed: {e}")),
             }
             true
         }
@@ -3341,13 +3389,23 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             80,
             18,
         ),
-        Modal::Interview(state) => (
-            format!(" ✍ interview · {} ", state.title),
-            Text::from(interview_body(state, theme)),
-            "Tab/↓ next · Shift+Tab/↑ prev · PgUp/PgDn scroll · Space toggle · Enter send (on Submit) · Ctrl+S submit · Esc cancel".to_string(),
-            110,
-            32,
-        ),
+        Modal::Interview(state) => {
+            // V3.e.8 · the full hint is 104 chars; under ~95 terminal
+            // cols it wraps unpredictably inside the modal chrome. Pick
+            // a compact variant when the frame can't fit the long one.
+            let hint = if area.width >= 95 {
+                "Tab/↓ next · Shift+Tab/↑ prev · PgUp/PgDn scroll · Space toggle · Enter send (on Submit) · Ctrl+S submit · Esc cancel".to_string()
+            } else {
+                "Tab/↑↓ navigate · Space toggle · Ctrl+S submit · Esc cancel".to_string()
+            };
+            (
+                format!(" ✍ interview · {} ", state.title),
+                Text::from(interview_body(state, theme)),
+                hint,
+                110,
+                32,
+            )
+        }
         Modal::Shortcuts { .. } => (
             " ⌨  shortcuts ".to_string(),
             Text::from(shortcuts_body(theme)),
@@ -3358,8 +3416,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::Settings(state) => (
             " ⚙  settings ".to_string(),
             Text::from(settings_body(app, state, theme)),
-            "↑↓ nav · Enter/Space toggle · ←/→ cycle · PgUp/PgDn ±5 · Esc close"
-                .to_string(),
+            "↑↓ nav · Enter/Space toggle · ←/→ cycle · PgUp/PgDn ±5 · Esc close".to_string(),
             110,
             32,
         ),
@@ -4350,87 +4407,75 @@ fn commands_selected_line(list: &ListModal<crate::ui::commands::MenuItem>) -> u1
 }
 
 fn help_text(t: &Theme) -> Text<'static> {
+    // V3.e.1 · previous body listed 10 commands out of 40+ and omitted
+    // /settings and /shortcuts entirely. New body points at the two
+    // authoritative references and keeps only the daily-use keys so a
+    // first-time user isn't drowned.
+    let heading = |s: &'static str| {
+        Line::from(Span::styled(
+            s,
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ))
+    };
     Text::from(vec![
+        Line::from(Span::styled(
+            "Welcome to rata-pi.",
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        heading("Full reference"),
         Line::from(vec![
+            Span::raw("  "),
+            kb("/shortcuts", t),
+            Span::raw("  every keybinding, grouped by context (aliases: /keys · /hotkeys)"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            kb("/settings", t),
+            Span::raw("  every tunable + live state (aliases: /prefs · /preferences)"),
+        ]),
+        Line::default(),
+        heading("Essentials"),
+        Line::from(vec![
+            Span::raw("  "),
             kb("Enter", t),
-            Span::raw(" submit   "),
+            Span::raw("          submit prompt"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
             kb("Shift+Enter", t),
-            Span::raw(" newline (deferred)"),
+            Span::raw("    newline in composer"),
         ]),
         Line::from(vec![
-            kb("!cmd", t),
-            Span::raw(" bash RPC · "),
-            kb("/", t),
-            Span::raw(" commands"),
-        ]),
-        Line::from(vec![
-            Span::styled("  slash: ", Style::default().fg(t.dim)),
-            Span::styled(
-                "/help /stats /export /export-html /rename <n> /new /switch <p> /fork /compact /theme",
-                Style::default().fg(t.warning),
-            ),
-        ]),
-        Line::from(vec![
+            Span::raw("  "),
             kb("Esc", t),
-            Span::raw(" abort/clear/quit · "),
+            Span::raw("            abort streaming · clear composer · quit"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            kb("Ctrl+F", t),
+            Span::raw("         focus mode (navigate transcript cards)"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
             kb("Ctrl+C", t),
-            Span::raw(" quit"),
+            Span::raw("         quit"),
         ]),
         Line::from(vec![
-            kb("Ctrl+R", t),
-            Span::raw(" history search · "),
-            kb("Ctrl+S", t),
-            Span::raw(" export markdown · "),
-            kb("↑/↓", t),
-            Span::raw(" history"),
-        ]),
-        Line::default(),
-        Line::from(vec![
-            kb("Ctrl+T", t),
-            Span::raw(" thinking · "),
-            kb("Ctrl+Shift+T", t),
-            Span::raw(" cycle theme · "),
-            kb("/theme <name>", t),
-            Span::raw(" pick"),
+            Span::raw("  "),
+            kb("/", t),
+            Span::raw("              slash-command picker"),
         ]),
         Line::from(vec![
-            kb("Ctrl+E", t),
-            Span::raw(" expand/collapse last tool card"),
-        ]),
-        Line::from(vec![
-            kb("Ctrl+Space", t),
-            Span::raw(" cycle composer mode (steer / follow-up)"),
-        ]),
-        Line::default(),
-        Line::from(vec![
-            kb("F1", t),
-            Span::raw(" commands   "),
-            kb("F5", t),
-            Span::raw(" model   "),
-            kb("F6", t),
-            Span::raw(" thinking"),
-        ]),
-        Line::from(vec![
-            kb("F7", t),
-            Span::raw(" stats   "),
-            kb("F8", t),
-            Span::raw(" compact now   "),
-            kb("F9", t),
-            Span::raw(" auto-compact"),
-        ]),
-        Line::from(vec![
-            kb("F10", t),
-            Span::raw(" auto-retry   "),
+            Span::raw("  "),
             kb("?", t),
-            Span::raw(" this help"),
+            Span::raw("              this screen"),
         ]),
         Line::default(),
-        Line::from(vec![
-            kb("PgUp/PgDn", t),
-            Span::raw(" scroll · "),
-            kb("End", t),
-            Span::raw(" auto-follow"),
-        ]),
+        Line::from(Span::styled(
+            "  Press / to browse commands · /shortcuts for the full keymap.",
+            Style::default().fg(t.dim),
+        )),
     ])
 }
 
@@ -5849,6 +5894,31 @@ I'll take it from here.",
         assert!(close);
     }
 
+    /// V3.e.2 · Tab / Shift+Tab step selection forward / backward through
+    /// selectable rows, same as Down / Up / j / k. Missing binding was a
+    /// papercut users hit coming from the Interview modal.
+    #[test]
+    fn settings_tab_and_shift_tab_step_selection() {
+        let mut a = app();
+        a.modal = Some(Modal::Settings(crate::ui::modal::SettingsState::default()));
+        // Ensure selection lands on first selectable row after initial key.
+        let _ = settings_modal_key(KeyCode::Tab, KeyModifiers::NONE, &mut a);
+        let after_tab = match &a.modal {
+            Some(Modal::Settings(s)) => s.selected,
+            _ => unreachable!("modal should still be Settings"),
+        };
+        assert!(after_tab > 0, "Tab should advance selection");
+        let _ = settings_modal_key(KeyCode::BackTab, KeyModifiers::NONE, &mut a);
+        let after_backtab = match &a.modal {
+            Some(Modal::Settings(s)) => s.selected,
+            _ => unreachable!(),
+        };
+        assert!(
+            after_backtab < after_tab,
+            "BackTab should reverse the Tab step (after={after_tab}, back={after_backtab})"
+        );
+    }
+
     /// V3.b · AppCaps is built exactly once in App::new and shared across
     /// every frame. build_settings_rows MUST read from app.caps — not
     /// re-probe the clipboard or reload the history JSONL. This test
@@ -5921,12 +5991,70 @@ I'll take it from here.",
                 _ => unreachable!(),
             }
             // Flash explains the offline caveat.
-            let flash_text = a.flash.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
+            let (flash_text, flash_kind) = a
+                .flash
+                .as_ref()
+                .map(|(m, _, k)| (m.as_str(), *k))
+                .unwrap_or(("", FlashKind::Info));
             assert!(
                 flash_text.contains(expected_label) && flash_text.contains("offline"),
                 "expected offline flash for {action:?}, got {flash_text:?}"
             );
+            // V3.e.3 · offline flashes are Warn-kind so the footer tints
+            // them appropriately.
+            assert_eq!(
+                flash_kind,
+                FlashKind::Warn,
+                "offline settings flash should be Warn-kind"
+            );
         }
+    }
+
+    /// V3.e.3 · every flash_* helper tags the stored FlashKind so the
+    /// footer renders them with the right color.
+    #[test]
+    fn flash_helpers_tag_kind_correctly() {
+        let mut a = app();
+        a.flash_success("ok");
+        assert!(matches!(a.flash, Some((_, _, FlashKind::Success))));
+        a.flash_warn("oops");
+        assert!(matches!(a.flash, Some((_, _, FlashKind::Warn))));
+        a.flash_error("boom");
+        assert!(matches!(a.flash, Some((_, _, FlashKind::Error))));
+        a.flash("just fyi");
+        assert!(matches!(a.flash, Some((_, _, FlashKind::Info))));
+    }
+
+    // ── V3.e.1 · /help refresh ──────────────────────────────────────────
+
+    /// The refreshed /help body must direct users to /shortcuts and /settings
+    /// (the authoritative references) rather than ship a 10-of-40 command
+    /// cheat sheet as V2.1 did.
+    #[test]
+    fn help_text_points_at_shortcuts_and_settings() {
+        let t = crate::theme::default_theme();
+        let text = help_text(t)
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<String>();
+        for needle in [
+            "/shortcuts",
+            "/settings",
+            "Essentials",
+            "Enter",
+            "Esc",
+            "Ctrl+C",
+            "Ctrl+F",
+            "?",
+        ] {
+            assert!(text.contains(needle), "help body missing {needle:?}");
+        }
+        // Regression: the stale V2.1 commands list must NOT reappear.
+        assert!(
+            !text.contains("/export-html"),
+            "stale 10-command cheat sheet came back"
+        );
     }
 
     // ── V2.13.a · /shortcuts modal ──────────────────────────────────────

@@ -177,7 +177,7 @@ pub(super) async fn handle_key(
             if let Some(text) = last_assistant {
                 do_copy(app, &text);
             } else {
-                app.flash("nothing to copy yet");
+                app.flash_warn("nothing to copy yet");
             }
         }
         (KeyCode::Char(' '), KeyModifiers::CONTROL) => {
@@ -221,7 +221,7 @@ pub(super) async fn handle_key(
             if let Some(stats) = &app.session.stats {
                 app.modal = Some(Modal::Stats(Box::new(stats.clone())));
             } else {
-                app.flash("no stats yet");
+                app.flash_warn("no stats yet");
             }
         }
         (KeyCode::F(8), _) => {
@@ -265,8 +265,8 @@ pub(super) async fn handle_key(
         }
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
             match crate::ui::export::export(&app.transcript) {
-                Ok(path) => app.flash(format!("exported → {}", path.display())),
-                Err(e) => app.flash(format!("export failed: {e}")),
+                Ok(path) => app.flash_success(format!("exported → {}", path.display())),
+                Err(e) => app.flash_error(format!("export failed: {e}")),
             }
         }
         (KeyCode::Up, KeyModifiers::NONE) => {
@@ -313,6 +313,12 @@ pub(super) async fn handle_key(
         (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
             app.composer.insert_newline();
         }
+        // V3.e.7 · explicit Ctrl+Enter → submit. Already falls into the
+        // catch-all Enter arm below, but pinning it makes the symmetry
+        // with the Interview modal's explicit Ctrl+Enter binding
+        // obvious and keeps the intent from being accidentally broken
+        // by future arm reordering.
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => submit(app, client).await,
         (KeyCode::Enter, _) => submit(app, client).await,
 
         // Cursor motion (work in both insert and normal mode).

@@ -836,16 +836,24 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
     // Right-aligned chip. When a flash message is active, it replaces
     // the hint chip; otherwise the stable `? help · /settings · /shortcuts`
     // pointer stays put. Flashes expire naturally after 15 ticks.
-    let hint_spans: Vec<Span<'static>> = if let Some((msg, _)) = &app.flash {
+    // V3.e.3 · color chosen per FlashKind so success/warn/error/info
+    // read at a glance rather than all being yellow.
+    let hint_spans: Vec<Span<'static>> = if let Some((msg, _, kind)) = &app.flash {
+        let color = match kind {
+            super::FlashKind::Success => t.success,
+            super::FlashKind::Warn => t.warning,
+            super::FlashKind::Error => t.error,
+            super::FlashKind::Info => t.accent,
+        };
         vec![
             Span::raw(" "),
             Span::styled(
                 "• ",
-                Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 msg.clone(),
-                Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
         ]

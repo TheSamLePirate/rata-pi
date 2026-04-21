@@ -68,8 +68,12 @@ pub(crate) fn settings_modal_key(
 
     match code {
         KeyCode::Esc => return (None, true),
-        KeyCode::Char('j') | KeyCode::Down => step_by(state, 1),
-        KeyCode::Char('k') | KeyCode::Up => step_by(state, -1),
+        // V3.e.2 · Tab / Shift+Tab navigate between selectable rows,
+        // symmetric with every other modal. Without this binding users
+        // who reflexively press Tab from the Interview modal got
+        // nothing.
+        KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => step_by(state, 1),
+        KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => step_by(state, -1),
         KeyCode::Home | KeyCode::Char('g') => {
             if let Some(first) = rows.iter().position(|r| r.is_selectable()) {
                 state.selected = first;
@@ -165,11 +169,11 @@ pub(crate) async fn dispatch_settings_action(
                 let _ = c
                     .fire(RpcCommand::SetAutoCompaction { enabled: next })
                     .await;
-                app.flash(format!("auto-compact {}", on_off(next)));
+                app.flash_success(format!("auto-compact {}", on_off(next)));
             } else {
                 // V3.a · local flag flipped but there's no pi to persist it.
                 // Warn the user so they don't think the setting stuck.
-                app.flash(format!(
+                app.flash_warn(format!(
                     "auto-compact {} — offline, applies next session",
                     on_off(next)
                 ));
@@ -180,9 +184,9 @@ pub(crate) async fn dispatch_settings_action(
             app.session.auto_retry = Some(next);
             if let Some(c) = client {
                 let _ = c.fire(RpcCommand::SetAutoRetry { enabled: next }).await;
-                app.flash(format!("auto-retry {}", on_off(next)));
+                app.flash_success(format!("auto-retry {}", on_off(next)));
             } else {
-                app.flash(format!(
+                app.flash_warn(format!(
                     "auto-retry {} — offline, applies next session",
                     on_off(next)
                 ));
@@ -577,33 +581,50 @@ pub(crate) fn settings_body(
                     Span::styled(yn.to_string(), Style::default().fg(t.text)),
                 ]));
             }
-            SettingsRow::Cycle { label, display, .. } => {
+            SettingsRow::Cycle {
+                label,
+                display,
+                action,
+            } => {
                 let arrow_color = if focused { t.accent_strong } else { t.dim };
                 let label_style = if focused {
                     Style::default().fg(t.text).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(t.muted)
                 };
-                out.push(Line::from(vec![
+                // V3.e.5 · only Theme has a real backward cycle — the
+                // pi-backed cycles (Model, ThinkingLevel, SteeringMode,
+                // FollowUpMode) don't have a `previous_*` RPC, so ← is a
+                // no-op there. Hide the ◂ affordance to stop implying
+                // bidirectional control.
+                let bidirectional = matches!(action, CycleAction::Theme);
+                let mut spans = vec![
                     Span::styled(format!("  {marker} "), marker_style),
                     Span::styled(format!("{:<22}", label), label_style),
-                    Span::styled(
+                ];
+                if bidirectional {
+                    spans.push(Span::styled(
                         "◂ ",
                         Style::default()
                             .fg(arrow_color)
                             .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        display.clone(),
-                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        " ▸",
-                        Style::default()
-                            .fg(arrow_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
+                    ));
+                } else {
+                    // Placeholder spaces so forward-only rows still align
+                    // visually with the theme row's ◂ affordance.
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled(
+                    display.clone(),
+                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    " ▸",
+                    Style::default()
+                        .fg(arrow_color)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                out.push(Line::from(spans));
             }
         }
     }

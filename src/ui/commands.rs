@@ -347,17 +347,20 @@ pub fn builtins() -> Vec<MenuItem> {
         ),
         b!(Git, "stash", "git stash push", "", "/stash"),
         // ── session · settings/shortcuts (V2.13) ─────────────────────────
+        // V3.e.4 · aliases baked into the description so the picker's
+        // substring-match filter surfaces the row when a user types
+        // `/prefs` or `/keys` without remembering the canonical name.
         b!(
             Session,
             "settings",
-            "every tunable setting + live state in one panel",
+            "every tunable setting + live state (aliases: /prefs · /preferences)",
             "",
             "/settings"
         ),
         b!(
             Session,
             "shortcuts",
-            "read-only keybinding reference for every modal and context",
+            "read-only keybinding reference (aliases: /keys · /hotkeys)",
             "",
             "/shortcuts"
         ),
@@ -503,6 +506,39 @@ mod tests {
         assert!(matches(&it, "display"));
         assert!(matches(&it, "SESSION")); // case-insensitive
         assert!(!matches(&it, "xyz"));
+    }
+
+    /// V3.e.4 · users typing `/keys` or `/prefs` in the picker must see
+    /// the /shortcuts / /settings rows surface, even though those are the
+    /// canonical names. Aliases are embedded in each description so the
+    /// substring filter catches them.
+    #[test]
+    fn picker_surfaces_rows_via_alias_hints() {
+        let all = builtins();
+        let shortcuts = all
+            .iter()
+            .find(|i| i.name == "shortcuts")
+            .expect("shortcuts row should exist");
+        let settings = all
+            .iter()
+            .find(|i| i.name == "settings")
+            .expect("settings row should exist");
+        assert!(
+            matches(shortcuts, "keys"),
+            "filter `keys` misses shortcuts row"
+        );
+        assert!(
+            matches(shortcuts, "hotkeys"),
+            "filter `hotkeys` misses shortcuts row"
+        );
+        assert!(
+            matches(settings, "prefs"),
+            "filter `prefs` misses settings row"
+        );
+        assert!(
+            matches(settings, "preferences"),
+            "filter `preferences` misses settings row"
+        );
     }
 
     #[test]
