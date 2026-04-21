@@ -60,24 +60,22 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 ---
 
-## V3.d — Module split (medium)
+## V3.d — Module split (medium) ✅
 
-- [ ] `src/app/modals/mod.rs` re-export hub
-- [ ] `src/app/modals/interview.rs` — key/draw/dispatch extracted (~500 LoC)
-- [ ] `src/app/modals/settings.rs` — rows/actions/body/key/dispatch extracted (~700 LoC)
-- [ ] `src/app/events.rs` — `on_event`, bootstrap import, live-state transitions (~1 200 LoC)
-- [ ] `src/app/input.rs` — `handle_key` global composer path (~600 LoC)
-- [ ] `src/app/helpers.rs` — `truncate_preview`, `args_preview`, `approx_tokens`, `on_off`
-- [ ] Tests moved alongside their modules; `cargo test` still green across the split
-- [ ] `src/app/mod.rs` < 5 100 lines verified
+- [x] `src/app/modals/mod.rs` re-export hub
+- [x] `src/app/modals/interview.rs` — key/draw/dispatch extracted (905 LoC)
+- [x] `src/app/modals/settings.rs` — rows/actions/body/key/dispatch extracted (618 LoC)
+- [x] `src/app/events.rs` — `on_event`, `apply_state`, bootstrap `import_messages` (390 LoC)
+- [x] `src/app/input.rs` — `handle_key` + `handle_focus_key` + `on_mouse_click` + `handle_vim_normal` (446 LoC)
+- [x] `src/app/helpers.rs` — `truncate_preview`, `args_preview`, `approx_tokens`, `extract_error_detail`, `on_off` (87 LoC)
+- [x] Tests moved alongside (or stayed — reducer tests still in mod.rs under `#[cfg(test)]` re-imports). All 203 tests pass across the split.
+- [!] `src/app/mod.rs` target ≤ 5 100 lines — **deviated**, ended at 6 132. See Deviations §2.
 
-**Shipped as** `` (may span 5 commits — list each below)
-
-- [ ] commit 1: modals/interview — hash:
-- [ ] commit 2: modals/settings — hash:
-- [ ] commit 3: events — hash:
-- [ ] commit 4: input — hash:
-- [ ] commit 5: helpers + `mod.rs` cleanup — hash:
+- [x] commit 1: modals/interview — `b7862c7`
+- [x] commit 2: modals/settings — `e00d5f3`
+- [x] commit 3: events — `4fb8645`
+- [x] commit 4: input — `f32b4ad`
+- [x] commit 5: helpers — `32e848a`
 
 ---
 
@@ -231,23 +229,33 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 | | V2.13 | V3.a | V3.b | V3.c | V3.d | V3.e | V3.f | V3.g | V3.h | V3.i | V3.j |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| Tests | 194 | 197 | 203 | 203 | | | | | ≥ 220 | | |
-| `src/app/mod.rs` LoC | 8 266 | 8 311 | 8 348 | 8 348 | ≤ 5 100 | | | | | | |
-| Release binary (MiB) | 5.3 | 5.3 | 5.3 | 5.3 | | | | | | | |
-| Hardcoded `Color::X` in markdown/syntax | many | many | many | many | | | | | | | |
-| CI test OS count | 2 | 2 | 2 | **3** | | | | | | | |
-| CI jobs total | 4 | 4 | 4 | **6** | | | | | | | |
-| Clippy `-D warnings` enforced in CI | no | no | no | **yes** | | | | | | | |
-| Per-frame I/O in /settings | 3+ | 3+ | 0 | 0 | | | | | | | |
-| Per-frame transcript hash walk | O(n) | O(n) | O(1) idle | O(1) idle | | | | | | | |
-| Clippy clean | ✓ | ✓ | ✓ | ✓ | | | | | | | |
-| Fmt clean | ✓ | ✓ | ✓ | ✓ | | | | | | | |
+| Tests | 194 | 197 | 203 | 203 | 203 | | | | ≥ 220 | | |
+| `src/app/mod.rs` LoC | 8 266 | 8 311 | 8 348 | 8 348 | **6 132** | | | | | | |
+| Modules under `src/app/` | 3 | 3 | 3 | 3 | **8** | | | | | | |
+| Release binary (MiB) | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | | | | | | |
+| Hardcoded `Color::X` in markdown/syntax | many | many | many | many | many | | | | | | |
+| CI test OS count | 2 | 2 | 2 | 3 | 3 | | | | | | |
+| CI jobs total | 4 | 4 | 4 | 6 | 6 | | | | | | |
+| Clippy `-D warnings` enforced in CI | no | no | no | yes | yes | | | | | | |
+| Per-frame I/O in /settings | 3+ | 3+ | 0 | 0 | 0 | | | | | | |
+| Per-frame transcript hash walk | O(n) | O(n) | O(1) idle | O(1) idle | O(1) idle | | | | | | |
+| Clippy clean | ✓ | ✓ | ✓ | ✓ | ✓ | | | | | | |
+| Fmt clean | ✓ | ✓ | ✓ | ✓ | ✓ | | | | | | |
 
 ---
 
 ## Deviations
 
 *(If any task deviates from `PLAN_V3.md`, record it below with: sub-milestone · task · what changed · why. Blank section = on plan.)*
+
+### 2. V3.d · mod.rs ended at 6 132 lines, not ≤ 5 100
+**What changed.** The plan targeted `src/app/mod.rs` ≤ 5 100 after the medium split; final LoC is 6 132.
+
+**Why.** Every function the plan enumerated was extracted: the two modals (interview, settings), the reducer (events), the global input layer (input), and the cross-cutting helpers. Total reduction 8 466 → 6 132 = **-2 334 lines / -27.6%**. The remaining ~1 000 excess sits in two places:
+- Modal *body renderer* functions (`doctor_body`, `mcp_body`, `help_text`, `commands_text`, `models_text`, `thinking_text`, `history_text`, `forks_text`, `ext_*_text`, `plan_full_lines`, `plan_card`, `git_*_body`, `file_preview_lines`, `file_finder_text`) — ~700 LoC. Natural home is a new `modals/bodies.rs` or per-modal files extending the pattern from V3.d.1/.2.
+- `handle_modal_key` (~500 LoC) — per-variant dispatch for every `Modal::*` kind. Logical home is `modals/mod.rs` once every modal has its own submodule.
+
+Both are clean mechanical extractions — the scope grew beyond what the V3.d milestone's "medium split" framing said to do in one pass. Deferred rather than expand the milestone. Plan for V3.d.* follow-up OR a dedicated V3.d.6 when we revisit the split later in V3 or early V4.
 
 ### 1. V3.b · skipped `spawn_blocking` offload for `files::preview`
 **What changed.** The plan called for `files::preview` to be offloaded via `tokio::task::spawn_blocking`. It isn't.
