@@ -74,7 +74,7 @@ pub(super) fn draw(f: &mut ratatui::Frame, app: &App, mm: &mut MouseMap) {
         if status_h > 0 {
             c.push(Constraint::Length(status_h));
         }
-        c.push(Constraint::Length(2)); // footer
+        c.push(Constraint::Length(1)); // footer (V2.13.c · was 2 rows)
         c
     };
     let rects = Layout::vertical(constraints).split(area);
@@ -389,46 +389,41 @@ pub(super) fn fmt_elapsed(d: Duration) -> String {
     }
 }
 
+/// V2.13.c · slimmed header. One tight row with:
+///   rata-pi · heartbeat · spinner · model · state · (queue if nonzero)
+///   · (git chip if in a repo) · right: turn counter
+/// Thinking / session-name / session-file / notify-backend / etc. moved
+/// to /settings.
 fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let t = &app.theme;
+
+    // Heartbeat: pulse shape via the triangle easer; color = heartbeat color
+    // which already encodes liveness (green recent / yellow quiet / red stale).
+    // When offline, force red so the user sees it without reading the state.
+    let heartbeat_pct = crate::anim::ease::triangle(((app.ticks % 10) as f64) / 10.0);
+    let heartbeat_sym = if heartbeat_pct > 0.5 { "●" } else { "○" };
+    let heartbeat_color = if app.spawn_error.is_some() {
+        t.error
+    } else {
+        app.heartbeat_color()
+    };
+
     let spinner = if app.is_streaming {
         Span::styled(
-            format!("{} ", SPINNER[(app.ticks as usize) % SPINNER.len()]),
+            format!(" {}", SPINNER[(app.ticks as usize) % SPINNER.len()]),
             Style::default().fg(t.accent_strong),
         )
     } else {
         Span::raw("  ")
     };
-    let status = if app.is_streaming {
-        Span::styled("streaming", Style::default().fg(t.accent_strong))
-    } else if app.spawn_error.is_some() {
-        Span::styled("pi offline", Style::default().fg(t.error))
-    } else {
-        Span::styled("idle", Style::default().fg(t.muted))
-    };
-    let thinking_badge = if app.show_thinking {
-        Span::styled("  think ●", Style::default().fg(t.role_thinking))
-    } else {
-        Span::styled("  think ○", Style::default().fg(t.dim))
-    };
-    let queue = format!(
-        "  steer:{} · follow-up:{}",
-        app.session.queue_steering.len(),
-        app.session.queue_follow_up.len(),
-    );
-    let session_name = app
-        .session
-        .session_name
-        .as_deref()
-        .map(|n| format!("  [{n}]"))
-        .unwrap_or_default();
 
-    // Heartbeat dot: pulse shape via the triangle easer on the 10-tick loop
-    // of `ticks`. Color comes from heartbeat_color (maps recent-event time).
-    let heartbeat_pct = crate::anim::ease::triangle(((app.ticks % 10) as f64) / 10.0);
-    let heartbeat_sym = if heartbeat_pct > 0.5 { "●" } else { "○" };
+    let (state_label, state_color) = match (app.is_streaming, app.spawn_error.is_some()) {
+        (true, _) => (app.live.label(), t.accent_strong),
+        (_, true) => ("offline", t.error),
+        _ => (app.live.label(), t.muted),
+    };
 
-    let mut line_spans = vec![
+    let mut left: Vec<Span<'static>> = vec![
         Span::styled(
             " rata-pi ",
             Style::default()
@@ -437,25 +432,42 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("{heartbeat_sym} "),
-            Style::default().fg(app.heartbeat_color()),
+            heartbeat_sym.to_string(),
+            Style::default().fg(heartbeat_color),
         ),
         spinner,
-        Span::styled(&app.session.model_label, Style::default().fg(t.accent)),
-        Span::styled(session_name, Style::default().fg(t.dim)),
-        Span::raw("  ·  "),
-        status,
-        thinking_badge,
-        Span::styled(queue, Style::default().fg(t.dim)),
+        Span::raw(" "),
+        Span::styled(
+            short_model_label(&app.session.model_label),
+            Style::default().fg(t.accent),
+        ),
+        Span::raw("  "),
+        Span::styled(format!("· {state_label}"), Style::default().fg(state_color)),
     ];
-    // Git chip: only when inside a repo. Shows `  ⎇ branch●` where the dot
-    // is warning-colored when dirty, success-colored when clean.
+
+    // Queue chips only when something's pending.
+    let steer_n = app.session.queue_steering.len();
+    let fu_n = app.session.queue_follow_up.len();
+    if steer_n > 0 {
+        left.push(Span::styled(
+            format!("  ↻{}", steer_n),
+            Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if fu_n > 0 {
+        left.push(Span::styled(
+            format!("  ▸{}", fu_n),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Git chip only when inside a repo.
     if let Some(g) = &app.git_status
         && g.is_repo
     {
         let branch = g.branch.as_deref().unwrap_or("DETACHED");
         let dirty = g.dirty();
-        line_spans.extend([
+        left.extend([
             Span::raw("  "),
             Span::styled(
                 "⎇ ",
@@ -473,14 +485,35 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
             ),
         ]);
         if g.ahead > 0 || g.behind > 0 {
-            line_spans.push(Span::styled(
+            left.push(Span::styled(
                 format!(" ↑{} ↓{}", g.ahead, g.behind),
                 Style::default().fg(t.dim),
             ));
         }
     }
-    let line = Line::from(line_spans);
-    f.render_widget(Paragraph::new(line), area);
+
+    // Turn counter only once at least one turn has started.
+    if app.turn_count > 0 {
+        left.push(Span::styled(
+            format!("  t{}", app.turn_count),
+            Style::default().fg(t.dim),
+        ));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(left)), area);
+}
+
+/// Shorten a model label for the header. Providers usually surface
+/// `<provider>/<id>` — keep the id tail (`claude-sonnet-4-6`) and
+/// drop the provider when the full label is long.
+fn short_model_label(full: &str) -> String {
+    if full.len() <= 24 {
+        return full.to_string();
+    }
+    match full.rsplit_once('/') {
+        Some((_, id)) => id.to_string(),
+        None => full.to_string(),
+    }
 }
 
 fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App, mm: &mut MouseMap) {
@@ -766,12 +799,15 @@ fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &App) {
     );
 }
 
+/// V2.13.c · single-row footer. Context gauge + a right-aligned pointer
+/// to `/settings` and `/shortcuts`. Flash messages and ext-UI statuses
+/// become transient toasts rather than hijacking a permanent row
+/// (existing toast widget handles those).
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let t = &app.theme;
-    let [bar, hints] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
-    // Context gauge row.
-    let (pct, label) = if let Some(ctx) = app
+    // Context gauge (or placeholder).
+    let (pct, gauge_label) = if let Some(ctx) = app
         .session
         .stats
         .as_ref()
@@ -790,87 +826,64 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
             ),
         )
     } else {
-        (0.0, "context: —".to_string())
+        (0.0, "context —".to_string())
     };
+
+    // Right-aligned chip. When a flash message is active, it replaces
+    // the hint chip; otherwise the stable `? help · /settings · /shortcuts`
+    // pointer stays put. Flashes expire naturally after 15 ticks.
+    let hint_spans: Vec<Span<'static>> = if let Some((msg, _)) = &app.flash {
+        vec![
+            Span::raw(" "),
+            Span::styled(
+                "• ",
+                Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                msg.clone(),
+                Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]
+    } else {
+        vec![
+            Span::styled(" ", Style::default()),
+            kb("?", t),
+            Span::styled(" help ", Style::default().fg(t.dim)),
+            Span::styled("·", Style::default().fg(t.dim)),
+            Span::styled(" ", Style::default()),
+            kb("/settings", t),
+            Span::styled(" ", Style::default()),
+            kb("/shortcuts", t),
+            Span::raw(" "),
+        ]
+    };
+    let hint_line = Line::from(hint_spans);
+    // Estimate hint width from the plain text (Ratatui doesn't expose a
+    // per-span width helper we can rely on on every Line — count chars).
+    let hint_text: String = hint_line
+        .spans
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect();
+    let hint_w = hint_text.chars().count() as u16;
+
+    let gauge_w = area.width.saturating_sub(hint_w.min(area.width));
+    let gauge_area = Rect::new(area.x, area.y, gauge_w, area.height.min(1));
+    let hint_area = Rect::new(
+        area.x + gauge_w,
+        area.y,
+        hint_w.min(area.width.saturating_sub(gauge_w)),
+        area.height.min(1),
+    );
+
     let gauge_color = theme::gauge_color(&app.theme, pct);
     let gauge = Gauge::default()
         .gauge_style(Style::default().fg(gauge_color).bg(Color::Reset))
         .ratio(pct)
-        .label(label);
-    f.render_widget(gauge, bar);
-
-    // Hints + flash message row.
-    let mut spans = if app.is_streaming {
-        vec![
-            kb("Esc", t),
-            Span::raw(" abort · "),
-            kb("Ctrl+Space", t),
-            Span::raw(" cycle · "),
-            kb("F7", t),
-            Span::raw(" stats · "),
-            kb("Ctrl+T", t),
-            Span::raw(" thinking · "),
-            kb("PgUp/PgDn", t),
-            Span::raw(" scroll · "),
-            kb("Ctrl+C", t),
-            Span::raw(" quit"),
-        ]
-    } else if app.focus_idx.is_some() {
-        vec![
-            kb("j/k", t),
-            Span::raw(" nav · "),
-            kb("Enter", t),
-            Span::raw(" expand · "),
-            kb("g/G", t),
-            Span::raw(" top/bot · "),
-            kb("Esc", t),
-            Span::raw(" exit · "),
-            kb("Ctrl+C", t),
-            Span::raw(" quit"),
-        ]
-    } else {
-        vec![
-            kb("Enter", t),
-            Span::raw(" send · "),
-            kb("/", t),
-            Span::raw(" cmds · "),
-            kb("Ctrl+F", t),
-            Span::raw(" focus · "),
-            kb("F5", t),
-            Span::raw(" model · "),
-            kb("F6", t),
-            Span::raw(" think · "),
-            kb("F7", t),
-            Span::raw(" stats · "),
-            kb("Alt+T", t),
-            Span::raw(" theme · "),
-            kb("?", t),
-            Span::raw(" help · "),
-            kb("Ctrl+C", t),
-            Span::raw(" quit"),
-        ]
-    };
-    if let Some((msg, _)) = &app.flash {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(
-            format!("• {msg}"),
-            Style::default()
-                .fg(app.theme.warning)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    for (k, v) in &app.ext_ui.statuses {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(
-            format!("[{k}] "),
-            Style::default().fg(app.theme.role_thinking),
-        ));
-        spans.push(Span::styled(v.clone(), Style::default().fg(app.theme.text)));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().fg(app.theme.muted)),
-        hints,
-    );
+        .label(gauge_label);
+    f.render_widget(gauge, gauge_area);
+    f.render_widget(Paragraph::new(hint_line), hint_area);
 }
 
 /// Render a keybinding chip. Uses the active theme's `accent_strong` so the
