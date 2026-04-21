@@ -146,6 +146,19 @@ pub enum Incoming {
         #[serde(flatten)]
         rest: serde_json::Value,
     },
+
+    // ── synthetic (not from pi) ───────────────────────────────────────────
+    //
+    // V2.12.f · when pi replies to a fire-and-forget command (typically
+    // `prompt` / `steer` / `follow_up`) with `{success: false}`, the
+    // reader task surfaces it here so the UI can push an Entry::Error
+    // instead of silently dropping the error at the RPC layer. Never
+    // deserialized from the wire — only constructed internally.
+    #[serde(skip)]
+    CommandError {
+        command: String,
+        message: String,
+    },
 }
 
 /// The `assistantMessageEvent` discriminator inside `message_update`.

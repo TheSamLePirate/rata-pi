@@ -274,7 +274,29 @@ async fn dispatch(msg: Incoming, evt_tx: &mpsc::Sender<Incoming>, pending: &Pend
                 };
                 let _ = tx.send(result);
             } else {
-                tracing::warn!(id = %id, command = %command, "no waiter for response");
+                // V2.12.f · an unmatched response is usually the reply to a
+                // fire-and-forget command (`prompt`, `steer`, `follow_up`).
+                // Successful replies can be dropped, but FAILURES must be
+                // surfaced — otherwise a user with no API credits sees
+                // nothing happen. Forward errors as a synthetic event so
+                // the UI can push an Entry::Error.
+                if success {
+                    tracing::debug!(id = %id, command = %command, "fire-and-forget response (ok)");
+                } else {
+                    let message = error.unwrap_or_else(|| "(no error message)".into());
+                    tracing::warn!(
+                        id = %id,
+                        command = %command,
+                        error = %message,
+                        "unmatched error response — surfacing to UI"
+                    );
+                    let _ = evt_tx
+                        .send(Incoming::CommandError {
+                            command: command.clone(),
+                            message,
+                        })
+                        .await;
+                }
             }
         }
         other => {

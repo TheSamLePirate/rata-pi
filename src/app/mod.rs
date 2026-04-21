@@ -675,10 +675,21 @@ impl App {
                     self.push_tokens(approx_tokens(&delta));
                     self.transcript.append_thinking(&delta);
                 }
-                AssistantEvent::Error { reason, .. } => {
+                AssistantEvent::Error { reason, partial } => {
                     self.set_live(LiveState::Error);
-                    self.transcript
-                        .push(Entry::Warn(format!("stream error: {reason:?}")));
+                    // Try to extract a human-readable error string from
+                    // the `partial` payload pi carries with stream errors.
+                    // Shape varies across providers — probe common paths.
+                    let detail = extract_error_detail(&partial);
+                    let msg = match detail {
+                        Some(d) => format!("stream error ({reason:?}): {d}"),
+                        None => format!("stream error: {reason:?}"),
+                    };
+                    self.transcript.push(Entry::Error(msg.clone()));
+                    if self.notify_enabled {
+                        let body = truncate_preview(&msg, 100);
+                        let _ = crate::notify::notify("pi · stream error", &body);
+                    }
                 }
                 _ => {}
             },
@@ -807,6 +818,22 @@ impl App {
                     error.as_deref().unwrap_or("(no detail)")
                 )));
             }
+            // V2.12.f · pi rejected a fire-and-forget command (usually the
+            // `prompt` RPC — "insufficient credits", "rate limit",
+            // "context too large"). Surface it in the transcript instead
+            // of silently dropping.
+            Incoming::CommandError { command, message } => {
+                self.is_streaming = false;
+                self.composer_mode = ComposerMode::Prompt;
+                self.set_live(LiveState::Error);
+                self.tool_running = 0;
+                self.transcript
+                    .push(Entry::Error(format!("{command}: {message}")));
+                if self.notify_enabled {
+                    let body = truncate_preview(&message, 100);
+                    let _ = crate::notify::notify(&format!("pi · {command} failed"), &body);
+                }
+            }
             Incoming::QueueUpdate {
                 steering,
                 follow_up,
@@ -839,6 +866,41 @@ fn wrap_with_plan(plan: &crate::plan::Plan, user_text: &str) -> String {
         out.push_str(crate::plan::capability_hint());
         out
     }
+}
+
+/// Dig a human-readable error message out of the `partial` payload that
+/// pi carries alongside stream errors. Providers disagree on the field
+/// name (`error`, `message`, nested `error.message` for Anthropic /
+/// OpenAI schemas), so we probe a few likely paths and fall back to the
+/// whole object stringified.
+fn extract_error_detail(v: &serde_json::Value) -> Option<String> {
+    if v.is_null() {
+        return None;
+    }
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    // Top-level string fields.
+    for key in ["error", "message", "detail", "reason"] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    // Nested `error.message` / `error.type` (Anthropic, OpenAI).
+    if let Some(err) = v.get("error") {
+        if let Some(s) = err.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(s) = err.get("message").and_then(|x| x.as_str()) {
+            let ty = err.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            return Some(if ty.is_empty() {
+                s.to_string()
+            } else {
+                format!("{ty}: {s}")
+            });
+        }
+    }
+    None
 }
 
 /// Truncate a string to `max` characters, appending an ellipsis if cut.
@@ -5580,7 +5642,9 @@ mod reducer_tests {
     }
 
     #[test]
-    fn stream_error_pushes_warn_and_sets_error_state() {
+    fn stream_error_pushes_error_entry_and_sets_error_state() {
+        // V2.12.f · this used to push Entry::Warn; now it's Entry::Error so
+        // API failures land in the visible error channel.
         let mut a = app();
         a.on_event(Incoming::MessageUpdate {
             message: serde_json::Value::Null,
@@ -5592,7 +5656,7 @@ mod reducer_tests {
         assert!(matches!(a.live, LiveState::Error));
         assert!(matches!(
             a.transcript.entries().last(),
-            Some(Entry::Warn(_))
+            Some(Entry::Error(_))
         ));
     }
 
@@ -5759,6 +5823,81 @@ mod reducer_tests {
         });
         let last = a.transcript.entries().last().unwrap();
         assert!(matches!(last, Entry::Error(s) if s.contains("boom")));
+    }
+
+    // ── Command errors (V2.12.f) — API failures, rate limits, etc. ────────
+
+    #[test]
+    fn command_error_pushes_error_and_clears_streaming() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        assert!(a.is_streaming);
+        a.on_event(Incoming::CommandError {
+            command: "prompt".into(),
+            message: "insufficient credits".into(),
+        });
+        assert!(!a.is_streaming);
+        assert!(matches!(a.live, LiveState::Error));
+        assert_eq!(a.tool_running, 0);
+        let last = a.transcript.entries().last().unwrap();
+        match last {
+            Entry::Error(s) => {
+                assert!(s.contains("prompt"), "got {s}");
+                assert!(s.contains("insufficient credits"), "got {s}");
+            }
+            other => panic!("expected Entry::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_extracts_anthropic_nested_message() {
+        let mut a = app();
+        a.on_event(Incoming::MessageUpdate {
+            message: serde_json::Value::Null,
+            assistant_message_event: AssistantEvent::Error {
+                reason: crate::rpc::types::ErrorReason::Error,
+                partial: serde_json::json!({
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Your credit balance is too low to access the Claude API."
+                    }
+                }),
+            },
+        });
+        assert!(matches!(a.live, LiveState::Error));
+        let last = a.transcript.entries().last().unwrap();
+        match last {
+            Entry::Error(s) => {
+                assert!(s.contains("credit balance is too low"), "got {s}");
+                assert!(s.contains("invalid_request_error"), "got {s}");
+            }
+            other => panic!("expected Entry::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_falls_back_on_unknown_partial_shape() {
+        let mut a = app();
+        a.on_event(Incoming::MessageUpdate {
+            message: serde_json::Value::Null,
+            assistant_message_event: AssistantEvent::Error {
+                reason: crate::rpc::types::ErrorReason::Error,
+                partial: serde_json::Value::Null,
+            },
+        });
+        let last = a.transcript.entries().last().unwrap();
+        assert!(matches!(last, Entry::Error(s) if s.contains("stream error")));
+    }
+
+    #[test]
+    fn extract_error_detail_handles_top_level_message() {
+        let v = serde_json::json!({"message": "rate limited"});
+        assert_eq!(extract_error_detail(&v), Some("rate limited".into()));
+    }
+
+    #[test]
+    fn extract_error_detail_returns_none_for_null() {
+        assert!(extract_error_detail(&serde_json::Value::Null).is_none());
     }
 
     // ── Liveness probe ───────────────────────────────────────────────────
