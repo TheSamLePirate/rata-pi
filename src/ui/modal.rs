@@ -61,6 +61,11 @@ pub enum Modal {
     /// Plan view: full list of plan items with status.
     PlanView,
 
+    /// V2.11 · readiness modal. One row per check.
+    Doctor(Vec<DoctorCheck>),
+    /// V2.11 · MCP servers (if pi exposes any).
+    Mcp(Vec<McpRow>),
+
     Help,
 
     /// Extension UI dialog: select from a list of strings.
@@ -100,6 +105,42 @@ pub struct DiffView {
     pub diff: String,
     /// Line-granular scroll offset into the rendered diff lines.
     pub scroll: u16,
+}
+
+/// A single row in the `/doctor` readiness modal.
+#[derive(Debug, Clone)]
+pub struct DoctorCheck {
+    pub label: &'static str,
+    pub status: DoctorStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorStatus {
+    Pass,
+    Warn,
+    Fail,
+    Info,
+}
+
+/// A row in the `/mcp` modal. pi doesn't currently expose MCP state over
+/// RPC, so we surface one informational row explaining that. When/if pi
+/// adds `get_mcp_servers` (or similar), each server becomes its own row.
+#[derive(Debug, Clone)]
+pub struct McpRow {
+    pub name: String,
+    pub status: McpStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpStatus {
+    /// Reserved for when pi starts reporting MCP server state.
+    #[allow(dead_code)]
+    Connected,
+    #[allow(dead_code)]
+    Disconnected,
+    Unknown,
 }
 
 #[derive(Debug)]

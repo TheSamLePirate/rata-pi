@@ -115,8 +115,55 @@ fn install_panic_hook(kitty: bool) {
             LeaveAlternateScreen
         );
         let _ = disable_raw_mode();
+        // V2.11 · persist the panic for post-mortem inspection.
+        let crash_path = write_crash_dump(info);
+        if let Some(path) = crash_path.as_deref() {
+            eprintln!("rata-pi: crash dump written to {path}");
+        }
         original(info);
     }));
+}
+
+/// Write a timestamped crash dump to `~/.local/state/rata-pi/crash-<ts>.log`.
+/// Best-effort: returns the path on success, None on any failure.
+fn write_crash_dump(info: &panic::PanicHookInfo<'_>) -> Option<String> {
+    use std::io::Write as _;
+
+    let dirs = directories::BaseDirs::new()?;
+    let state = dirs.data_local_dir().join("rata-pi");
+    std::fs::create_dir_all(&state).ok()?;
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = state.join(format!("crash-{ts}.log"));
+
+    let mut f = std::fs::File::create(&path).ok()?;
+    let _ = writeln!(f, "rata-pi crash · ts={ts}");
+    let _ = writeln!(
+        f,
+        "version={} os={} arch={}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let loc = info
+        .location()
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_else(|| "<no location>".into());
+    let _ = writeln!(f, "location={loc}");
+    let payload = info
+        .payload()
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>");
+    let _ = writeln!(f, "payload={payload}");
+    let _ = writeln!(f);
+    let bt = std::backtrace::Backtrace::force_capture();
+    let _ = writeln!(f, "backtrace:\n{bt}");
+    Some(path.display().to_string())
 }
 
 // ───────────────────────────────────────────────────────── state ──
@@ -272,6 +319,18 @@ struct App {
     /// Continue-prompt staged for automatic follow-up dispatch after
     /// `agent_end` fires during plan-mode auto-run.
     pending_auto_prompt: Option<String>,
+
+    // ── V2.11: notifications ───────────────────────────────────────────
+    /// Tick count when the current turn started (on `agent_start`). Used
+    /// to compute duration for the agent-end desktop notification.
+    agent_start_tick: Option<u64>,
+    /// Tool calls observed during the current turn. Summarised in the
+    /// agent-end notification body.
+    tool_calls_this_turn: u32,
+    /// Whether the user enabled desktop notifications. Default on; `/notify`
+    /// toggles. Notifications still go through OSC 777 only unless the
+    /// `notify` feature is compiled in.
+    notify_enabled: bool,
 }
 
 impl App {
@@ -312,6 +371,9 @@ impl App {
             vim_enabled: false,
             plan: crate::plan::Plan::default(),
             pending_auto_prompt: None,
+            agent_start_tick: None,
+            tool_calls_this_turn: 0,
+            notify_enabled: true,
         }
     }
 
@@ -500,6 +562,8 @@ impl App {
             Incoming::AgentStart => {
                 self.is_streaming = true;
                 self.set_live(LiveState::Llm);
+                self.agent_start_tick = Some(self.ticks);
+                self.tool_calls_this_turn = 0;
             }
             Incoming::AgentEnd { .. } => {
                 self.is_streaming = false;
@@ -511,6 +575,20 @@ impl App {
                 // [[PLAN_ADD]] and apply. Queue a continue follow-up for
                 // next tick if the plan is still active.
                 self.apply_plan_markers_on_agent_end();
+                if self.notify_enabled {
+                    let dur = self
+                        .agent_start_tick
+                        .map(|t0| self.ticks.saturating_sub(t0))
+                        .unwrap_or(0);
+                    // Notify only on turns that took ≥ 10 s (100 ticks) so
+                    // quick round-trips don't spam the desktop.
+                    if let Some((title, body)) =
+                        crate::notify::agent_end_notice(dur, 100, self.tool_calls_this_turn)
+                    {
+                        let _ = crate::notify::notify(&title, &body);
+                    }
+                }
+                self.agent_start_tick = None;
             }
             Incoming::TurnStart => {
                 self.turn_count = self.turn_count.saturating_add(1);
@@ -562,6 +640,7 @@ impl App {
                 args,
             } => {
                 self.tool_running = self.tool_running.saturating_add(1);
+                self.tool_calls_this_turn = self.tool_calls_this_turn.saturating_add(1);
                 self.set_live(LiveState::Tool);
                 self.transcript.start_tool(tool_call_id, tool_name, args);
             }
@@ -582,6 +661,24 @@ impl App {
                 self.tool_done = self.tool_done.saturating_add(1);
                 if self.tool_running == 0 && self.is_streaming {
                     self.set_live(LiveState::Llm);
+                }
+                if is_error && self.notify_enabled {
+                    let text = result
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .next()
+                        .unwrap_or("");
+                    let first = text.lines().next().unwrap_or("").trim();
+                    let body = if first.is_empty() {
+                        "tool call failed".to_string()
+                    } else {
+                        truncate_preview(first, 80)
+                    };
+                    let _ = crate::notify::notify("pi · tool error", &body);
                 }
                 self.transcript
                     .finish_tool(&tool_call_id, &result, is_error);
@@ -612,12 +709,19 @@ impl App {
                 let state = if success {
                     RetryState::Succeeded
                 } else {
-                    RetryState::Exhausted(final_error.unwrap_or_else(|| "unknown".into()))
+                    RetryState::Exhausted(final_error.clone().unwrap_or_else(|| "unknown".into()))
                 };
                 if success && self.is_streaming {
                     self.set_live(LiveState::Llm);
                 } else {
                     self.set_live(LiveState::Idle);
+                }
+                if !success && self.notify_enabled {
+                    let body = final_error
+                        .as_deref()
+                        .map(|s| truncate_preview(s, 80))
+                        .unwrap_or_else(|| "retries exhausted".to_string());
+                    let _ = crate::notify::notify("pi · retries exhausted", &body);
                 }
                 self.transcript.resolve_retry(attempt, state);
             }
@@ -1462,7 +1566,12 @@ async fn handle_modal_key(
         return;
     };
     match modal {
-        Modal::Stats(_) | Modal::Help | Modal::GitStatus(_) | Modal::PlanView => match code {
+        Modal::Stats(_)
+        | Modal::Help
+        | Modal::GitStatus(_)
+        | Modal::PlanView
+        | Modal::Doctor(_)
+        | Modal::Mcp(_) => match code {
             KeyCode::Esc | KeyCode::Enter => app.modal = None,
             _ => {}
         },
@@ -2368,17 +2477,18 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
             true
         }
         "doctor" => {
-            let caps = crate::term_caps::detect();
-            let cb_ok = arboard::Clipboard::new().is_ok();
-            let mut msg = format!(
-                "doctor → term: {:?}, kitty-kb: {}, gfx: {}, clipboard: {}",
-                caps.kind,
-                caps.kitty_keyboard,
-                caps.graphics,
-                if cb_ok { "arboard" } else { "osc52 fallback" }
-            );
-            msg.push_str(&format!(" · theme: {}", app.theme.name));
-            app.flash(msg);
+            app.modal = Some(Modal::Doctor(doctor_checks(app)));
+            true
+        }
+        "mcp" => {
+            app.modal = Some(Modal::Mcp(mcp_rows(app)));
+            true
+        }
+        "notify" => {
+            app.notify_enabled = !app.notify_enabled;
+            let state = if app.notify_enabled { "on" } else { "off" };
+            let b = crate::notify::notify("pi · notifications", &format!("notifications {state}"));
+            app.flash(format!("notifications {state} · backends: {}", b.label()));
             true
         }
         _ => false,
@@ -4608,6 +4718,20 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             90,
             26,
         ),
+        Modal::Doctor(checks) => (
+            " doctor ".to_string(),
+            Text::from(doctor_body(checks, theme)),
+            "Esc close".to_string(),
+            80,
+            22,
+        ),
+        Modal::Mcp(rows) => (
+            " mcp servers ".to_string(),
+            Text::from(mcp_body(rows, theme)),
+            "Esc close".to_string(),
+            80,
+            18,
+        ),
         Modal::ExtSelect {
             title,
             options,
@@ -4948,6 +5072,222 @@ fn git_status_body(s: &crate::git::GitStatus, t: &Theme) -> Vec<Line<'static>> {
     out.push(Line::default());
     out.push(Line::from(Span::styled(
         "  hint: /diff · /diff --staged · /log · /branch · /commit <msg> · /stash",
+        Style::default().fg(t.dim),
+    )));
+    out
+}
+
+/// Build the readiness-check rows for the /doctor modal.
+fn doctor_checks(app: &App) -> Vec<crate::ui::modal::DoctorCheck> {
+    use crate::ui::modal::{DoctorCheck, DoctorStatus};
+    let caps = crate::term_caps::detect();
+    let mut rows = Vec::new();
+
+    // pi on PATH
+    let pi_path = which_pi();
+    rows.push(DoctorCheck {
+        label: "pi binary",
+        status: if pi_path.is_some() {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Fail
+        },
+        detail: pi_path.unwrap_or_else(|| "not found on PATH".into()),
+    });
+
+    // pi connection live
+    rows.push(DoctorCheck {
+        label: "pi connection",
+        status: if app.spawn_error.is_some() {
+            DoctorStatus::Fail
+        } else {
+            DoctorStatus::Pass
+        },
+        detail: app
+            .spawn_error
+            .clone()
+            .unwrap_or_else(|| "connected".into()),
+    });
+
+    // terminal
+    rows.push(DoctorCheck {
+        label: "terminal",
+        status: DoctorStatus::Info,
+        detail: format!("{:?}", caps.kind),
+    });
+    rows.push(DoctorCheck {
+        label: "kitty keyboard",
+        status: if caps.kitty_keyboard {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Warn
+        },
+        detail: if caps.kitty_keyboard {
+            "enabled (Ctrl+Shift+T disambiguated)".into()
+        } else {
+            "not advertised (Alt+T / F12 fallbacks)".into()
+        },
+    });
+    rows.push(DoctorCheck {
+        label: "graphics",
+        status: if caps.graphics {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Info
+        },
+        detail: if caps.graphics {
+            "supported".into()
+        } else {
+            "no image protocol detected".into()
+        },
+    });
+
+    // clipboard
+    let cb_ok = arboard::Clipboard::new().is_ok();
+    rows.push(DoctorCheck {
+        label: "clipboard",
+        status: if cb_ok {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Warn
+        },
+        detail: if cb_ok {
+            "arboard (native)".into()
+        } else {
+            "OSC 52 fallback".into()
+        },
+    });
+
+    // git
+    let in_repo = app.git_status.as_ref().map(|s| s.is_repo).unwrap_or(false);
+    rows.push(DoctorCheck {
+        label: "git",
+        status: if in_repo {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Info
+        },
+        detail: if in_repo {
+            app.git_status
+                .as_ref()
+                .and_then(|s| s.branch.clone())
+                .unwrap_or_else(|| "(detached)".into())
+        } else {
+            "not a git repository".into()
+        },
+    });
+
+    // theme
+    rows.push(DoctorCheck {
+        label: "theme",
+        status: DoctorStatus::Info,
+        detail: app.theme.name.to_string(),
+    });
+
+    // notifications
+    let notify_feat = cfg!(feature = "notify");
+    rows.push(DoctorCheck {
+        label: "notifications",
+        status: if app.notify_enabled {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Info
+        },
+        detail: format!(
+            "{} · osc777 always · native {}",
+            if app.notify_enabled { "on" } else { "off" },
+            if notify_feat {
+                "feature enabled"
+            } else {
+                "feature disabled"
+            }
+        ),
+    });
+
+    rows
+}
+
+/// Check whether `pi` is resolvable on PATH; return the first match path.
+fn which_pi() -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("pi");
+        if candidate.is_file() {
+            return Some(candidate.display().to_string());
+        }
+    }
+    None
+}
+
+/// Render doctor rows as styled lines.
+fn doctor_body(checks: &[crate::ui::modal::DoctorCheck], t: &Theme) -> Vec<Line<'static>> {
+    use crate::ui::modal::DoctorStatus;
+    let mut out = Vec::with_capacity(checks.len() + 2);
+    out.push(Line::default());
+    for c in checks {
+        let (glyph, color) = match c.status {
+            DoctorStatus::Pass => ("✓", t.success),
+            DoctorStatus::Warn => ("▲", t.warning),
+            DoctorStatus::Fail => ("✗", t.error),
+            DoctorStatus::Info => ("·", t.dim),
+        };
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("  {glyph}  "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<16}", c.label),
+                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(c.detail.clone(), Style::default().fg(t.muted)),
+        ]));
+    }
+    out.push(Line::default());
+    out.push(Line::from(Span::styled(
+        "  hint: /notify toggles · /mcp shows MCP servers · Esc closes",
+        Style::default().fg(t.dim),
+    )));
+    out
+}
+
+/// Build MCP rows. pi 0.x does not currently expose MCP servers via the
+/// JSONL RPC, so we ship a single informational row. Future-proof: when pi
+/// adds `get_mcp_servers`, populate this list from its response.
+fn mcp_rows(_app: &App) -> Vec<crate::ui::modal::McpRow> {
+    use crate::ui::modal::{McpRow, McpStatus};
+    vec![McpRow {
+        name: "mcp info".into(),
+        status: McpStatus::Unknown,
+        detail: "pi does not expose MCP server state over RPC yet".into(),
+    }]
+}
+
+fn mcp_body(rows: &[crate::ui::modal::McpRow], t: &Theme) -> Vec<Line<'static>> {
+    use crate::ui::modal::McpStatus;
+    let mut out = Vec::with_capacity(rows.len() + 2);
+    out.push(Line::default());
+    for r in rows {
+        let (glyph, color) = match r.status {
+            McpStatus::Connected => ("●", t.success),
+            McpStatus::Disconnected => ("○", t.error),
+            McpStatus::Unknown => ("·", t.dim),
+        };
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("  {glyph}  "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<18}", r.name),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(r.detail.clone(), Style::default().fg(t.muted)),
+        ]));
+    }
+    out.push(Line::default());
+    out.push(Line::from(Span::styled(
+        "  hint: MCP servers are configured in pi's settings, not rata-pi",
         Style::default().fg(t.dim),
     )));
     out

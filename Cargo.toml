@@ -52,6 +52,16 @@ syntect = { version = "5", default-features = false, features = [
     "regex-fancy",
 ] }
 
+# Native desktop notifications — opt-in via the `notify` feature. OSC 777
+# emission is always available and does not require this dep.
+notify-rust = { version = "4", optional = true }
+
+[features]
+default = []
+# Enable native desktop notifications (DBus / NSUserNotification / WinToast).
+# OSC 777 works without this feature.
+notify = ["dep:notify-rust"]
+
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]
 codegen-units = 1

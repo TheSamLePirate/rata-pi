@@ -347,7 +347,27 @@ pub fn builtins() -> Vec<MenuItem> {
         ),
         b!(Git, "stash", "git stash push", "", "/stash"),
         // ── debug ────────────────────────────────────────────────────────
-        b!(Debug, "doctor", "basic readiness check", "", "/doctor"),
+        b!(
+            Debug,
+            "doctor",
+            "readiness modal (pi, terminal, clipboard, git, notifications)",
+            "",
+            "/doctor"
+        ),
+        b!(
+            Debug,
+            "mcp",
+            "list MCP servers (if pi exposes them)",
+            "",
+            "/mcp"
+        ),
+        b!(
+            Debug,
+            "notify",
+            "toggle desktop notifications (OSC 777 + native if built with `notify`)",
+            "",
+            "/notify"
+        ),
         b!(Debug, "version", "show rata-pi version", "", "/version"),
         b!(Debug, "log", "show the log file path", "", "/log"),
         b!(

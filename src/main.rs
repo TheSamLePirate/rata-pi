@@ -7,6 +7,7 @@ mod files;
 mod git;
 mod history;
 mod log;
+mod notify;
 mod plan;
 mod rpc;
 mod term_caps;

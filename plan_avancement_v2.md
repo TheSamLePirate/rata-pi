@@ -264,19 +264,154 @@ Also folds in V2.0 bug fixes the user reported (see "Fixes" below).
 
 ---
 
-## V2.6 — File tree + fuzzy + grep + @file
+## V2.6 — File tree + fuzzy + grep + @file ✅ (fuzzy + @-path subset)
 
-- [ ] `ignore` crate walker; respects .gitignore + .git/info/exclude
-- [ ] `FileTree` widget (tui-tree-widget)
-- [ ] `F2` toggles sidebar; `/files` focuses it
-- [ ] `Ctrl+P` fuzzy file finder modal
-- [ ] `Ctrl+G` live grep modal (uses ripgrep shell-out; pipes as stream)
-- [ ] `@path` autocomplete in composer with floating picker + live preview pane
-- [ ] `/find <q>` and `/grep <q>` slash commands
-- [ ] Preview pane shows first 40 lines with syntect highlighting
-- [ ] Open file in default editor via `/edit <path>` (stretch)
+### Delivered
+- [x] `ignore` crate walker (`src/files.rs`) respects `.gitignore` + `.git/info/exclude`; capped at `MAX_FILES=20_000` with `truncated` flag in `FileList`.
+- [x] `Ctrl+P` fuzzy file finder modal — `FileFinder { files, query, selected, mode }`. Live substring filter uses `SkimMatcherV2`; empty query returns a short-path-first prefix.
+- [x] `@path` autocomplete — typing `@` in the composer opens a floating picker with the current token used as a live filter. Selecting replaces the `@<incomplete>` token with `@<full/path>`.
+- [x] `/find [query]` slash command opens the file finder with the query pre-loaded.
+- [x] Preview pane reserved in the modal split — `files::preview(root, rel)` returns first 40 lines or 8 KiB with a binary-file heuristic.
+- [x] `FilePickMode::{Insert, AtToken}` distinguishes "replace composer" (Ctrl+P) from "replace last @-token" (composer autocomplete).
 
-**Notes:** _(to fill in)_
+### Deferred
+- [ ] `FileTree` sidebar widget — V2.6 shipped the finder because that's the muscle memory users have (VS Code / Sublime). Tree sidebar (`F2`) lands with V2.11+ polish.
+- [ ] `Ctrl+G` live grep — ripgrep shell-out exists for `/git-log`-style use; the live streaming grep picker is queued for V2.12.
+- [ ] `/edit <path>` shells to `$EDITOR` — parked pending the multi-line composer decision (V2.10 shipped in-TUI).
+
+**Notes:**
+- `matches_file(path, query)` is a wrapper around `SkimMatcherV2::fuzzy_match` so filter logic stays in one place.
+- The modal's `text_width` reservation for the scrollbar column was kept in sync with the Commands picker so both feel identical.
+
+---
+
+## V2.7 — Git integration ✅ (core)
+
+### Delivered
+- [x] Git helper (`src/git.rs`) shells out to the `git` binary — no `git2` / libgit2. `git_timeout` runs on a background thread with a bounded duration so a hung repo never blocks draws.
+- [x] `GitStatus { is_repo, branch, ahead, behind, staged, unstaged, untracked }` parsed from `git status --porcelain=v2 --branch`. Refreshed on every stats tick.
+- [x] Header git chip: `⎇ branch ●` (dirty) / `○` (clean) with ahead/behind pips `↑N ↓N`. Hidden outside a repo.
+- [x] `/status` opens the git-status modal with staged/unstaged/untracked counts + branch chip.
+- [x] `/diff`, `/diff --staged` → `DiffView { title, staged, diff, scroll }` full-screen modal using the V2.3 diff widget; `j/k/↑/↓/PgUp/PgDn/g/G` scroll.
+- [x] `/git-log [n]` → `GitLogState { commits, selected }` — scrollable picker of last N commits.
+- [x] `/branch` opens `GitBranchState { branches, query, selected }` with live filter.
+- [x] `/switch-branch <name>` / `/commit <msg>` / `/stash` slash commands.
+- [x] Post-V2.7 fix: git-log and diff modals were missing scroll; the follow-up commit `e0b67b3` added j/k/↑/↓/PgUp/PgDn/g/G nav + scroll centering for both. Diff scroll is line-granular.
+
+### Deferred
+- [ ] Side-by-side diff (`d/D`) — queued with V2.12 polish.
+- [ ] Commit modal with staged-files preview + message composer — `/commit <msg>` works inline but the full modal with file-tick-boxes is V2.12.
+- [ ] `git2` feature flag — shell-out is fast and dep-light; revisit if profiling shows the subprocess latency matters.
+
+**Notes:**
+- Porcelain v2 parsing lives in `classify_staged_and_unstaged` with 4 unit tests covering staged/unstaged/untracked combinations.
+- `GitStatus::dirty()` returns true if any of staged/unstaged/untracked is non-zero.
+
+---
+
+## V2.8 — Plan mode + TODO + diagnostics — **merged into V2.9**
+
+Plan-mode work shipped in V2.9. TODO widget + `/diagnostics` deferred to V2.11+.
+
+- [—] Standalone V2.8 folded into V2.9 because plan-mode is the feature that needed to land first; TODO is a separate UI primitive (right-side widget) that deserves its own milestone.
+
+---
+
+## V2.9 — Plan mode, agent-authored or user-authored, enforced ✅ (core)
+
+### Delivered
+- [x] `src/plan.rs` — `Plan { items, auto_run, fail_reason }`, `Item { text, status, attempts }`, `Status { Pending, Active, Done, Failed }`.
+- [x] **Agent-authored plans** via marker protocol: assistant text containing `[[PLAN_SET: a | b | c]]` sets the plan; `[[PLAN_ADD: text]]` appends one item; `[[STEP_DONE]]` advances the active step; `[[STEP_FAILED: reason]]` marks the step failed.
+- [x] `parse_markers(text)` scans assistant text on each `agent_end`; `as_context()` renders the plan as a prompt-injection block; `capability_hint()` tells the agent about the markers when no plan is active.
+- [x] `wrap_with_plan()` prepends the active plan context to every outgoing prompt so the agent has full state in every turn.
+- [x] **Auto-continue** — when `auto_run: true` and the plan still has pending items, `agent_end` queues a follow-up prompt ("continue with the next step"). Capped at `MAX_ATTEMPTS = 3` per step to prevent runaway loops.
+- [x] Plan card rendered between editor and footer when the plan is active, showing progress (N/M done) + active step with `▸` marker.
+- [x] `Modal::PlanView` full plan listing via `/plan` (no arg); `/plan set | add | done | fail | next | clear | auto` manages plan state from the composer.
+- [x] Commit `98f5379` "feat(v2.9): plan mode — agent-authored or user-authored, enforced".
+
+### Deferred
+- [ ] Plan-mode Y/N gate on `tool_execution_start` — plan enforcement is narrative, not tool-level; the tool-gate flavor of plan mode is queued behind UX research.
+- [ ] TODO widget (right-side persistent, keyboard CRUD) — separate primitive, V2.11+.
+- [ ] Timeline / replay — deferred to its own milestone (V2.12 candidate).
+- [ ] Transcript snapshots `/snapshots` — placeholder command exists; persistence lands with V2.12.
+
+**Notes:**
+- The marker scan is scoped to text blocks only so embedded code doesn't trigger accidental plan updates.
+- `attempts` on each `Item` is bumped by the auto-continue loop and consulted before queueing another follow-up.
+
+---
+
+## V2.10 — Multi-line composer + vim mode ✅ (core)
+
+### Delivered
+- [x] `src/composer.rs` — `Composer { lines, row, col, mode, pending_op }`, `Mode::{Insert, Normal}`, UTF-8-aware char-boundary helpers.
+- [x] Insert ops: `insert_char / insert_str / insert_newline / backspace / delete_char_forward`.
+- [x] Navigation: `left / right / up / down / home / end / top / bottom / word_left / word_right` (vim-style, with trailing-whitespace skip on word_right).
+- [x] Kill ops: `kill_line_forward / kill_line_back / delete_line`.
+- [x] `desired_rows(max)` drives editor height so the editor grows as you type (up to `max`, clamped).
+- [x] `render(theme, focus)` bakes the cursor as a `Modifier::REVERSED` cell (works on every terminal without cursor-positioning races).
+- [x] Composer replaces `App.input: String` across 36 call sites in `app.rs`. Shift+Enter / Ctrl+J inserts newline; Enter submits. Ctrl+A / Ctrl+U / Ctrl+K / Ctrl+W / Alt+←/→ round out the editing surface.
+- [x] **Vim mode** opt-in via `/vim` with a full normal-mode dispatcher: `h/j/k/l`, `w/b`, `0/$`, `i/a/o/I/A/O`, `x`, `dd`, `gg`, `G`. Double-letter ops (`dd`) use `pending_op`.
+- [x] `vim_enabled: bool` on App — default **off** so Esc keeps clearing the composer for non-vim users. Editor title chip shows `· INS` / `· NORM` only when vim mode is on.
+- [x] `/default` (alias `/emacs`) restores default bindings. Both commands in the `View` category.
+- [x] 8 composer unit tests cover insert / newline / word-right-with-whitespace / backspace-across-line / kill_line.
+
+### Deferred
+- [ ] `tui-textarea` migration — rolled our own to avoid the dep and own cursor semantics.
+- [ ] Undo / redo — composer edits are non-reversible today; a ring buffer of snapshots is scoped for V2.12.
+- [ ] `/templates` picker over `~/.config/rata-pi/templates/*.md` with `{{selection}}` / `{{file}}` — parked for V2.12.
+
+**Notes:**
+- Composer's word_right now explicitly skips trailing whitespace to land on the next word's first char (matched vim's `w` after the test caught the off-by-one).
+- Cursor rendering via `Modifier::REVERSED` on the target cell means no terminal cursor is actually drawn — reliable across SSH + screen multiplexers.
+
+---
+
+## V2.11 — Notifications, /doctor, /mcp, crash dump ✅ (core)
+
+### Delivered
+- [x] **`src/notify.rs`** — unified notification surface:
+  - **OSC 777** (`ESC ] 777 ; notify ; title ; body BEL`) is always emitted; works on iTerm2, kitty, WezTerm, Ghostty, gnome-terminal, konsole.
+  - **`notify-rust`** behind the opt-in `notify` cargo feature for native DBus / NSUserNotification / WinToast.
+  - Returns `Backends { osc777, native }` so `/notify` can report "notifications on · backends: osc777 · native".
+  - Sanitises BEL / ESC / CR / LF in title+body so a stray BEL can't close the OSC frame early.
+- [x] **Event hooks** fire notifications on:
+  - `agent_end` when the turn took ≥ 10 s (100 ticks at 100 ms/tick) — `"pi · response ready" / "15s · 2 tool calls"`.
+  - `ToolExecutionEnd { is_error: true }` — `"pi · tool error" / <first line of output>`.
+  - `AutoRetryEnd { success: false }` — `"pi · retries exhausted" / <final_error>`.
+  - `agent_start_tick` + `tool_calls_this_turn` fields added to App to track duration and tool count per turn.
+- [x] **`/notify` slash command** toggles `app.notify_enabled`; emits a test notification and flashes the backends label so the user can verify their setup.
+- [x] **`Modal::Doctor(Vec<DoctorCheck>)`** — pass/warn/fail/info rows:
+  - pi binary on PATH (pass / fail with resolved path).
+  - pi connection (fail with spawn error, or pass).
+  - terminal kind (info).
+  - Kitty keyboard (pass if advertised, warn if not).
+  - Graphics protocol (info).
+  - Clipboard (arboard native vs OSC 52 fallback).
+  - Git repo (pass with branch, info outside).
+  - Theme (info).
+  - Notifications (pass when enabled; shows whether the `notify` feature is compiled in).
+  - Rows render with `✓ / ▲ / ✗ / ·` glyphs in the theme's success/warning/error/dim colors.
+  - `/doctor` slash command opens the modal; Esc closes.
+- [x] **`Modal::Mcp(Vec<McpRow>)`** — placeholder today because pi doesn't expose MCP servers over the JSONL RPC yet. Single info row: "pi does not expose MCP server state over RPC yet". Structure is future-proof for when pi adds `get_mcp_servers`.
+- [x] **Crash dump on panic** — `install_panic_hook` now also calls `write_crash_dump(info)` which writes `{data_local_dir}/rata-pi/crash-<unix_ts>.log` with version / os / arch / location / payload / `Backtrace::force_capture()`. Panic path: restore-terminal → write-dump → stderr-notice → chain to original hook. Uses `directories::BaseDirs::data_local_dir()` (works on macOS / Linux / Windows).
+- [x] Catalog entries for `/doctor`, `/mcp`, `/notify` under the Debug category with arg hints + examples; detail pane explains what each does.
+- [x] `notify-rust` crate is optional and gated — default build is unchanged in dep count.
+- [x] 104 tests pass (V2.10 99 + 4 notify + 1 earlier suite bump). `cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean. Release build unchanged (notify feature off). `cargo build --features notify` also clean.
+
+### Deferred
+- [ ] `~/.config/rata-pi/hooks.toml` schema (event → shell cmd OR notify) — hooks config parked pending a real use-case; the built-in notifications cover the common cases (agent_end, tool_error, retry_exhausted).
+- [ ] `/doctor` actions (click a failing row to open docs / restart pi) — currently read-only.
+- [ ] Real MCP listing — blocked on pi exposing the info over RPC; when it does, `mcp_rows(app)` swaps to a live reader.
+- [ ] `color-eyre`-style formatted panic report — current dump uses a plain `Backtrace::force_capture()`; the colorized eyre report is nice-to-have for V2.12.
+
+**Notes:**
+- Agent-end notification threshold is deliberately 10 s so sub-conversational turns stay silent.
+- `Backends { osc777: true, native: true }` lights both in iTerm2 + macOS Notification Center when built with `--features notify`.
+- `Modal::Doctor` / `Modal::Mcp` reuse the same close-on-Esc pattern as `Help` / `Stats`.
+- Crash dump uses unix-seconds for the filename so sort order matches chronology without any locale fuss.
+
+---
 
 ---
 
@@ -338,17 +473,7 @@ Also folds in V2.0 bug fixes the user reported (see "Fixes" below).
 
 ---
 
-## V2.11 — Hooks + notifications + MCP
-
-- [ ] `~/.config/rata-pi/hooks.toml` schema (event → shell cmd OR notify)
-- [ ] `on_agent_end`, `on_tool_error`, `on_compaction`, `on_retry_exhausted`
-- [ ] `notify-rust` desktop notifications (feature `notify`)
-- [ ] OSC 777 emit
-- [ ] Crash dump to `~/.local/state/rata-pi/crash-<ts>.log` with color-eyre report
-- [ ] `/mcp` modal — list MCP servers pi exposes (from extended `get_state` if present)
-- [ ] `/doctor` modal — checks: pi on PATH, clipboard, image protocol, git, terminal capabilities
-
-**Notes:** _(to fill in)_
+## V2.11 — (see above — merged into the delivered V2.11 section)
 
 ---
 
