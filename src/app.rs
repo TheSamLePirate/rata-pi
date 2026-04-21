@@ -263,6 +263,12 @@ struct App {
 
     // ── V2.7: git status (refreshed on stats_tick) ───────────────────────
     git_status: Option<crate::git::GitStatus>,
+
+    // ── V2.9: plan mode ─────────────────────────────────────────────────
+    plan: crate::plan::Plan,
+    /// Continue-prompt staged for automatic follow-up dispatch after
+    /// `agent_end` fires during plan-mode auto-run.
+    pending_auto_prompt: Option<String>,
 }
 
 impl App {
@@ -300,6 +306,8 @@ impl App {
             turn_count: 0,
             last_sec_tick: 0,
             git_status: None,
+            plan: crate::plan::Plan::default(),
+            pending_auto_prompt: None,
         }
     }
 
@@ -344,6 +352,85 @@ impl App {
         }
         let sum: u32 = self.throughput.iter().sum();
         sum / self.throughput.len() as u32
+    }
+
+    /// Scan the most-recent assistant message for plan markers and apply
+    /// them. Stages an automatic continue prompt into `pending_auto_prompt`
+    /// when the plan is still running — the main loop dispatches it as a
+    /// follow-up RPC right after handling the event.
+    fn apply_plan_markers_on_agent_end(&mut self) {
+        let Some(text) = self
+            .transcript
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Entry::Assistant(s) => Some(s.clone()),
+                _ => None,
+            })
+        else {
+            return;
+        };
+
+        let mut advanced = false;
+        let mut created_plan = false;
+        for m in crate::plan::parse_markers(&text) {
+            match m {
+                crate::plan::Marker::PlanSet(items) => {
+                    self.plan.set_all(items);
+                    created_plan = true;
+                    self.transcript.push(Entry::Info(format!(
+                        "plan set by agent: {} steps",
+                        self.plan.total()
+                    )));
+                }
+                crate::plan::Marker::PlanAdd(text) => {
+                    self.plan.add(text.clone());
+                    self.transcript.push(Entry::Info(format!("plan + {text}")));
+                }
+                crate::plan::Marker::Done => {
+                    if let Some(done_text) = self.plan.mark_done() {
+                        self.transcript
+                            .push(Entry::Info(format!("✓ step done: {done_text}")));
+                        advanced = true;
+                    }
+                }
+                crate::plan::Marker::Failed(reason) => {
+                    if let Some(text) = self.plan.mark_fail(reason.clone()) {
+                        self.transcript
+                            .push(Entry::Warn(format!("✗ step failed: {text} — {reason}")));
+                    }
+                }
+            }
+        }
+
+        // Queue a continue follow-up if the plan is still running.
+        if self.plan.is_active() && self.plan.auto_run {
+            if let Some(cur) = self.plan.current() {
+                let attempts = cur.attempts;
+                let step_text = cur.text.clone();
+                let n = self.plan.current_idx().unwrap_or(0) + 1;
+                if attempts >= crate::plan::MAX_ATTEMPTS {
+                    self.plan.auto_run = false;
+                    self.transcript.push(Entry::Warn(format!(
+                        "step {n} stuck after {attempts} attempts — halting auto-run"
+                    )));
+                } else if advanced || created_plan || attempts == 0 {
+                    // Advance OR first attempt of a fresh step — kick pi off.
+                    self.pending_auto_prompt = Some(format!("Proceed with step {n}: {step_text}"));
+                    self.plan.bump_attempt();
+                } else {
+                    // Agent didn't mark the step done. Nudge to continue.
+                    self.pending_auto_prompt = Some(format!(
+                        "Continue step {n} ({step_text}). When complete, end with [[STEP_DONE]]."
+                    ));
+                    self.plan.bump_attempt();
+                }
+            }
+        } else if self.plan.all_done() {
+            self.transcript
+                .push(Entry::Info("plan complete ✓".to_string()));
+        }
     }
 
     fn heartbeat_color(&self) -> Color {
@@ -415,6 +502,11 @@ impl App {
                 self.composer_mode = ComposerMode::Prompt;
                 self.set_live(LiveState::Idle);
                 self.tool_running = 0;
+                // Plan-mode marker handling: scan the last assistant text
+                // for [[STEP_DONE]] / [[STEP_FAILED]] / [[PLAN_SET]] /
+                // [[PLAN_ADD]] and apply. Queue a continue follow-up for
+                // next tick if the plan is still active.
+                self.apply_plan_markers_on_agent_end();
             }
             Incoming::TurnStart => {
                 self.turn_count = self.turn_count.saturating_add(1);
@@ -575,6 +667,22 @@ impl App {
 /// used for the live throughput sparkline, not anything billed.
 fn approx_tokens(s: &str) -> u32 {
     (s.chars().count() as u32).div_ceil(4)
+}
+
+/// If a plan is active, prepend its full context to the user prompt. If
+/// not, append a short capability hint so pi knows about the markers.
+fn wrap_with_plan(plan: &crate::plan::Plan, user_text: &str) -> String {
+    if plan.is_active() {
+        let mut out = plan.as_context();
+        out.push_str("User request:\n");
+        out.push_str(user_text);
+        out
+    } else {
+        let mut out = String::with_capacity(user_text.len() + 200);
+        out.push_str(user_text);
+        out.push_str(crate::plan::capability_hint());
+        out
+    }
 }
 
 /// Truncate a string to `max` characters, appending an ellipsis if cut.
@@ -904,6 +1012,20 @@ async fn ui_loop(
                     match events.try_recv() {
                         Ok(msg) => handle_incoming(msg, app, client).await,
                         Err(_) => break,
+                    }
+                }
+                // Plan mode: if the last agent_end scheduled a continue
+                // follow-up, fire it now via the current client.
+                if let (Some(text), Some(c)) = (app.pending_auto_prompt.take(), client) {
+                    let rpc = RpcCommand::Prompt {
+                        message: wrap_with_plan(&app.plan, &text),
+                        images: vec![],
+                        streaming_behavior: None,
+                    };
+                    if let Err(e) = c.fire(rpc).await {
+                        app.transcript.push(Entry::Error(format!(
+                            "plan auto-run send failed: {e}"
+                        )));
                     }
                 }
             }
@@ -1291,7 +1413,7 @@ async fn handle_modal_key(
         return;
     };
     match modal {
-        Modal::Stats(_) | Modal::Help | Modal::GitStatus(_) => match code {
+        Modal::Stats(_) | Modal::Help | Modal::GitStatus(_) | Modal::PlanView => match code {
             KeyCode::Esc | KeyCode::Enter => app.modal = None,
             _ => {}
         },
@@ -1808,6 +1930,76 @@ fn insert_file_ref(app: &mut App, path: &str, mode: crate::ui::modal::FilePickMo
     app.history.reset_walk();
 }
 
+fn handle_plan_slash(app: &mut App, arg: &str) {
+    let mut parts = arg.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("").trim();
+    match sub {
+        "" | "show" => {
+            app.modal = Some(Modal::PlanView);
+        }
+        "set" => {
+            let items = crate::plan::Plan::parse_list(rest);
+            if items.is_empty() {
+                app.flash("usage: /plan set step1 | step2 | step3");
+            } else {
+                app.plan.set_all(items);
+                app.flash(format!(
+                    "plan set · {} steps · auto-run on",
+                    app.plan.total()
+                ));
+            }
+        }
+        "add" => {
+            if rest.is_empty() {
+                app.flash("usage: /plan add <text>");
+            } else {
+                app.plan.add(rest.into());
+                app.flash(format!("plan + \"{}\"", truncate_preview(rest, 40)));
+            }
+        }
+        "done" => match app.plan.mark_done() {
+            Some(t) => app.flash(format!("✓ step: {}", truncate_preview(&t, 40))),
+            None => app.flash("no active step"),
+        },
+        "fail" => {
+            let reason = if rest.is_empty() {
+                "manual".to_string()
+            } else {
+                rest.to_string()
+            };
+            match app.plan.mark_fail(reason.clone()) {
+                Some(t) => app.flash(format!("✗ step: {} — {reason}", truncate_preview(&t, 40))),
+                None => app.flash("no active step"),
+            }
+        }
+        "next" | "skip" => match app.plan.mark_done() {
+            Some(t) => app.flash(format!("→ skipped: {}", truncate_preview(&t, 40))),
+            None => app.flash("no active step"),
+        },
+        "clear" => {
+            app.plan.clear();
+            app.flash("plan cleared");
+        }
+        "auto" => match rest.to_ascii_lowercase().as_str() {
+            "on" | "true" | "1" | "yes" => {
+                app.plan.auto_run = true;
+                app.flash("plan auto-run ON");
+            }
+            "off" | "false" | "0" | "no" => {
+                app.plan.auto_run = false;
+                app.flash("plan auto-run OFF");
+            }
+            _ => app.flash("usage: /plan auto on | off"),
+        },
+        other => {
+            app.flash(format!(
+                "unknown /plan {other} — try set/add/done/fail/next/clear/auto/show"
+            ));
+        }
+    }
+}
+
 fn open_file_finder(app: &mut App, query: String, mode: crate::ui::modal::FilePickMode) {
     let files = crate::files::walk_cwd();
     app.modal = Some(Modal::Files(crate::ui::modal::FileFinder {
@@ -1953,6 +2145,10 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
         }
         "find" | "files" => {
             open_file_finder(app, arg.to_string(), crate::ui::modal::FilePickMode::Insert);
+            true
+        }
+        "plan" => {
+            handle_plan_slash(app, arg);
             true
         }
         // ── git (all local: we shell out to `git`) ───────────────────
@@ -2416,18 +2612,21 @@ async fn submit(app: &mut App, client: Option<&RpcClient>) {
     if !app.is_streaming {
         app.set_live(LiveState::Sending);
     }
+    // Wrap outgoing message with plan context / capability hint so pi's
+    // LLM sees the plan (or knows the markers it can emit to create one).
+    let wrapped = wrap_with_plan(&app.plan, &text);
     let rpc = match (app.is_streaming, app.composer_mode) {
         (false, _) => RpcCommand::Prompt {
-            message: text,
+            message: wrapped,
             images: vec![],
             streaming_behavior: None,
         },
         (true, ComposerMode::Steer | ComposerMode::Prompt) => RpcCommand::Steer {
-            message: text,
+            message: wrapped,
             images: vec![],
         },
         (true, ComposerMode::FollowUp) => RpcCommand::FollowUp {
-            message: text,
+            message: wrapped,
             images: vec![],
         },
     };
@@ -2490,6 +2689,15 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     // the terminal is too short.
     let status_h: u16 = if area.height >= 20 { 4 } else { 0 };
 
+    // Plan card above the editor when a plan is active. Height = items + 2
+    // borders, capped so a long plan doesn't crowd out the transcript.
+    let plan_h: u16 = if app.plan.is_active() || app.plan.all_done() {
+        let items = app.plan.total().min(6) as u16;
+        items.saturating_add(2).min(8)
+    } else {
+        0
+    };
+
     let constraints: Vec<Constraint> = {
         let mut c = vec![
             Constraint::Length(1), // header
@@ -2497,6 +2705,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         ];
         if above_h > 0 {
             c.push(Constraint::Length(above_h));
+        }
+        if plan_h > 0 {
+            c.push(Constraint::Length(plan_h));
         }
         c.push(Constraint::Length(3)); // editor
         if below_h > 0 {
@@ -2515,6 +2726,13 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let body = rects[idx];
     idx += 1;
     let above_rect = if above_h > 0 {
+        let r = rects[idx];
+        idx += 1;
+        Some(r)
+    } else {
+        None
+    };
+    let plan_rect = if plan_h > 0 {
         let r = rects[idx];
         idx += 1;
         Some(r)
@@ -2543,6 +2761,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     draw_body(f, body, app);
     if let Some(r) = above_rect {
         draw_widgets(f, r, &above_widgets);
+    }
+    if let Some(r) = plan_rect {
+        plan_card(&app.plan, &app.theme).render(f, r, &app.theme);
     }
     draw_editor(f, editor_area, app);
     if let Some(r) = below_rect {
@@ -4239,6 +4460,13 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             70,
             24,
         ),
+        Modal::PlanView => (
+            " plan ".to_string(),
+            Text::from(plan_full_lines(&app.plan, theme)),
+            "/plan set | add | done | fail | clear · Esc close".to_string(),
+            90,
+            26,
+        ),
         Modal::ExtSelect {
             title,
             options,
@@ -4643,6 +4871,139 @@ fn git_log_body(state: &crate::ui::modal::GitLogState, t: &Theme) -> Vec<Line<'s
         ]));
     }
     out
+}
+
+fn plan_full_lines(plan: &crate::plan::Plan, t: &Theme) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    if !plan.is_active() && !plan.all_done() && plan.total() == 0 {
+        out.push(Line::from(Span::styled(
+            "  (no plan)",
+            Style::default().fg(t.dim),
+        )));
+        out.push(Line::default());
+        out.push(Line::from(Span::styled(
+            "  Tell the agent what to do and let it propose a plan, or run:",
+            Style::default().fg(t.dim),
+        )));
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                "/plan set step 1 | step 2 | step 3",
+                Style::default().fg(t.accent_strong),
+            ),
+        ]));
+        return out;
+    }
+
+    out.push(Line::from(vec![
+        Span::styled(
+            "  ▸ progress  ",
+            Style::default().fg(t.dim).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{} / {}", plan.count_done(), plan.total()),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if plan.auto_run {
+                "   auto-run ●"
+            } else {
+                "   auto-run ○"
+            },
+            Style::default().fg(if plan.auto_run { t.success } else { t.dim }),
+        ),
+    ]));
+    out.push(Line::default());
+    for (i, it) in plan.items.iter().enumerate() {
+        let (color, bold) = match it.status {
+            crate::plan::Status::Done => (t.success, false),
+            crate::plan::Status::Active => (t.accent, true),
+            crate::plan::Status::Pending => (t.dim, false),
+            crate::plan::Status::Failed => (t.error, true),
+        };
+        let mut style = Style::default().fg(color);
+        if bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        out.push(Line::from(vec![
+            Span::styled(format!("  {} {:>2}. ", it.status.marker(), i + 1), style),
+            Span::styled(it.text.clone(), style),
+        ]));
+        if it.attempts > 0 && it.status == crate::plan::Status::Active {
+            out.push(Line::from(Span::styled(
+                format!(
+                    "       attempts: {}/{}",
+                    it.attempts,
+                    crate::plan::MAX_ATTEMPTS
+                ),
+                Style::default().fg(t.dim),
+            )));
+        }
+    }
+    if let Some(r) = plan.fail_reason.as_deref() {
+        out.push(Line::default());
+        out.push(Line::from(vec![
+            Span::styled(
+                "  failure: ",
+                Style::default().fg(t.error).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(r.to_string(), Style::default().fg(t.error)),
+        ]));
+    }
+    out
+}
+
+/// Compact plan card shown above the editor while a plan is active.
+fn plan_card(plan: &crate::plan::Plan, t: &Theme) -> crate::ui::cards::Card {
+    use crate::ui::cards::Card;
+    let mut body = Vec::new();
+    // Show a focused window around the active step for the compact card.
+    let active = plan.current_idx();
+    for (i, it) in plan.items.iter().enumerate() {
+        let (color, bold) = match it.status {
+            crate::plan::Status::Done => (t.success, false),
+            crate::plan::Status::Active => (t.accent, true),
+            crate::plan::Status::Pending => (t.dim, false),
+            crate::plan::Status::Failed => (t.error, true),
+        };
+        let mut style = Style::default().fg(color);
+        if bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        let marker = it.status.marker();
+        body.push(Line::from(vec![
+            Span::styled(format!("{marker} "), style),
+            Span::styled(it.text.clone(), style),
+        ]));
+        // Cap compact card height — if plan is long, show only 6 items
+        // centered around active.
+        if plan.items.len() > 6
+            && let Some(a) = active
+            && (i + 3 < a || i > a + 3)
+        {
+            body.pop();
+        }
+    }
+    let right = format!(
+        "{}/{} {}",
+        plan.count_done(),
+        plan.total(),
+        if plan.auto_run { "·auto" } else { "" }
+    );
+    Card {
+        icon: "◆",
+        title: "plan".into(),
+        right_title: Some(right),
+        body,
+        border_color: if plan.fail_reason.is_some() {
+            t.error
+        } else {
+            t.accent
+        },
+        icon_color: t.accent,
+        title_color: t.accent,
+        focused: false,
+    }
 }
 
 fn git_branch_body(state: &crate::ui::modal::GitBranchState, t: &Theme) -> Vec<Line<'static>> {

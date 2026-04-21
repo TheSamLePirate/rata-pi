@@ -58,6 +58,9 @@ pub enum Modal {
     /// Branch picker.
     GitBranch(GitBranchState),
 
+    /// Plan view: full list of plan items with status.
+    PlanView,
+
     Help,
 
     /// Extension UI dialog: select from a list of strings.

@@ -293,6 +293,13 @@ pub fn builtins() -> Vec<MenuItem> {
             "[query]",
             "/find app"
         ),
+        b!(
+            View,
+            "plan",
+            "open the plan view (no-arg) or manage steps",
+            "[set|add|done|fail|next|clear|auto]",
+            "/plan set fetch repo | parse output | write tests"
+        ),
         // ── git ──────────────────────────────────────────────────────────
         b!(Git, "status", "git status summary", "", "/status"),
         b!(
