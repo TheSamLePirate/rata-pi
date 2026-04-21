@@ -2,6 +2,7 @@ mod anim;
 mod app;
 mod cli;
 mod clipboard;
+mod files;
 mod history;
 mod log;
 mod rpc;

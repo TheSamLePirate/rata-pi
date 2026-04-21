@@ -1096,6 +1096,9 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
                 app.transcript.toggle_tool_expanded(&id);
             }
         }
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            open_file_finder(app, String::new(), crate::ui::modal::FilePickMode::Insert);
+        }
         (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
             // Copy the most recent assistant message to the clipboard.
             let last_assistant = app.transcript.entries().iter().rev().find_map(|e| match e {
@@ -1235,6 +1238,16 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
         {
             app.input.push(ch);
             app.history.reset_walk();
+            // Typing `@` at a word boundary opens the file finder in
+            // `AtToken` mode so the picked path replaces the partial.
+            let opens_picker = ch == '@' && {
+                let before = app.input.len().saturating_sub(1);
+                let prev = app.input.as_bytes().get(before.saturating_sub(1)).copied();
+                before == 0 || matches!(prev, Some(b' ' | b'\t'))
+            };
+            if opens_picker {
+                open_file_finder(app, String::new(), crate::ui::modal::FilePickMode::AtToken);
+            }
         }
         (KeyCode::PageUp, _) => {
             let cur = app.scroll.unwrap_or(u16::MAX);
@@ -1397,12 +1410,30 @@ async fn handle_modal_key(
                         {
                             Ok(_) => {
                                 app.flash(format!("forked at {}", truncate_preview(&f.text, 40)));
-                                // Reload transcript at the fork point.
                                 bootstrap(c, app).await;
                             }
                             Err(e) => app.flash(format!("fork failed: {e}")),
                         }
                     }
+                }
+                _ => {}
+            }
+        }
+        Modal::Files(ff) => {
+            let n = crate::files::filter(&ff.files.files, &ff.query, 500).len();
+            if handle_list_keys(&mut ff.query, &mut ff.selected, code, n) {
+                return;
+            }
+            match code {
+                KeyCode::Esc => app.modal = None,
+                KeyCode::Enter => {
+                    let scored = crate::files::filter(&ff.files.files, &ff.query, 500);
+                    let Some((path, _)) = scored.get(ff.selected).cloned() else {
+                        return;
+                    };
+                    let mode = ff.mode;
+                    app.modal = None;
+                    insert_file_ref(app, &path, mode);
                 }
                 _ => {}
             }
@@ -1647,6 +1678,49 @@ fn last_tool_id(transcript: &Transcript) -> Option<String> {
     })
 }
 
+/// Insert a picked file reference into the composer.
+///
+/// `Insert` mode: append `@path` (with a leading space if the composer isn't
+/// empty). `AtToken` mode: replace the current `@...` token — scan back from
+/// the end of `app.input` to the last `@` and swap from there.
+fn insert_file_ref(app: &mut App, path: &str, mode: crate::ui::modal::FilePickMode) {
+    use crate::ui::modal::FilePickMode;
+    let token = format!("@{path}");
+    match mode {
+        FilePickMode::Insert => {
+            if app.input.is_empty() {
+                app.input = token;
+            } else {
+                if !app.input.ends_with(' ') {
+                    app.input.push(' ');
+                }
+                app.input.push_str(&token);
+            }
+        }
+        FilePickMode::AtToken => {
+            if let Some(pos) = app.input.rfind('@') {
+                app.input.truncate(pos);
+                app.input.push_str(&token);
+            } else {
+                app.input.push_str(&token);
+            }
+        }
+    }
+    app.history.reset_walk();
+}
+
+fn open_file_finder(app: &mut App, query: String, mode: crate::ui::modal::FilePickMode) {
+    let files = crate::files::walk_cwd();
+    app.modal = Some(Modal::Files(crate::ui::modal::FileFinder {
+        title: "files".into(),
+        hint: "type to filter · Enter inserts @path · Esc cancels".into(),
+        files,
+        query,
+        selected: 0,
+        mode,
+    }));
+}
+
 /// Copy `text` to the clipboard, reporting outcome via the transient flash.
 fn do_copy(app: &mut App, text: &str) {
     match crate::clipboard::copy(text) {
@@ -1776,6 +1850,10 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
                 "TERM={term} TERM_PROGRAM={term_program} kind={:?} kb={} gfx={}",
                 caps.kind, caps.kitty_keyboard, caps.graphics
             ));
+            true
+        }
+        "find" | "files" => {
+            open_file_finder(app, arg.to_string(), crate::ui::modal::FilePickMode::Insert);
             true
         }
         "doctor" => {
@@ -3908,6 +3986,15 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             90,
             24,
         ),
+        Modal::Files(ff) => (
+            format!(" {} ", ff.title),
+            // Actual body is rebuilt below once list_area is known so the
+            // scroll math is width-accurate (same trick as Commands).
+            Text::default(),
+            ff.hint.clone(),
+            120,
+            26,
+        ),
         Modal::ExtSelect {
             title,
             options,
@@ -3971,7 +4058,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     // Two-pane layout when this is a Commands modal AND the terminal is
     // wide enough: left ~60% = list, right ~40% = detail pane.
     let (list_area, detail_area) = match modal {
-        Modal::Commands(_) if inner.width >= 80 => {
+        Modal::Commands(_) | Modal::Files(_) if inner.width >= 80 => {
             let left_w = (inner.width * 6) / 10;
             let right_w = inner.width - left_w - 1;
             let list_rect = Rect::new(inner.x, inner.y, left_w, inner.height);
@@ -3999,6 +4086,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     // Rebuild the Commands body now that we know the list width.
     let body_owned = match modal {
         Modal::Commands(l) => commands_text(l, t, text_width),
+        Modal::Files(ff) => file_finder_text(ff, t, text_width),
         _ => body,
     };
 
@@ -4008,6 +4096,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::Models(l) => Some(2 + l.selected as u16),
         Modal::History(l) => Some(2 + l.selected as u16),
         Modal::Forks(l) => Some(2 + l.selected as u16),
+        Modal::Files(ff) => Some(2 + ff.selected as u16),
         Modal::ExtSelect { selected, .. } => Some(*selected as u16),
         _ => None,
     };
@@ -4055,11 +4144,136 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             da,
         );
     }
+    if let (Some(da), Modal::Files(ff)) = (detail_area, modal) {
+        let detail = file_preview_lines(ff, t);
+        f.render_widget(
+            Paragraph::new(Text::from(detail)).wrap(Wrap { trim: false }),
+            da,
+        );
+    }
 }
 
 /// Compute the terminal-row index of the selected item in `commands_text`.
 /// Mirrors the category-grouping + description-line layout so the scroll
 /// computation can keep the selected item centered.
+/// Left-pane body for the FileFinder modal. Width-aware truncation so the
+/// scroll math remains one-row-per-item.
+fn file_finder_text(
+    ff: &crate::ui::modal::FileFinder,
+    t: &Theme,
+    list_width: u16,
+) -> Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let viewport_cap: usize = 500;
+    let scored = crate::files::filter(&ff.files.files, &ff.query, viewport_cap);
+
+    let hint_bits = if ff.files.truncated {
+        format!(
+            "   ({} / {}+ files truncated)",
+            scored.len(),
+            crate::files::MAX_FILES
+        )
+    } else {
+        format!("   ({} items)", scored.len())
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("filter: ", Style::default().fg(t.dim)),
+        Span::styled(
+            ff.query.clone(),
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(hint_bits, Style::default().fg(t.dim)),
+    ]));
+    lines.push(Line::default());
+
+    if scored.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no matches)",
+            Style::default().fg(t.dim),
+        )));
+        return Text::from(lines);
+    }
+
+    let max = list_width as usize;
+    for (i, (path, _score)) in scored.iter().enumerate() {
+        let is_sel = i == ff.selected;
+        let marker = if is_sel { "▸" } else { " " };
+        let style = if is_sel {
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.text)
+        };
+        let display = if path.chars().count() + 4 > max {
+            // Prefer showing the filename over the path prefix.
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let prefix_len = max.saturating_sub(name.chars().count() + 5);
+            if prefix_len >= 3 {
+                let prefix: String = path.chars().take(prefix_len.saturating_sub(2)).collect();
+                format!("{prefix}…/{name}")
+            } else {
+                truncate_preview(name, max.saturating_sub(2))
+            }
+        } else {
+            path.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {marker} "), style),
+            Span::styled(display, style),
+        ]));
+    }
+    Text::from(lines)
+}
+
+/// Right-pane preview of the selected file: first ~40 lines, syntect-
+/// highlighted by extension.
+fn file_preview_lines(ff: &crate::ui::modal::FileFinder, t: &Theme) -> Vec<Line<'static>> {
+    let scored = crate::files::filter(&ff.files.files, &ff.query, 500);
+    let Some((path, _)) = scored.get(ff.selected) else {
+        return vec![Line::from(Span::styled(
+            "(no selection)",
+            Style::default().fg(t.dim),
+        ))];
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("  ▤ ", Style::default().fg(t.accent)),
+        Span::styled(
+            path.clone(),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::default());
+
+    match crate::files::preview(&ff.files.root, path) {
+        Some((text, lang)) => {
+            let highlighted = crate::ui::syntax::highlight(&text, &lang);
+            if highlighted.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "(empty file)",
+                    Style::default().fg(t.dim),
+                )));
+            } else {
+                for l in highlighted {
+                    lines.push(l);
+                }
+            }
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "(preview unavailable — binary or too large)",
+                Style::default().fg(t.dim),
+            )));
+        }
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "  Enter inserts @path · Esc closes",
+        Style::default().fg(t.dim),
+    )));
+    lines
+}
+
 fn commands_selected_line(list: &ListModal<crate::ui::commands::MenuItem>) -> u16 {
     let filtered: Vec<&crate::ui::commands::MenuItem> =
         filtered_commands(&list.items, &list.query).collect();

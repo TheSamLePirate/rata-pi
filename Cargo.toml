@@ -39,6 +39,10 @@ directories = "6"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 base64 = "0.22"
 
+# Fuzzy file finder.
+fuzzy-matcher = "0.3"
+ignore = "0.4"
+
 # Rendering
 pulldown-cmark = { version = "0.13", default-features = false }
 syntect = { version = "5", default-features = false, features = [

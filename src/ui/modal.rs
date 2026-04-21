@@ -7,9 +7,33 @@
 
 use ratatui::layout::Rect;
 
+use crate::files::FileList;
 use crate::history::HistoryEntry;
 use crate::rpc::types::{ForkMessage, Model, SessionStats, ThinkingLevel};
 use crate::ui::commands::MenuItem;
+
+/// Fuzzy file finder state. The `files` list is captured at modal-open
+/// time; `query` is typed live; `selected` indexes into the fuzzy-filtered
+/// subset.
+#[derive(Debug)]
+pub struct FileFinder {
+    pub title: String,
+    pub hint: String,
+    pub files: FileList,
+    pub query: String,
+    pub selected: usize,
+    /// Where to put the picked path: into the composer verbatim, or as a
+    /// `@path` replacement token inside the existing composer text.
+    pub mode: FilePickMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FilePickMode {
+    /// Replace the composer entirely with `@<path>`.
+    Insert,
+    /// Replace the final `@<incomplete>` token with `@<path>`.
+    AtToken,
+}
 
 #[derive(Debug)]
 pub enum Modal {
@@ -20,6 +44,8 @@ pub enum Modal {
     Thinking(RadioModal<ThinkingLevel>),
     History(ListModal<HistoryEntry>),
     Forks(ListModal<ForkMessage>),
+    /// Fuzzy file finder — Ctrl+P, /find, @path.
+    Files(FileFinder),
     Help,
     /// Extension UI dialog: select from a list of strings.
     ExtSelect {

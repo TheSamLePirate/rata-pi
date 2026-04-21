@@ -282,6 +282,13 @@ pub fn builtins() -> Vec<MenuItem> {
             "/theme dracula"
         ),
         b!(View, "themes", "pick a color theme (picker)", "", "/themes"),
+        b!(
+            View,
+            "find",
+            "fuzzy file finder (Ctrl+P) — inserts @path",
+            "[query]",
+            "/find app"
+        ),
         // ── debug ────────────────────────────────────────────────────────
         b!(Debug, "doctor", "basic readiness check", "", "/doctor"),
         b!(Debug, "version", "show rata-pi version", "", "/version"),
