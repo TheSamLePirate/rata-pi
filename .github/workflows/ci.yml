@@ -45,8 +45,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # V3.c · enforce -D warnings explicitly so a warning can never merge.
+      # Local dev runs with the same flags; CI must match.
       - name: Run clippy action
         uses: clechasseur/rs-clippy-check@v3
+        with:
+          args: --all-features --all-targets -- -D warnings
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
   doc:
@@ -69,7 +73,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        # V3.c · Linux added. Main dev target for TUI work; omitting it from
+        # the test matrix (as V2.x did) meant Linux-only regressions could
+        # slip through until a local cargo test caught them.
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       # if your project needs OpenSSL, uncomment this to fix Windows builds.
       # it's commented out by default as the install command takes 5-10m.
@@ -86,5 +93,38 @@ jobs:
         run: cargo generate-lockfile
       - name: cargo test --locked
         run: cargo test --locked --all-features --all-targets
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+  # V3.c · ensure the feature-gated notify-rust integration compiles. Without
+  # this, the `notify` feature could rot silently since `--all-features`
+  # (used in `test`) includes it but the code only truly exercises it when
+  # desktop notifications fire at runtime.
+  build-notify:
+    name: build --features notify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install notify-rust deps
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: cargo build --features notify
+        run: cargo build --locked --features notify
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+  # V3.c · release-profile smoke. LTO + opt-level=3 + codegen-units=1 can
+  # surface bugs debug/test builds never hit (V2.12.c hit one in scroll
+  # layout math). Compile-only — we just need the release path to succeed.
+  build-release:
+    name: build --release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo build --release
+        run: cargo build --locked --release
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2

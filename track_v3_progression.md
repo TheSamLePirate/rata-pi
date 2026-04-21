@@ -48,15 +48,15 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 ---
 
-## V3.c — CI hardening
+## V3.c — CI hardening ✅
 
-- [ ] `.github/workflows/ci.yml` — `ubuntu-latest` added to test matrix
-- [ ] Clippy job — `clippy_flags: -- -D warnings` passed explicitly
-- [ ] `build-notify` job — `cargo build --features notify` on Ubuntu
-- [ ] `build-release` job — `cargo build --release` smoke on Ubuntu
-- [ ] Verified green on a throwaway branch
+- [x] `.github/workflows/ci.yml` — `ubuntu-latest` added to test matrix
+- [x] Clippy job — `args: --all-features --all-targets -- -D warnings` passed explicitly
+- [x] `build-notify` job — `cargo build --locked --features notify` on Ubuntu (installs libdbus-1-dev)
+- [x] `build-release` job — `cargo build --locked --release` smoke on Ubuntu
+- [x] Local parity: all three commands pass locally (test matrix will confirm on push)
 
-**Shipped as** ``
+**Shipped as** `<tbd>`
 
 ---
 
@@ -231,15 +231,17 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 | | V2.13 | V3.a | V3.b | V3.c | V3.d | V3.e | V3.f | V3.g | V3.h | V3.i | V3.j |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| Tests | 194 | 197 | **203** | | | | | | ≥ 220 | | |
-| `src/app/mod.rs` LoC | 8 266 | 8 311 | 8 348 | | ≤ 5 100 | | | | | | |
-| Release binary (MiB) | 5.3 | 5.3 | 5.3 | | | | | | | | |
-| Hardcoded `Color::X` in markdown/syntax | many | many | many | | | | | | | | |
-| CI test OS count | 2 | 2 | 2 | 3 | | | | | | | |
-| Per-frame I/O in /settings | 3+ | 3+ | **0** | | | | | | | | |
-| Per-frame transcript hash walk | O(n) | O(n) | **O(1)** idle | | | | | | | | |
-| Clippy clean | ✓ | ✓ | ✓ | | | | | | | | |
-| Fmt clean | ✓ | ✓ | ✓ | | | | | | | | |
+| Tests | 194 | 197 | 203 | 203 | | | | | ≥ 220 | | |
+| `src/app/mod.rs` LoC | 8 266 | 8 311 | 8 348 | 8 348 | ≤ 5 100 | | | | | | |
+| Release binary (MiB) | 5.3 | 5.3 | 5.3 | 5.3 | | | | | | | |
+| Hardcoded `Color::X` in markdown/syntax | many | many | many | many | | | | | | | |
+| CI test OS count | 2 | 2 | 2 | **3** | | | | | | | |
+| CI jobs total | 4 | 4 | 4 | **6** | | | | | | | |
+| Clippy `-D warnings` enforced in CI | no | no | no | **yes** | | | | | | | |
+| Per-frame I/O in /settings | 3+ | 3+ | 0 | 0 | | | | | | | |
+| Per-frame transcript hash walk | O(n) | O(n) | O(1) idle | O(1) idle | | | | | | | |
+| Clippy clean | ✓ | ✓ | ✓ | ✓ | | | | | | | |
+| Fmt clean | ✓ | ✓ | ✓ | ✓ | | | | | | | |
 
 ---
 
