@@ -645,24 +645,53 @@ Every field supports a `default`:
 
 ### Keyboard reference (Interview modal)
 
+**Navigation** — Tab cycles through every interactive field **and** the Submit button at the end. Focus auto-scrolls the viewport so the current field stays visible even in long forms.
+
 | Key | Action |
 |---|---|
-| `Tab` | Next interactive field (skips sections) |
-| `Shift+Tab` | Previous interactive field |
-| `↓` / `↑` | Same as Tab / Shift+Tab (unless in a multiline text field where ↓/↑ still move focus — one field per field) |
+| `Tab` / `↓` | Next focus slot (interactive field → submit button → wraps) |
+| `Shift+Tab` / `↑` | Previous focus slot |
 | `←` / `→` | Field-specific: cycle select, move multiselect cursor, set toggle, move text cursor |
 | `Alt+←` / `Alt+→` | Word-left / word-right inside a text or number field |
 | `Home` / `Ctrl+A` | Start of the current text field |
 | `End` / `Ctrl+E` | End of the current text field |
-| `Space` | Toggle a checkbox / boolean / multiselect option |
+| `Space` | Toggle a boolean / multiselect option |
 | `1..9` | On a select, jump to option *N* |
 | `Backspace` / `Delete` | Delete char before / after cursor |
 | `Ctrl+U` | Kill to start of the current text field |
 | `Ctrl+K` | Kill to end of the current text field |
 | `Ctrl+W` | Kill word back |
 | `Shift+Enter` | Insert newline (in a `multiline` text field only) |
-| `Ctrl+Enter` or `Ctrl+S` | Submit — send answers to the agent |
+
+**Submit** — the primary path is Tab-to-button-then-Enter. Power shortcuts work from anywhere.
+
+| Key | Action |
+|---|---|
+| `Enter` on the Submit button | Submit the form |
+| `Enter` on a single-line text / number / select | Advance focus (same as Tab) |
+| `Enter` on a toggle | Toggle the value |
+| `Enter` on a multiselect | Toggle the option under the cursor |
+| `Ctrl+S` (anywhere) | Submit — works on every terminal |
+| `Ctrl+Enter` (anywhere) | Submit — works on terminals with the Kitty keyboard protocol |
 | `Esc` | Cancel — close the modal without sending |
+
+**Scrolling** — long forms (e.g. 15+ fields) scroll naturally. By default the viewport follows focus; `PgUp` / `PgDn` pauses that and lets you browse freely. The next Tab / arrow key re-enables focus-follow.
+
+| Key | Action |
+|---|---|
+| `PgDn` | Scroll viewport down ~10 rows |
+| `PgUp` | Scroll viewport up ~10 rows |
+| `Ctrl+End` | Jump to bottom of the form |
+| `Ctrl+Home` | Jump to top of the form |
+| *any Tab / arrow* | Resume focus-follow auto-scroll |
+
+A scrollbar appears in the right column whenever the form is taller than the modal frame.
+
+### Submit-button states
+
+* **Idle** — dim `▶` marker to its left, button has a normal accent fill, hint says *"Tab here · Ctrl+S / Ctrl+Enter anywhere · Esc to cancel"*.
+* **Focused** — bright `▶` marker, button label wrapped as `▶ Submit ◀` in reverse-video, hint says *"press Enter to send · Esc to cancel"*.
+* **Blocked** (required field empty) — button color dims and the hint reads *"fill required fields, then Enter"*. Attempting to submit sets a red validation row above the fields and jumps focus to the first missing field.
 
 ### What pi receives on submit
 
