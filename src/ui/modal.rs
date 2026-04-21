@@ -207,10 +207,12 @@ pub struct PlanReviewState {
     /// in Edit mode, the focused step index.
     pub selected: usize,
     pub scroll: u16,
-    /// V3.f.2 (next sub-commit) uses this to gate Edit-mode key handling;
-    /// for now Review is the only variant.
-    #[allow(dead_code)]
+    /// Review (action chips + step list, read-only) vs Edit (step list
+    /// with mutation keys). Flipped by pressing `e` in Review mode.
     pub mode: PlanReviewMode,
+    /// V3.f.2 · when Some, the step at `editing.index` is under
+    /// text entry. None while simply navigating the edit list.
+    pub editing: Option<EditingStep>,
     /// Will auto-run kick off after Accept? Starts from the proposal's
     /// suggested flag; user may toggle with `t` in either mode.
     pub auto_run_pref: bool,
@@ -222,7 +224,20 @@ pub struct PlanReviewState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanReviewMode {
     Review,
-    // V3.f.2 will add Edit variant.
+    /// V3.f.2 · edit the draft before accepting. `selected` indexes
+    /// into `items`; when `editing` is Some, the step at that index is
+    /// in text-entry mode.
+    Edit,
+}
+
+/// V3.f.2 · in-place text edit on one step. The buffer is a shadow
+/// copy — committed back to `PlanReviewState.items[index]` when the
+/// user presses Enter / Esc in the edit sub-mode.
+#[derive(Debug)]
+pub struct EditingStep {
+    pub index: usize,
+    pub buffer: String,
+    pub cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

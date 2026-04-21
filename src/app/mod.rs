@@ -428,6 +428,27 @@ struct AppCaps {
     platform: String,
 }
 
+/// V3.f.2 · char-boundary helpers for the plan review Edit sub-mode.
+/// Duplicates the same-named helpers in `modals/interview.rs` — keeping
+/// them local here avoids a cross-module API change for one two-line
+/// function. If a third caller appears we'll lift both copies into
+/// `app/helpers.rs`.
+fn prev_char_boundary_str(s: &str, i: usize) -> usize {
+    let mut j = i.saturating_sub(1);
+    while j > 0 && !s.is_char_boundary(j) {
+        j -= 1;
+    }
+    j
+}
+
+fn next_char_boundary_str(s: &str, i: usize) -> usize {
+    let mut j = i.saturating_add(1).min(s.len());
+    while j < s.len() && !s.is_char_boundary(j) {
+        j += 1;
+    }
+    j
+}
+
 /// V3.f · flatten every assistant Text block across an `agent_end.messages`
 /// payload into a single string, concatenated with newlines. This is the
 /// authoritative source of what the agent emitted on its final turn —
@@ -711,6 +732,7 @@ impl App {
             selected: 0,
             scroll: 0,
             mode: PlanReviewMode::Review,
+            editing: None,
             auto_run_pref: true,
             purpose: PlanReviewPurpose::NewPlan,
         })));
@@ -737,6 +759,7 @@ impl App {
             selected: 0,
             scroll: 0,
             mode: PlanReviewMode::Review,
+            editing: None,
             auto_run_pref: self.plan.auto_run,
             purpose: PlanReviewPurpose::Amendment,
         })));
@@ -1812,52 +1835,198 @@ async fn handle_modal_key(
             }
             _ => {}
         },
-        // V3.f · Plan Review modal. Review-mode only (Edit lands in V3.f.2).
-        // Keys: a = accept · d = deny · t = toggle auto-run ·
-        // Enter = activate focused action · Esc = deny (same as d).
-        // Navigation keys (↑↓/j/k/PgUp/PgDn/g/G/Home/End) scroll the
-        // step list for long proposals.
-        Modal::PlanReview(state) => match code {
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                app.modal = None;
-                app.accept_proposed_plan();
-            }
-            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
-                app.modal = None;
-                app.deny_proposed_plan();
-            }
-            KeyCode::Char('t') | KeyCode::Char('T') => {
-                state.auto_run_pref = !state.auto_run_pref;
-                if let Some(p) = app.proposed_plan.as_mut() {
-                    p.suggested_auto_run = state.auto_run_pref;
+        // V3.f · Plan Review modal. Three sub-modes:
+        //   * Review (action chips + step list, read-only)
+        //   * Edit (step list focus; add / delete / enter-to-edit)
+        //   * Edit + text-entry (a single step under cursor)
+        Modal::PlanReview(state) => {
+            use crate::ui::modal::{EditingStep, PlanReviewMode};
+
+            // ── Text-entry sub-mode: raw keys edit the buffer. ────────
+            if let Some(edit) = state.editing.as_mut() {
+                match code {
+                    KeyCode::Enter => {
+                        // Commit buffer → items[index]; return to Edit.
+                        if let Some(slot) = state.items.get_mut(edit.index) {
+                            *slot = std::mem::take(&mut edit.buffer);
+                        }
+                        state.editing = None;
+                    }
+                    KeyCode::Esc => {
+                        // Drop edits, return to Edit list.
+                        state.editing = None;
+                    }
+                    KeyCode::Backspace => {
+                        if edit.cursor > 0 {
+                            let prev = prev_char_boundary_str(&edit.buffer, edit.cursor);
+                            edit.buffer.drain(prev..edit.cursor);
+                            edit.cursor = prev;
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if edit.cursor < edit.buffer.len() {
+                            let next = next_char_boundary_str(&edit.buffer, edit.cursor);
+                            edit.buffer.drain(edit.cursor..next);
+                        }
+                    }
+                    KeyCode::Left => {
+                        if edit.cursor > 0 {
+                            edit.cursor = prev_char_boundary_str(&edit.buffer, edit.cursor);
+                        }
+                    }
+                    KeyCode::Right => {
+                        if edit.cursor < edit.buffer.len() {
+                            edit.cursor = next_char_boundary_str(&edit.buffer, edit.cursor);
+                        }
+                    }
+                    KeyCode::Home => edit.cursor = 0,
+                    KeyCode::End => edit.cursor = edit.buffer.len(),
+                    KeyCode::Char(ch)
+                        if !mods.contains(KeyModifiers::CONTROL)
+                            && !mods.contains(KeyModifiers::ALT) =>
+                    {
+                        let mut buf = [0u8; 4];
+                        let s = ch.encode_utf8(&mut buf);
+                        edit.buffer.insert_str(edit.cursor, s);
+                        edit.cursor += s.len();
+                    }
+                    _ => {}
                 }
+                return;
             }
-            KeyCode::Enter => {
-                // Focused chip: 0 Accept · 1 Edit (not yet) · 2 Deny.
-                let sel = state.selected;
-                app.modal = None;
-                match sel {
-                    0 => app.accept_proposed_plan(),
-                    2 => app.deny_proposed_plan(),
-                    // 1 (Edit) lands in V3.f.2 — fall back to Accept for
-                    // now so Enter is never a no-op.
-                    _ => app.accept_proposed_plan(),
-                }
+
+            match state.mode {
+                // ── Review mode: action chips drive Accept / Edit / Deny. ──
+                PlanReviewMode::Review => match code {
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        app.modal = None;
+                        app.accept_proposed_plan();
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
+                        app.modal = None;
+                        app.deny_proposed_plan();
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        state.mode = PlanReviewMode::Edit;
+                        state.selected = 0;
+                    }
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        state.auto_run_pref = !state.auto_run_pref;
+                        if let Some(p) = app.proposed_plan.as_mut() {
+                            p.suggested_auto_run = state.auto_run_pref;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        // Focused chip: 0 Accept · 1 Edit · 2 Deny.
+                        let sel = state.selected;
+                        match sel {
+                            0 => {
+                                app.modal = None;
+                                app.accept_proposed_plan();
+                            }
+                            1 => {
+                                state.mode = PlanReviewMode::Edit;
+                                state.selected = 0;
+                            }
+                            _ => {
+                                app.modal = None;
+                                app.deny_proposed_plan();
+                            }
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        state.selected = state.selected.saturating_sub(1);
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        state.selected = (state.selected + 1).min(2);
+                    }
+                    KeyCode::PageDown => state.scroll = state.scroll.saturating_add(10),
+                    KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(10),
+                    KeyCode::Home | KeyCode::Char('g') => state.scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => state.scroll = u16::MAX,
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        state.scroll = state.scroll.saturating_add(1)
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.scroll = state.scroll.saturating_sub(1)
+                    }
+                    _ => {}
+                },
+                // ── Edit mode: navigate steps, add / delete / enter-to-edit. ──
+                PlanReviewMode::Edit => match code {
+                    KeyCode::Esc => {
+                        // Back to Review without committing anything (the
+                        // list itself is already committed; edits to the
+                        // list mutate items directly).
+                        state.mode = PlanReviewMode::Review;
+                        state.selected = 1; // keep focus on Edit chip
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S')
+                        if mods.contains(KeyModifiers::CONTROL) =>
+                    {
+                        // Ctrl+S commits the edited list as the accepted plan.
+                        if let Some(p) = app.proposed_plan.as_mut() {
+                            p.items = state.items.clone();
+                            p.suggested_auto_run = state.auto_run_pref;
+                        }
+                        app.modal = None;
+                        app.accept_proposed_plan();
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !state.items.is_empty() {
+                            state.selected = (state.selected + 1).min(state.items.len() - 1);
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.selected = state.selected.saturating_sub(1);
+                    }
+                    KeyCode::Enter | KeyCode::Char('i') => {
+                        if let Some(cur) = state.items.get(state.selected) {
+                            let buffer = cur.clone();
+                            let cursor = buffer.len();
+                            state.editing = Some(EditingStep {
+                                index: state.selected,
+                                buffer,
+                                cursor,
+                            });
+                        }
+                    }
+                    KeyCode::Char('a') => {
+                        // Add blank step below the focused row.
+                        let at = state.selected.saturating_add(1).min(state.items.len());
+                        state.items.insert(at, String::new());
+                        state.selected = at;
+                        if let Some(p) = app.proposed_plan.as_mut() {
+                            p.items = state.items.clone();
+                        }
+                        // Jump straight into text-entry for the new row.
+                        state.editing = Some(EditingStep {
+                            index: at,
+                            buffer: String::new(),
+                            cursor: 0,
+                        });
+                    }
+                    KeyCode::Delete | KeyCode::Char('x') => {
+                        if state.selected < state.items.len() {
+                            state.items.remove(state.selected);
+                            if state.selected >= state.items.len() && !state.items.is_empty() {
+                                state.selected = state.items.len() - 1;
+                            }
+                            if let Some(p) = app.proposed_plan.as_mut() {
+                                p.items = state.items.clone();
+                            }
+                        }
+                    }
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        state.auto_run_pref = !state.auto_run_pref;
+                        if let Some(p) = app.proposed_plan.as_mut() {
+                            p.suggested_auto_run = state.auto_run_pref;
+                        }
+                    }
+                    _ => {}
+                },
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                state.selected = state.selected.saturating_sub(1);
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                state.selected = (state.selected + 1).min(2);
-            }
-            KeyCode::PageDown => state.scroll = state.scroll.saturating_add(10),
-            KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(10),
-            KeyCode::Home | KeyCode::Char('g') => state.scroll = 0,
-            KeyCode::End | KeyCode::Char('G') => state.scroll = u16::MAX,
-            KeyCode::Down | KeyCode::Char('j') => state.scroll = state.scroll.saturating_add(1),
-            KeyCode::Up | KeyCode::Char('k') => state.scroll = state.scroll.saturating_sub(1),
-            _ => {}
-        },
+        }
     }
 }
 
@@ -4393,23 +4562,28 @@ fn git_log_body(state: &crate::ui::modal::GitLogState, t: &Theme) -> Vec<Line<'s
     out
 }
 
-/// V3.f · body of the Plan Review modal. Lists the proposed steps, the
-/// auto-run toggle, and the three action chips (Accept / Edit / Deny).
-/// Edit mode wires in during V3.f.2 — for now the Edit chip falls back
-/// to Accept.
+/// V3.f · body of the Plan Review modal. Review mode renders the action
+/// chips (Accept / Edit / Deny); Edit mode renders a focused step list
+/// with mutation hints. A third "Edit + text entry" sub-state inlines a
+/// cursor into the current row.
 fn plan_review_body(state: &crate::ui::modal::PlanReviewState, t: &Theme) -> Vec<Line<'static>> {
-    use crate::ui::modal::PlanReviewPurpose;
+    use crate::ui::modal::{PlanReviewMode, PlanReviewPurpose};
     let mut out: Vec<Line<'static>> = Vec::new();
+    let in_edit = state.mode == PlanReviewMode::Edit;
 
-    let intro = match state.purpose {
-        PlanReviewPurpose::NewPlan => format!(
+    let intro = match (state.purpose, in_edit) {
+        (PlanReviewPurpose::NewPlan, false) => format!(
             "The agent proposed a {}-step plan. Review before execution.",
             state.items.len()
         ),
-        PlanReviewPurpose::Amendment => format!(
+        (PlanReviewPurpose::Amendment, false) => format!(
             "The agent wants to amend the current plan ({} steps after amendment).",
             state.items.len()
         ),
+        (_, true) => {
+            "Edit mode · ↑↓ nav · Enter edit · a add · x delete · Ctrl+S accept · Esc back"
+                .to_string()
+        }
     };
     out.push(Line::default());
     out.push(Line::from(Span::styled(
@@ -4419,14 +4593,48 @@ fn plan_review_body(state: &crate::ui::modal::PlanReviewState, t: &Theme) -> Vec
     out.push(Line::default());
 
     for (i, step) in state.items.iter().enumerate() {
-        out.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("[ ] {:>2}. ", i + 1),
-                Style::default().fg(t.dim).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(step.clone(), Style::default().fg(t.text)),
-        ]));
+        let focused = in_edit && i == state.selected;
+        let editing = state.editing.as_ref().filter(|e| e.index == i);
+
+        let marker = if focused { "▶" } else { " " };
+        let marker_style = if focused {
+            Style::default()
+                .fg(t.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.dim)
+        };
+        let num_style = Style::default().fg(t.dim).add_modifier(Modifier::BOLD);
+        let prefix_num = format!("[ ] {:>2}. ", i + 1);
+
+        if let Some(e) = editing {
+            let (before, under, after) = split_cursor(&e.buffer, e.cursor);
+            out.push(Line::from(vec![
+                Span::styled(format!("  {marker} "), marker_style),
+                Span::styled(prefix_num, num_style),
+                Span::styled(before, Style::default().fg(t.text)),
+                Span::styled(
+                    under,
+                    Style::default()
+                        .fg(t.text)
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                ),
+                Span::styled(after, Style::default().fg(t.text)),
+            ]));
+        } else {
+            out.push(Line::from(vec![
+                Span::styled(format!("  {marker} "), marker_style),
+                Span::styled(prefix_num, num_style),
+                Span::styled(step.clone(), Style::default().fg(t.text)),
+            ]));
+        }
+    }
+
+    if in_edit && state.items.is_empty() {
+        out.push(Line::from(Span::styled(
+            "  (empty — press `a` to add the first step)",
+            Style::default().fg(t.dim),
+        )));
     }
 
     out.push(Line::default());
@@ -4448,35 +4656,57 @@ fn plan_review_body(state: &crate::ui::modal::PlanReviewState, t: &Theme) -> Vec
     ]));
     out.push(Line::default());
 
-    // Action chips. Selected chip is inverted for contrast.
-    let chip = |label: &str, idx: usize, color: Color| -> Span<'static> {
-        let focused = state.selected == idx;
-        let style = if focused {
-            Style::default()
-                .fg(Color::Rgb(0, 0, 0))
-                .bg(color)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            Style::default().fg(color).add_modifier(Modifier::BOLD)
+    if !in_edit {
+        // Action chips — Review mode only.
+        let chip = |label: &str, idx: usize, color: Color| -> Span<'static> {
+            let focused = state.selected == idx;
+            let style = if focused {
+                Style::default()
+                    .fg(Color::Rgb(0, 0, 0))
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            };
+            Span::styled(format!("  {label}  "), style)
         };
-        Span::styled(format!("  {label}  "), style)
-    };
-    out.push(Line::from(vec![
-        Span::raw("  "),
-        chip("Accept", 0, t.success),
-        Span::raw("  "),
-        chip("Edit", 1, t.accent),
-        Span::raw("  "),
-        chip("Deny", 2, t.error),
-    ]));
-
-    out.push(Line::default());
-    out.push(Line::from(Span::styled(
-        "  Shortcuts: a Accept · e Edit · d Deny · t toggle auto-run · Esc / d to cancel",
-        Style::default().fg(t.dim),
-    )));
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            chip("Accept", 0, t.success),
+            Span::raw("  "),
+            chip("Edit", 1, t.accent),
+            Span::raw("  "),
+            chip("Deny", 2, t.error),
+        ]));
+        out.push(Line::default());
+        out.push(Line::from(Span::styled(
+            "  a Accept · e Edit · d Deny · t toggle auto-run · Esc / d to cancel",
+            Style::default().fg(t.dim),
+        )));
+    } else {
+        out.push(Line::from(Span::styled(
+            "  ↑↓ nav · Enter edit · a add · x delete · t toggle auto-run · Ctrl+S accept · Esc back",
+            Style::default().fg(t.dim),
+        )));
+    }
 
     out
+}
+
+/// Split a buffer at `cursor` into `(before, under, after)` where `under`
+/// is the single char at the cursor (or " " when at end-of-buffer).
+fn split_cursor(s: &str, cursor: usize) -> (String, String, String) {
+    let cursor = cursor.min(s.len());
+    let before = s[..cursor].to_string();
+    let rest = &s[cursor..];
+    let (under, after) = match rest.chars().next() {
+        Some(c) => {
+            let cb = c.len_utf8();
+            (rest[..cb].to_string(), rest[cb..].to_string())
+        }
+        None => (" ".to_string(), String::new()),
+    };
+    (before, under, after)
 }
 
 fn plan_full_lines(plan: &crate::plan::Plan, t: &Theme) -> Vec<Line<'static>> {
@@ -6448,6 +6678,60 @@ I'll take it from here.",
         assert_eq!(a.plan.count_done(), 1);
         let second = &a.plan.items[1];
         assert_eq!(second.status, crate::plan::Status::Active);
+    }
+
+    /// V3.f.2 · edit flow: navigate into edit mode, delete a step, add
+    /// a fresh one, Ctrl+S commits as the active plan.
+    #[tokio::test]
+    async fn plan_review_edit_delete_add_accept() {
+        use crate::ui::modal::{EditingStep, PlanReviewMode};
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("[[PLAN_SET: alpha | beta | gamma]]"));
+
+        // Enter Edit mode.
+        handle_modal_key(KeyCode::Char('e'), KeyModifiers::NONE, &mut a, None).await;
+        match &a.modal {
+            Some(Modal::PlanReview(s)) => assert_eq!(s.mode, PlanReviewMode::Edit),
+            _ => unreachable!(),
+        }
+
+        // Focus beta (index 1), delete it. After deletion items = ["alpha", "gamma"].
+        handle_modal_key(KeyCode::Down, KeyModifiers::NONE, &mut a, None).await;
+        handle_modal_key(KeyCode::Char('x'), KeyModifiers::NONE, &mut a, None).await;
+        match &a.modal {
+            Some(Modal::PlanReview(s)) => {
+                assert_eq!(s.items, vec!["alpha".to_string(), "gamma".to_string()]);
+            }
+            _ => unreachable!(),
+        }
+
+        // Add a step below gamma, commit its buffer directly, exit text entry.
+        handle_modal_key(KeyCode::Down, KeyModifiers::NONE, &mut a, None).await;
+        handle_modal_key(KeyCode::Char('a'), KeyModifiers::NONE, &mut a, None).await;
+        // `a` inserted a blank row AND entered text-entry on it.
+        match a.modal.as_mut() {
+            Some(Modal::PlanReview(s)) => {
+                assert!(s.editing.is_some());
+                // Manually stuff the buffer to avoid driving 10 char
+                // keypresses through the handler.
+                s.editing = Some(EditingStep {
+                    index: s.selected,
+                    buffer: "delta".into(),
+                    cursor: 5,
+                });
+            }
+            _ => unreachable!(),
+        }
+        // Enter commits the buffer back into items[index].
+        handle_modal_key(KeyCode::Enter, KeyModifiers::NONE, &mut a, None).await;
+
+        // Ctrl+S accepts the edited draft.
+        handle_modal_key(KeyCode::Char('s'), KeyModifiers::CONTROL, &mut a, None).await;
+        assert!(a.modal.is_none(), "modal should close on Ctrl+S accept");
+        assert!(a.proposed_plan.is_none(), "proposal cleared after accept");
+        let items: Vec<String> = a.plan.items.iter().map(|i| i.text.clone()).collect();
+        assert_eq!(items, vec!["alpha", "gamma", "delta"]);
     }
 
     /// V3.f · parsing pulls from agent_end.messages, not the transcript
