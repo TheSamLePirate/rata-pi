@@ -3,6 +3,7 @@ mod app;
 mod cli;
 mod clipboard;
 mod files;
+mod git;
 mod history;
 mod log;
 mod rpc;

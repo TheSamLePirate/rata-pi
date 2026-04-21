@@ -260,6 +260,9 @@ struct App {
     last_event_tick: u64,
     turn_count: u32,
     last_sec_tick: u64,
+
+    // ── V2.7: git status (refreshed on stats_tick) ───────────────────────
+    git_status: Option<crate::git::GitStatus>,
 }
 
 impl App {
@@ -296,6 +299,7 @@ impl App {
             last_event_tick: 0,
             turn_count: 0,
             last_sec_tick: 0,
+            git_status: None,
         }
     }
 
@@ -760,6 +764,17 @@ async fn bootstrap(client: &RpcClient, app: &mut App) {
             .collect();
     }
     refresh_stats(client, app).await;
+    refresh_git(app);
+}
+
+/// Re-read git status on the low-rate ticker so the header chip is live.
+fn refresh_git(app: &mut App) {
+    let st = crate::git::status();
+    if st.is_repo {
+        app.git_status = Some(st);
+    } else {
+        app.git_status = None;
+    }
 }
 
 async fn refresh_stats(client: &RpcClient, app: &mut App) {
@@ -905,6 +920,7 @@ async fn ui_loop(
             }
             _ = stats_tick.tick() => {
                 if let Some(c) = client { refresh_stats(c, app).await; }
+                refresh_git(app);
             }
         }
     }
@@ -1275,10 +1291,42 @@ async fn handle_modal_key(
         return;
     };
     match modal {
-        Modal::Stats(_) | Modal::Help => match code {
-            KeyCode::Esc | KeyCode::Enter => app.modal = None,
-            _ => {}
-        },
+        Modal::Stats(_) | Modal::Help | Modal::Diff(_) | Modal::GitStatus(_) | Modal::GitLog(_) => {
+            match code {
+                KeyCode::Esc | KeyCode::Enter => app.modal = None,
+                _ => {}
+            }
+        }
+        Modal::GitBranch(state) => {
+            let n = state.branches.len();
+            if handle_list_keys(&mut state.query, &mut state.selected, code, n) {
+                return;
+            }
+            match code {
+                KeyCode::Esc => app.modal = None,
+                KeyCode::Enter => {
+                    let pick = state
+                        .branches
+                        .iter()
+                        .filter(|b| {
+                            state.query.is_empty()
+                                || b.name
+                                    .to_ascii_lowercase()
+                                    .contains(&state.query.to_ascii_lowercase())
+                        })
+                        .nth(state.selected)
+                        .map(|b| b.name.clone());
+                    app.modal = None;
+                    if let Some(name) = pick {
+                        match crate::git::switch(&name) {
+                            Ok(_) => app.flash(format!("switched to {name}")),
+                            Err(e) => app.flash(format!("switch failed: {e}")),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         Modal::Commands(list) => {
             let n = filtered_count_commands(&list.items, &list.query);
             if handle_list_keys(&mut list.query, &mut list.selected, code, n) {
@@ -1854,6 +1902,92 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
         }
         "find" | "files" => {
             open_file_finder(app, arg.to_string(), crate::ui::modal::FilePickMode::Insert);
+            true
+        }
+        // ── git (all local: we shell out to `git`) ───────────────────
+        "status" => {
+            let st = crate::git::status();
+            app.modal = Some(Modal::GitStatus(Box::new(st)));
+            true
+        }
+        "diff" => {
+            let staged = arg.contains("--staged") || arg.contains("--cached");
+            match crate::git::diff(staged) {
+                Ok(d) => {
+                    app.modal = Some(Modal::Diff(crate::ui::modal::DiffView {
+                        title: if staged {
+                            "staged changes".into()
+                        } else {
+                            "working-tree changes".into()
+                        },
+                        staged,
+                        diff: d,
+                    }));
+                }
+                Err(e) => app.flash(format!("git diff failed: {e}")),
+            }
+            true
+        }
+        "git-log" => {
+            let n: u32 = if arg.is_empty() {
+                30
+            } else {
+                arg.parse().unwrap_or(30)
+            };
+            match crate::git::log(n) {
+                Ok(commits) => {
+                    app.modal = Some(Modal::GitLog(crate::ui::modal::GitLogState {
+                        commits,
+                        selected: 0,
+                    }));
+                }
+                Err(e) => app.flash(format!("git log failed: {e}")),
+            }
+            true
+        }
+        "branch" => {
+            match crate::git::branches() {
+                Ok(bs) => {
+                    app.modal = Some(Modal::GitBranch(crate::ui::modal::GitBranchState {
+                        branches: bs,
+                        query: String::new(),
+                        selected: 0,
+                    }));
+                }
+                Err(e) => app.flash(format!("git branch failed: {e}")),
+            }
+            true
+        }
+        "switch-branch" => {
+            if arg.is_empty() {
+                app.flash("usage: /switch-branch <name>");
+            } else {
+                match crate::git::switch(arg) {
+                    Ok(_) => app.flash(format!("switched to {arg}")),
+                    Err(e) => app.flash(format!("switch failed: {e}")),
+                }
+            }
+            true
+        }
+        "commit" => {
+            if arg.is_empty() {
+                app.flash("usage: /commit <message>");
+            } else {
+                match crate::git::commit_all(arg) {
+                    Ok(o) => {
+                        let head = o.lines().next().unwrap_or("committed");
+                        app.flash(format!("commit: {head}"));
+                    }
+                    Err(e) => app.flash(format!("commit failed: {e}")),
+                }
+            }
+            true
+        }
+        "stash" => {
+            match crate::git::stash() {
+                Ok(o) => app.flash(o.lines().next().unwrap_or("stashed").to_string()),
+                Err(e) => app.flash(format!("stash failed: {e}")),
+            }
             true
         }
         "doctor" => {
@@ -2663,7 +2797,7 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let heartbeat_pct = crate::anim::ease::triangle(((app.ticks % 10) as f64) / 10.0);
     let heartbeat_sym = if heartbeat_pct > 0.5 { "●" } else { "○" };
 
-    let line = Line::from(vec![
+    let mut line_spans = vec![
         Span::styled(
             " rata-pi ",
             Style::default()
@@ -2682,7 +2816,39 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
         status,
         thinking_badge,
         Span::styled(queue, Style::default().fg(t.dim)),
-    ]);
+    ];
+    // Git chip: only when inside a repo. Shows `  ⎇ branch●` where the dot
+    // is warning-colored when dirty, success-colored when clean.
+    if let Some(g) = &app.git_status
+        && g.is_repo
+    {
+        let branch = g.branch.as_deref().unwrap_or("DETACHED");
+        let dirty = g.dirty();
+        line_spans.extend([
+            Span::raw("  "),
+            Span::styled(
+                "⎇ ",
+                Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                branch.to_string(),
+                Style::default()
+                    .fg(if dirty { t.warning } else { t.success })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if dirty { "●" } else { "○" },
+                Style::default().fg(if dirty { t.warning } else { t.success }),
+            ),
+        ]);
+        if g.ahead > 0 || g.behind > 0 {
+            line_spans.push(Span::styled(
+                format!(" ↑{} ↓{}", g.ahead, g.behind),
+                Style::default().fg(t.dim),
+            ));
+        }
+    }
+    let line = Line::from(line_spans);
     f.render_widget(Paragraph::new(line), area);
 }
 
@@ -3988,12 +4154,38 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         ),
         Modal::Files(ff) => (
             format!(" {} ", ff.title),
-            // Actual body is rebuilt below once list_area is known so the
-            // scroll math is width-accurate (same trick as Commands).
             Text::default(),
             ff.hint.clone(),
             120,
             26,
+        ),
+        Modal::Diff(d) => (
+            format!(" {} ", if d.staged { "diff --staged" } else { "diff" }),
+            Text::from(diff_body_lines(d, theme)),
+            "PgUp/PgDn scroll · Esc close".to_string(),
+            140,
+            40,
+        ),
+        Modal::GitStatus(s) => (
+            " git status ".to_string(),
+            Text::from(git_status_body(s, theme)),
+            "Esc close".to_string(),
+            70,
+            18,
+        ),
+        Modal::GitLog(state) => (
+            " git log ".to_string(),
+            Text::from(git_log_body(state, theme)),
+            "↑↓ scroll · Esc close".to_string(),
+            110,
+            30,
+        ),
+        Modal::GitBranch(state) => (
+            " branches ".to_string(),
+            Text::from(git_branch_body(state, theme)),
+            "type filter · Enter switch · Esc close".to_string(),
+            70,
+            24,
         ),
         Modal::ExtSelect {
             title,
@@ -4272,6 +4464,165 @@ fn file_preview_lines(ff: &crate::ui::modal::FileFinder, t: &Theme) -> Vec<Line<
         Style::default().fg(t.dim),
     )));
     lines
+}
+
+// ─────────────────────────────────────────────────────────── git bodies ──
+
+fn diff_body_lines(d: &crate::ui::modal::DiffView, t: &Theme) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    out.push(Line::from(vec![Span::styled(
+        format!("  {}", d.title),
+        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+    )]));
+    out.push(Line::default());
+    if d.diff.trim().is_empty() {
+        out.push(Line::from(Span::styled(
+            "  (no changes)",
+            Style::default().fg(t.dim),
+        )));
+        return out;
+    }
+    out.extend(crate::ui::diff::render(&d.diff, t));
+    out
+}
+
+fn git_status_body(s: &crate::git::GitStatus, t: &Theme) -> Vec<Line<'static>> {
+    if !s.is_repo {
+        return vec![Line::from(Span::styled(
+            "  (not a git repository)",
+            Style::default().fg(t.dim),
+        ))];
+    }
+    let mut out = Vec::new();
+    let dirty_dot = if s.dirty() {
+        Span::styled(
+            " ●",
+            Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(" ○", Style::default().fg(t.success))
+    };
+    out.push(Line::from(vec![
+        Span::styled(
+            "  branch  ",
+            Style::default().fg(t.dim).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            s.branch.clone().unwrap_or_else(|| "(detached)".into()),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ),
+        dirty_dot,
+    ]));
+    out.push(Line::from(vec![Span::styled(
+        format!("          ahead {} · behind {}", s.ahead, s.behind,),
+        Style::default().fg(t.dim),
+    )]));
+    out.push(Line::default());
+    out.push(status_row("staged", s.staged, t.diff_add, t));
+    out.push(status_row("unstaged", s.unstaged, t.diff_remove, t));
+    out.push(status_row("untracked", s.untracked, t.warning, t));
+    out.push(Line::default());
+    out.push(Line::from(Span::styled(
+        "  hint: /diff · /diff --staged · /log · /branch · /commit <msg> · /stash",
+        Style::default().fg(t.dim),
+    )));
+    out
+}
+
+fn status_row(label: &str, count: u32, color: Color, t: &Theme) -> Line<'static> {
+    let dot = if count > 0 { "●" } else { "○" };
+    Line::from(vec![
+        Span::styled(
+            format!("  {:>10}  ", label),
+            Style::default().fg(t.dim).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{dot} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{count}"), Style::default().fg(t.text)),
+    ])
+}
+
+fn git_log_body(state: &crate::ui::modal::GitLogState, t: &Theme) -> Vec<Line<'static>> {
+    if state.commits.is_empty() {
+        return vec![Line::from(Span::styled(
+            "  (no commits)",
+            Style::default().fg(t.dim),
+        ))];
+    }
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(state.commits.len() + 2);
+    out.push(Line::from(vec![Span::styled(
+        format!("  {} commits", state.commits.len()),
+        Style::default().fg(t.dim),
+    )]));
+    out.push(Line::default());
+    for c in &state.commits {
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<8}  ", c.hash),
+                Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<20}  ", truncate_preview(&c.author, 20)),
+                Style::default().fg(t.accent),
+            ),
+            Span::styled(
+                format!("{:<14}  ", truncate_preview(&c.date, 14)),
+                Style::default().fg(t.dim),
+            ),
+            Span::styled(c.subject.clone(), Style::default().fg(t.text)),
+        ]));
+    }
+    out
+}
+
+fn git_branch_body(state: &crate::ui::modal::GitBranchState, t: &Theme) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::from(vec![
+        Span::styled("filter: ", Style::default().fg(t.dim)),
+        Span::styled(
+            state.query.clone(),
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    out.push(Line::default());
+    let q = state.query.to_ascii_lowercase();
+    let filtered: Vec<&crate::git::Branch> = state
+        .branches
+        .iter()
+        .filter(|b| q.is_empty() || b.name.to_ascii_lowercase().contains(&q))
+        .collect();
+    if filtered.is_empty() {
+        out.push(Line::from(Span::styled(
+            "(no matches)",
+            Style::default().fg(t.dim),
+        )));
+        return out;
+    }
+    for (i, b) in filtered.iter().enumerate() {
+        let is_sel = i == state.selected;
+        let marker = if is_sel { "▸" } else { " " };
+        let chip = if b.current {
+            Span::styled(
+                " (current) ",
+                Style::default().fg(t.success).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("")
+        };
+        let style = if is_sel {
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.text)
+        };
+        out.push(Line::from(vec![
+            Span::styled(format!("  {marker} "), style),
+            Span::styled(b.name.clone(), style),
+            chip,
+        ]));
+    }
+    out
 }
 
 fn commands_selected_line(list: &ListModal<crate::ui::commands::MenuItem>) -> u16 {

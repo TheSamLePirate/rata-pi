@@ -8,6 +8,7 @@
 use ratatui::layout::Rect;
 
 use crate::files::FileList;
+use crate::git::{Branch, Commit, GitStatus};
 use crate::history::HistoryEntry;
 use crate::rpc::types::{ForkMessage, Model, SessionStats, ThinkingLevel};
 use crate::ui::commands::MenuItem;
@@ -46,7 +47,19 @@ pub enum Modal {
     Forks(ListModal<ForkMessage>),
     /// Fuzzy file finder — Ctrl+P, /find, @path.
     Files(FileFinder),
+
+    // ── V2.7: git ────────────────────────────────────────────────────────
+    /// Full-screen diff viewer using the V2.3 diff widget.
+    Diff(DiffView),
+    /// Status summary.
+    GitStatus(Box<GitStatus>),
+    /// Commit log picker.
+    GitLog(GitLogState),
+    /// Branch picker.
+    GitBranch(GitBranchState),
+
     Help,
+
     /// Extension UI dialog: select from a list of strings.
     ExtSelect {
         request_id: String,
@@ -75,6 +88,28 @@ pub enum Modal {
         title: String,
         value: String,
     },
+}
+
+#[derive(Debug)]
+pub struct DiffView {
+    pub title: String,
+    pub staged: bool,
+    pub diff: String,
+}
+
+#[derive(Debug)]
+pub struct GitLogState {
+    pub commits: Vec<Commit>,
+    /// Reserved for per-entry detail pane in a future revision.
+    #[allow(dead_code)]
+    pub selected: usize,
+}
+
+#[derive(Debug)]
+pub struct GitBranchState {
+    pub branches: Vec<Branch>,
+    pub query: String,
+    pub selected: usize,
 }
 
 /// A scrollable, filterable list of items.

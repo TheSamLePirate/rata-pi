@@ -20,6 +20,7 @@ pub enum Category {
     Model,
     PiRuntime,
     View,
+    Git,
     Debug,
     Extension,
     Prompt,
@@ -35,6 +36,7 @@ impl Category {
             Self::Model => "model",
             Self::PiRuntime => "pi runtime",
             Self::View => "view",
+            Self::Git => "git",
             Self::Debug => "debug",
             Self::Extension => "extension",
             Self::Prompt => "prompt",
@@ -50,6 +52,7 @@ impl Category {
             Self::Model => "✦",
             Self::PiRuntime => "⚙",
             Self::View => "◉",
+            Self::Git => "⎇",
             Self::Debug => "⌕",
             Self::Extension => "●",
             Self::Prompt => "▸",
@@ -66,11 +69,12 @@ impl Category {
             Self::Model => 2,
             Self::PiRuntime => 3,
             Self::View => 4,
-            Self::Theme => 5,
-            Self::Debug => 6,
-            Self::Extension => 7,
-            Self::Prompt => 8,
-            Self::Skill => 9,
+            Self::Git => 5,
+            Self::Theme => 6,
+            Self::Debug => 7,
+            Self::Extension => 8,
+            Self::Prompt => 9,
+            Self::Skill => 10,
         }
     }
 }
@@ -289,6 +293,38 @@ pub fn builtins() -> Vec<MenuItem> {
             "[query]",
             "/find app"
         ),
+        // ── git ──────────────────────────────────────────────────────────
+        b!(Git, "status", "git status summary", "", "/status"),
+        b!(
+            Git,
+            "diff",
+            "diff viewer (unstaged, or --staged)",
+            "[--staged]",
+            "/diff --staged"
+        ),
+        b!(
+            Git,
+            "git-log",
+            "recent commits picker",
+            "[n]",
+            "/git-log 20"
+        ),
+        b!(Git, "branch", "list + switch branches", "", "/branch"),
+        b!(
+            Git,
+            "switch-branch",
+            "checkout a branch by name",
+            "<name>",
+            "/switch-branch feat/x"
+        ),
+        b!(
+            Git,
+            "commit",
+            "commit tracked changes with message",
+            "<message>",
+            "/commit wire it up"
+        ),
+        b!(Git, "stash", "git stash push", "", "/stash"),
         // ── debug ────────────────────────────────────────────────────────
         b!(Debug, "doctor", "basic readiness check", "", "/doctor"),
         b!(Debug, "version", "show rata-pi version", "", "/version"),
