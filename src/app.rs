@@ -3872,7 +3872,10 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         ),
         Modal::Commands(list) => (
             format!(" {} ", list.title),
-            commands_text(list, theme),
+            // The actual list-width-aware body is rebuilt below once we
+            // know the split rects. Use a placeholder here; the real text
+            // is assigned after `list_area` is computed.
+            Text::default(),
             list.hint.clone(),
             120,
             26,
@@ -3965,8 +3968,41 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    // For list-style modals, scroll the body so the selected row stays in
-    // the viewport (centered where possible).
+    // Two-pane layout when this is a Commands modal AND the terminal is
+    // wide enough: left ~60% = list, right ~40% = detail pane.
+    let (list_area, detail_area) = match modal {
+        Modal::Commands(_) if inner.width >= 80 => {
+            let left_w = (inner.width * 6) / 10;
+            let right_w = inner.width - left_w - 1;
+            let list_rect = Rect::new(inner.x, inner.y, left_w, inner.height);
+            let rule_rect = Rect::new(inner.x + left_w, inner.y, 1, inner.height);
+            let detail_rect = Rect::new(inner.x + left_w + 1, inner.y, right_w, inner.height);
+            for dy in 0..inner.height {
+                let r = Rect::new(rule_rect.x, rule_rect.y + dy, 1, 1);
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled("│", Style::default().fg(t.dim)))),
+                    r,
+                );
+            }
+            (list_rect, Some(detail_rect))
+        }
+        _ => (inner, None),
+    };
+
+    // Reserve the scrollbar column up front so we can build the body text
+    // at the correct width (which lets `commands_text` truncate instead
+    // of wrap). This keeps rendered-rows == source-rows so the scroll
+    // cap lands precisely on the last item.
+    let list_width_full = list_area.width;
+    let text_width = list_width_full.saturating_sub(1).max(1);
+
+    // Rebuild the Commands body now that we know the list width.
+    let body_owned = match modal {
+        Modal::Commands(l) => commands_text(l, t, text_width),
+        _ => body,
+    };
+
+    // For list-style modals, center the selected row.
     let selected_line = match modal {
         Modal::Commands(l) => Some(commands_selected_line(l)),
         Modal::Models(l) => Some(2 + l.selected as u16),
@@ -3976,8 +4012,12 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         _ => None,
     };
 
-    let body_owned = body;
-    let total_lines = body_owned.lines.len() as u16;
+    // Authoritative rendered-row count = ratatui's own wrap math.
+    let source_lines = body_owned.lines.len() as u16;
+    let rendered = Paragraph::new(body_owned.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(text_width) as u16;
+    let total_lines = rendered.max(source_lines);
     let viewport = inner.height;
     let scroll_y = if let Some(line) = selected_line {
         if total_lines > viewport {
@@ -3991,34 +4031,11 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         0
     };
 
-    // Two-pane layout when this is a Commands modal AND the terminal is
-    // wide enough: left ~60% = list, right ~40% = detail pane.
-    let (list_area, detail_area) = match modal {
-        Modal::Commands(_) if inner.width >= 80 => {
-            let left_w = (inner.width * 6) / 10;
-            let right_w = inner.width - left_w - 1; // 1 col vertical rule
-            let list_rect = Rect::new(inner.x, inner.y, left_w, inner.height);
-            let rule_rect = Rect::new(inner.x + left_w, inner.y, 1, inner.height);
-            let detail_rect = Rect::new(inner.x + left_w + 1, inner.y, right_w, inner.height);
-            // Vertical rule between the panes.
-            for dy in 0..inner.height {
-                let r = Rect::new(rule_rect.x, rule_rect.y + dy, 1, 1);
-                f.render_widget(
-                    Paragraph::new(Line::from(Span::styled("│", Style::default().fg(t.dim)))),
-                    r,
-                );
-            }
-            (list_rect, Some(detail_rect))
-        }
-        _ => (inner, None),
-    };
-
-    // List pane, with its own scrollbar.
+    // Render the scrollbar when needed and compute the main text rect.
     let main_area = if total_lines > viewport && list_area.width > 2 {
-        let w = list_area.width.saturating_sub(1);
-        let sbar = Rect::new(list_area.x + w, list_area.y, 1, list_area.height);
+        let sbar = Rect::new(list_area.x + text_width, list_area.y, 1, list_area.height);
         draw_scrollbar(f, sbar, scroll_y, viewport, total_lines, t);
-        Rect::new(list_area.x, list_area.y, w, list_area.height)
+        Rect::new(list_area.x, list_area.y, text_width, list_area.height)
     } else {
         list_area
     };
@@ -4226,7 +4243,11 @@ fn label_value(k: &str, v: impl Into<String>, t: &Theme) -> Line<'static> {
 /// The caller (draw_modal) renders this `Text` in the LEFT pane and uses
 /// `command_detail_lines` to populate the RIGHT pane with the focused
 /// item's description + argument + example.
-fn commands_text(list: &ListModal<crate::ui::commands::MenuItem>, t: &Theme) -> Text<'static> {
+fn commands_text(
+    list: &ListModal<crate::ui::commands::MenuItem>,
+    t: &Theme,
+    list_width: u16,
+) -> Text<'static> {
     use crate::ui::commands::Category;
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -4287,22 +4308,39 @@ fn commands_text(list: &ListModal<crate::ui::commands::MenuItem>, t: &Theme) -> 
             crate::rpc::types::CommandSource::Skill => "skill",
             crate::rpc::types::CommandSource::Builtin => "builtin",
         };
-        let mut spans = vec![Span::styled(format!("  {marker} /{}", it.name), name_style)];
-        if !it.args.is_empty() {
-            spans.push(Span::styled(
-                format!(" {}", it.args),
-                Style::default().fg(t.warning),
-            ));
+        // Build the primary item row, truncated to the list pane width so
+        // it never wraps — the scroll math needs rendered rows == source
+        // rows for the scroll cap to land on the last item.
+        let raw_main = format!("  {marker} /{}", it.name);
+        let args_piece = if it.args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", it.args)
+        };
+        let badge_piece = format!("   [{badge}]");
+        // Budget: list_width cells total. The badge sits at the end; the
+        // name + args occupy the rest. Truncate the name if necessary.
+        let available = list_width as usize;
+        let badge_len = badge_piece.chars().count();
+        let args_len = args_piece.chars().count();
+        let name_budget = available.saturating_sub(badge_len + args_len);
+        let name_trunc = if raw_main.chars().count() > name_budget {
+            truncate_preview(&raw_main, name_budget)
+        } else {
+            raw_main
+        };
+        let mut spans = vec![Span::styled(name_trunc, name_style)];
+        if !args_piece.is_empty() {
+            spans.push(Span::styled(args_piece, Style::default().fg(t.warning)));
         }
-        spans.push(Span::styled(
-            format!("   [{badge}]"),
-            Style::default().fg(t.dim),
-        ));
+        spans.push(Span::styled(badge_piece, Style::default().fg(t.dim)));
         lines.push(Line::from(spans));
-        // Sub-line description dimmed (wraps naturally if too long).
+        // Description: indent 6, truncate to fit so it never wraps.
         if !it.description.is_empty() {
+            let desc_w = (list_width as usize).saturating_sub(6);
+            let desc_trunc = truncate_preview(&it.description, desc_w);
             lines.push(Line::from(Span::styled(
-                format!("      {}", it.description),
+                format!("      {desc_trunc}"),
                 Style::default().fg(t.dim),
             )));
         }
