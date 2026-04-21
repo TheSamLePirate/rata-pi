@@ -59,7 +59,7 @@ use crate::rpc::commands::{ExtensionUiResponse, RpcCommand};
 use crate::rpc::events::{AssistantEvent, Incoming};
 use crate::rpc::types::{
     AgentMessage, AssistantBlock, CommandInfo, ContentBlock, FollowUpMode, ForkMessage, Model,
-    SessionStats, State, SteeringMode, ThinkingLevel, ToolResultPayload, UserContent,
+    SessionStats, State, SteeringMode, StopReason, ThinkingLevel, ToolResultPayload, UserContent,
 };
 use crate::theme::{self, Theme};
 use crate::ui::cards::{Card, InlineRow};
@@ -613,23 +613,53 @@ impl App {
                 self.agent_start_tick = Some(self.ticks);
                 self.tool_calls_this_turn = 0;
             }
-            Incoming::AgentEnd { .. } => {
+            Incoming::AgentEnd { messages } => {
                 self.is_streaming = false;
                 self.composer_mode = ComposerMode::Prompt;
-                self.set_live(LiveState::Idle);
                 self.tool_running = 0;
+                // V2.12.f · for non-retryable API failures (e.g. "Your
+                // credit balance is too low"), pi sets stop_reason=Error
+                // + error_message on the assistant message and closes
+                // the turn with agent_end. No stream-error event fires
+                // before this, so we MUST scan agent_end.messages for a
+                // failed assistant entry and surface it. Otherwise the
+                // user sees nothing at all.
+                let mut had_error = false;
+                for m in &messages {
+                    if let AgentMessage::Assistant {
+                        stop_reason: Some(StopReason::Error),
+                        error_message,
+                        ..
+                    } = m
+                    {
+                        had_error = true;
+                        let msg = error_message
+                            .clone()
+                            .unwrap_or_else(|| "agent ended with error".to_string());
+                        self.transcript.push(Entry::Error(format!("pi: {msg}")));
+                        if self.notify_enabled {
+                            let body = truncate_preview(&msg, 100);
+                            let _ = crate::notify::notify("pi · agent error", &body);
+                        }
+                        break;
+                    }
+                }
+                if had_error {
+                    self.set_live(LiveState::Error);
+                } else {
+                    self.set_live(LiveState::Idle);
+                }
                 // Plan-mode marker handling: scan the last assistant text
                 // for [[STEP_DONE]] / [[STEP_FAILED]] / [[PLAN_SET]] /
-                // [[PLAN_ADD]] and apply. Queue a continue follow-up for
-                // next tick if the plan is still active.
+                // [[PLAN_ADD]] and apply.
                 self.apply_plan_markers_on_agent_end();
-                if self.notify_enabled {
+                if self.notify_enabled && !had_error {
                     let dur = self
                         .agent_start_tick
                         .map(|t0| self.ticks.saturating_sub(t0))
                         .unwrap_or(0);
-                    // Notify only on turns that took ≥ 10 s (100 ticks) so
-                    // quick round-trips don't spam the desktop.
+                    // Notify only on turns that took ≥ 10 s (100 ticks)
+                    // so quick round-trips don't spam the desktop.
                     if let Some((title, body)) =
                         crate::notify::agent_end_notice(dur, 100, self.tool_calls_this_turn)
                     {
@@ -675,12 +705,13 @@ impl App {
                     self.push_tokens(approx_tokens(&delta));
                     self.transcript.append_thinking(&delta);
                 }
-                AssistantEvent::Error { reason, partial } => {
+                AssistantEvent::Error { reason, error } => {
                     self.set_live(LiveState::Error);
-                    // Try to extract a human-readable error string from
-                    // the `partial` payload pi carries with stream errors.
-                    // Shape varies across providers — probe common paths.
-                    let detail = extract_error_detail(&partial);
+                    // Pi sends the final failed AssistantMessage in the
+                    // `error` field (was mis-named `partial` in older
+                    // rata-pi — silent default-to-null was masking every
+                    // API failure). Probe it for a human-readable message.
+                    let detail = extract_error_detail(&error);
                     let msg = match detail {
                         Some(d) => format!("stream error ({reason:?}): {d}"),
                         None => format!("stream error: {reason:?}"),
@@ -880,8 +911,16 @@ fn extract_error_detail(v: &serde_json::Value) -> Option<String> {
     if let Some(s) = v.as_str() {
         return Some(s.to_string());
     }
-    // Top-level string fields.
-    for key in ["error", "message", "detail", "reason"] {
+    // Top-level string fields. `errorMessage` is the canonical field on
+    // pi's AssistantMessage; the others catch provider-direct payloads.
+    for key in [
+        "errorMessage",
+        "error_message",
+        "error",
+        "message",
+        "detail",
+        "reason",
+    ] {
         if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
             return Some(s.to_string());
         }
@@ -5600,6 +5639,7 @@ mod reducer_tests {
                     }),
                 }),
                 stop_reason: None,
+                error_message: None,
                 timestamp: 0,
                 entry_id: None,
             }),
@@ -5650,7 +5690,7 @@ mod reducer_tests {
             message: serde_json::Value::Null,
             assistant_message_event: AssistantEvent::Error {
                 reason: crate::rpc::types::ErrorReason::Error,
-                partial: serde_json::Value::Null,
+                error: serde_json::Value::Null,
             },
         });
         assert!(matches!(a.live, LiveState::Error));
@@ -5856,7 +5896,7 @@ mod reducer_tests {
             message: serde_json::Value::Null,
             assistant_message_event: AssistantEvent::Error {
                 reason: crate::rpc::types::ErrorReason::Error,
-                partial: serde_json::json!({
+                error: serde_json::json!({
                     "error": {
                         "type": "invalid_request_error",
                         "message": "Your credit balance is too low to access the Claude API."
@@ -5882,7 +5922,7 @@ mod reducer_tests {
             message: serde_json::Value::Null,
             assistant_message_event: AssistantEvent::Error {
                 reason: crate::rpc::types::ErrorReason::Error,
-                partial: serde_json::Value::Null,
+                error: serde_json::Value::Null,
             },
         });
         let last = a.transcript.entries().last().unwrap();
@@ -5898,6 +5938,130 @@ mod reducer_tests {
     #[test]
     fn extract_error_detail_returns_none_for_null() {
         assert!(extract_error_detail(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn extract_error_detail_handles_assistant_message_error_message_field() {
+        // Pi's AssistantMessage carries the error in the `errorMessage`
+        // (camelCase) field. Make sure we dig it out.
+        let v = serde_json::json!({
+            "role": "assistant",
+            "content": [],
+            "stopReason": "error",
+            "errorMessage": "Your credit balance is too low to access the Claude API."
+        });
+        assert_eq!(
+            extract_error_detail(&v).as_deref(),
+            Some("Your credit balance is too low to access the Claude API.")
+        );
+    }
+
+    // ── V2.12.f regression: "nothing shown" when API returns credit error
+
+    #[test]
+    fn agent_end_with_error_assistant_message_pushes_error_entry() {
+        // This is the exact shape pi sends for a non-retryable provider
+        // error (insufficient credits, model not found, etc.): the
+        // assistant message carries stopReason=error + errorMessage, and
+        // `agent_end.messages` includes it. No stream error event fires.
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(Incoming::AgentEnd {
+            messages: vec![AgentMessage::Assistant {
+                content: vec![],
+                api: None,
+                provider: Some("anthropic".into()),
+                model: Some("claude-haiku-4-5".into()),
+                usage: None,
+                stop_reason: Some(StopReason::Error),
+                error_message: Some(
+                    "Your credit balance is too low to access the Claude API.".into(),
+                ),
+                timestamp: 0,
+                entry_id: None,
+            }],
+        });
+        assert!(!a.is_streaming);
+        assert!(matches!(a.live, LiveState::Error));
+        let last = a.transcript.entries().last().unwrap();
+        match last {
+            Entry::Error(s) => {
+                assert!(s.contains("pi:"), "got {s}");
+                assert!(s.contains("credit balance is too low"), "got {s}");
+            }
+            other => panic!("expected Entry::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_end_parses_real_wire_json_with_error() {
+        // Belt and braces: deserialize the real JSON pi puts on the wire
+        // for a credit-error agent_end. If this parses without losing
+        // the errorMessage, we're good.
+        let wire = serde_json::json!({
+            "type": "agent_end",
+            "messages": [{
+                "role": "assistant",
+                "content": [],
+                "api": "anthropic-messages",
+                "provider": "anthropic",
+                "model": "claude-haiku-4-5",
+                "usage": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0
+                },
+                "stopReason": "error",
+                "errorMessage": "402 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your credit balance is too low to access the Claude API. Please go to Plans & Billing to upgrade or purchase credits.\"}}",
+                "timestamp": 1_713_628_800_000_i64
+            }]
+        });
+        let ev: Incoming = serde_json::from_value(wire).expect("parse agent_end");
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(ev);
+        let last = a.transcript.entries().last().unwrap();
+        match last {
+            Entry::Error(s) => {
+                assert!(s.contains("credit balance is too low"), "got {s}");
+            }
+            other => panic!("expected Entry::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_update_error_uses_correct_field_name() {
+        // Regression: AssistantEvent::Error used to declare `partial`
+        // but pi sends `error`. With #[serde(default)] the old code
+        // silently accepted the message with an empty payload and
+        // rendered "stream error: Error" with no detail. Verify we
+        // now parse the `error` field and extract errorMessage.
+        let wire = serde_json::json!({
+            "type": "message_update",
+            "message": null,
+            "assistantMessageEvent": {
+                "type": "error",
+                "reason": "error",
+                "error": {
+                    "role": "assistant",
+                    "content": [],
+                    "stopReason": "error",
+                    "errorMessage": "429 rate_limit: Too many requests"
+                }
+            }
+        });
+        let ev: Incoming = serde_json::from_value(wire).expect("parse message_update");
+        let mut a = app();
+        a.on_event(ev);
+        assert!(matches!(a.live, LiveState::Error));
+        let last = a.transcript.entries().last().unwrap();
+        match last {
+            Entry::Error(s) => {
+                assert!(s.contains("rate_limit"), "got {s}");
+            }
+            other => panic!("expected Entry::Error, got {other:?}"),
+        }
     }
 
     // ── Liveness probe ───────────────────────────────────────────────────

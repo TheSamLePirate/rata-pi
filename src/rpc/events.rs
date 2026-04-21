@@ -240,10 +240,13 @@ pub enum AssistantEvent {
         #[serde(default)]
         partial: serde_json::Value,
     },
+    /// Terminal error for this stream. Pi's wire format sends the
+    /// final (failed) `AssistantMessage` in an `error` field — NOT
+    /// `partial`. Parse it directly so we can pull `errorMessage`.
     Error {
         reason: ErrorReason,
         #[serde(default)]
-        partial: serde_json::Value,
+        error: serde_json::Value,
     },
 }
 

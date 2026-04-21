@@ -220,6 +220,11 @@ pub enum AgentMessage {
         usage: Option<Usage>,
         #[serde(default)]
         stop_reason: Option<StopReason>,
+        /// Present when `stop_reason == Error` (or rarely `Aborted`) —
+        /// carries the provider's error message, e.g. "Your credit
+        /// balance is too low to access the Claude API."
+        #[serde(default)]
+        error_message: Option<String>,
         #[serde(default)]
         timestamp: i64,
         #[serde(default)]
