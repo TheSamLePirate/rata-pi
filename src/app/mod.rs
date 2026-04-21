@@ -2323,6 +2323,103 @@ fn insert_file_ref(app: &mut App, path: &str, mode: crate::ui::modal::FilePickMo
     app.history.reset_walk();
 }
 
+/// V3.j.3 · MVP transcript search. `/search foo` case-insensitively
+/// scans the transcript for `foo`, focuses the most recent matching
+/// entry (so the user sees the card), and flashes a hit-count summary.
+/// A full highlight-and-n/N overlay lands in a future milestone.
+fn handle_search_slash(app: &mut App, arg: &str) {
+    let q = arg.trim();
+    if q.is_empty() {
+        app.flash_warn("usage: /search <text>");
+        return;
+    }
+    let needle = q.to_lowercase();
+    let mut hits: Vec<usize> = Vec::new();
+    for (i, e) in app.transcript.entries().iter().enumerate() {
+        let hay = match e {
+            Entry::User(s)
+            | Entry::Assistant(s)
+            | Entry::Thinking(s)
+            | Entry::Info(s)
+            | Entry::Warn(s)
+            | Entry::Error(s) => s.as_str(),
+            Entry::ToolCall(tc) => tc.output.as_str(),
+            Entry::BashExec(bx) => bx.output.as_str(),
+            _ => continue,
+        };
+        if hay.to_lowercase().contains(&needle) {
+            hits.push(i);
+        }
+    }
+    if hits.is_empty() {
+        app.flash_warn(format!("no matches for {q:?}"));
+        return;
+    }
+    // Focus the most recent hit so the user lands on the answer.
+    let idx = *hits.last().unwrap();
+    app.focus_idx = Some(idx);
+    app.scroll = None;
+    app.flash_success(format!(
+        "{} match{} for {q:?} — focused latest",
+        hits.len(),
+        if hits.len() == 1 { "" } else { "es" }
+    ));
+}
+
+/// V3.j.4 · `/template` dispatcher.
+fn handle_template_slash(app: &mut App, arg: &str) {
+    let mut parts = arg.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("").trim();
+    match sub {
+        "" | "list" => {
+            let names = crate::templates::list_names();
+            if names.is_empty() {
+                app.flash_info("no templates saved yet — /template save <name> first");
+            } else {
+                app.flash_info(format!("templates: {}", names.join(" · ")));
+            }
+        }
+        "save" if !rest.is_empty() => {
+            let body = app.composer.text();
+            if body.trim().is_empty() {
+                app.flash_warn("composer is empty — nothing to save");
+                return;
+            }
+            crate::templates::put(rest, &body);
+            app.flash_success(format!("saved template {rest:?}"));
+        }
+        "save" => {
+            app.flash_warn("usage: /template save <name>");
+        }
+        "use" | "load" if !rest.is_empty() => match crate::templates::get(rest) {
+            Some(body) => {
+                app.composer.set_text(&body);
+                app.flash_success(format!("loaded template {rest:?}"));
+            }
+            None => {
+                app.flash_error(format!("no template {rest:?}"));
+            }
+        },
+        "use" | "load" => {
+            app.flash_warn("usage: /template use <name>");
+        }
+        "delete" | "rm" if !rest.is_empty() => {
+            if crate::templates::delete(rest) {
+                app.flash_success(format!("deleted template {rest:?}"));
+            } else {
+                app.flash_error(format!("no template {rest:?}"));
+            }
+        }
+        "delete" | "rm" => {
+            app.flash_warn("usage: /template delete <name>");
+        }
+        _ => {
+            app.flash_warn("/template <save|use|list|delete> [name]");
+        }
+    }
+}
+
 fn handle_plan_slash(app: &mut App, arg: &str) {
     let mut parts = arg.splitn(2, char::is_whitespace);
     let sub = parts.next().unwrap_or("");
@@ -2682,6 +2779,21 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
         }
         "settings" | "prefs" | "preferences" => {
             app.modal = Some(Modal::Settings(crate::ui::modal::SettingsState::default()));
+            true
+        }
+        // V3.j.4 · composer templates. Stored in
+        // <config_dir>/rata-pi/templates.json; one line per subcommand.
+        "template" | "tpl" => {
+            handle_template_slash(app, arg);
+            true
+        }
+        // V3.j.3 · lightweight transcript search. Focuses the most
+        // recent matching entry; cycles backward with repeated calls
+        // against the same query. Full match-highlight overlay is
+        // a follow-up — MVP covers the "where did we discuss X"
+        // use case.
+        "search" | "find-in-transcript" => {
+            handle_search_slash(app, arg);
             true
         }
         "notify" => {

@@ -12,6 +12,7 @@ mod log;
 mod notify;
 mod plan;
 mod rpc;
+mod templates;
 mod term_caps;
 mod theme;
 mod ui;

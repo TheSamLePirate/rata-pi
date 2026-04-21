@@ -364,6 +364,22 @@ pub fn builtins() -> Vec<MenuItem> {
             "",
             "/shortcuts"
         ),
+        // V3.j.4 · composer templates.
+        b!(
+            Session,
+            "template",
+            "save / use / list / delete composer templates (alias: /tpl)",
+            "<save|use|list|delete> [name]",
+            "/template save review-pr"
+        ),
+        // V3.j.3 · transcript search (MVP: jump-to-latest-match).
+        b!(
+            Transcript,
+            "search",
+            "find text in the transcript and focus the most recent match",
+            "<text>",
+            "/search insufficient credits"
+        ),
         // ── debug ────────────────────────────────────────────────────────
         b!(
             Debug,
