@@ -175,7 +175,6 @@ impl RpcClient {
     /// Reply to an `extension_ui_request`. Does not go through command
     /// correlation — the `id` field on the response matches the request, not
     /// one of our outgoing request ids. Consumed by the M4 extension UI router.
-    #[allow(dead_code)]
     pub async fn send_ext_ui_response(&self, resp: ExtensionUiResponse) -> Result<(), RpcError> {
         let json =
             serde_json::to_string(&resp).map_err(|e| RpcError::Send(format!("serialize: {e}")))?;

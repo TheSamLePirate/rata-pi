@@ -63,8 +63,14 @@ default = []
 notify = ["dep:notify-rust"]
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
+#
+# V2.11.3 · flipped opt-level from "s" (size-optimized) to 3 (speed).
+# A TUI has no size constraint — the previous 4.2 MB release binary is
+# already well under anything that matters. The markdown/syntect work on
+# the draw path + the per-entry visuals cache benefit measurably from
+# full inlining.
 [profile.release]
 codegen-units = 1
 lto = true
-opt-level = "s"
+opt-level = 3
 strip = true

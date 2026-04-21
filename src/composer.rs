@@ -224,7 +224,9 @@ impl Composer {
     pub fn word_right(&mut self) {
         // Skip current word if we're on one.
         while self.col < self.lines[self.row].len() {
-            let c = self.lines[self.row][self.col..].chars().next().unwrap();
+            let Some(c) = self.lines[self.row][self.col..].chars().next() else {
+                break;
+            };
             if !(c.is_alphanumeric() || c == '_') {
                 break;
             }
@@ -242,7 +244,9 @@ impl Composer {
                 self.col = 0;
                 continue;
             }
-            let c = line[self.col..].chars().next().unwrap();
+            let Some(c) = line[self.col..].chars().next() else {
+                return;
+            };
             if c.is_alphanumeric() || c == '_' {
                 return;
             }

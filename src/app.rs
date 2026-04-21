@@ -11,7 +11,6 @@
 //!   cycles the composer between steer / follow-up intent during streaming
 //! - F8 = compact now, F9 = toggle auto-compaction, F10 = toggle auto-retry
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{Stdout, stdout};
 use std::panic;
@@ -124,13 +123,20 @@ fn install_panic_hook(kitty: bool) {
     }));
 }
 
-/// Write a timestamped crash dump to `~/.local/state/rata-pi/crash-<ts>.log`.
+/// Write a timestamped crash dump to the platform's state dir:
+/// `~/.local/state/rata-pi/` on Linux (XDG), `~/Library/Application
+/// Support/rata-pi/` on macOS, `%LOCALAPPDATA%\rata-pi\` on Windows.
 /// Best-effort: returns the path on success, None on any failure.
 fn write_crash_dump(info: &panic::PanicHookInfo<'_>) -> Option<String> {
     use std::io::Write as _;
 
     let dirs = directories::BaseDirs::new()?;
-    let state = dirs.data_local_dir().join("rata-pi");
+    // XDG state_dir is only populated on Linux; everywhere else fall back
+    // to data_local_dir which is the conventional state location.
+    let state = dirs
+        .state_dir()
+        .unwrap_or_else(|| dirs.data_local_dir())
+        .join("rata-pi");
     std::fs::create_dir_all(&state).ok()?;
 
     let ts = std::time::SystemTime::now()
@@ -293,7 +299,12 @@ struct App {
     focus_idx: Option<usize>,
 
     // ── V2.4: mouse hit-test map, refreshed on every draw ────────────────
-    mouse_map: RefCell<MouseMap>,
+    //
+    // V2.11.3 · plain field (was RefCell<MouseMap>). The map is a
+    // *product* of rendering: `draw` takes `&mut MouseMap` and populates
+    // it; after the frame we stash it into this field so mouse handlers
+    // have last-frame coordinates. No interior mutability needed.
+    mouse_map: MouseMap,
 
     // ── V2.1: live status signals ────────────────────────────────────────
     live: LiveState,
@@ -370,7 +381,7 @@ impl App {
             history: History::load(),
             theme: *theme::default_theme(),
             focus_idx: None,
-            mouse_map: RefCell::new(MouseMap::default()),
+            mouse_map: MouseMap::default(),
             live: LiveState::Idle,
             live_since_tick: 0,
             tool_running: 0,
@@ -955,7 +966,7 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: Args
             tracing::warn!(error = ?e, "shutdown error");
         }
     } else {
-        ui_loop(terminal, &mut app, None, &mut dummy_events()).await?;
+        ui_loop(terminal, &mut app, None, &mut offline_events()).await?;
     }
     Ok(())
 }
@@ -1106,7 +1117,14 @@ async fn refresh_stats(client: &RpcClient, app: &mut App) {
     }
 }
 
-fn dummy_events() -> tokio::sync::mpsc::Receiver<Incoming> {
+/// Offline-mode event receiver: a dead channel. We drop the sender
+/// immediately so the receiver resolves to `None` on first poll, but
+/// crucially the branch `Some(msg) = events.recv()` never fires — the
+/// offline UI loop is driven purely by ticks + crossterm input. A
+/// stale TODO about replacing this with an `Option<Receiver>` would
+/// save two lines but add plumbing; the one-cell buffer here is
+/// effectively free.
+fn offline_events() -> tokio::sync::mpsc::Receiver<Incoming> {
     let (_tx, rx) = tokio::sync::mpsc::channel::<Incoming>(1);
     rx
 }
@@ -1229,7 +1247,12 @@ async fn ui_loop(
             // cache so markdown/syntect/line_count stays out of draw.
             let size = terminal.size()?;
             prepare_frame_caches(app, size);
-            terminal.draw(|f| draw(f, app))?;
+            // V2.11.3 · MouseMap is a frame-scoped output: draw populates
+            // it, then we stash the completed map on App for the next
+            // mouse-click handler. No more RefCell<MouseMap>.
+            let mut mm = MouseMap::default();
+            terminal.draw(|f| draw(f, app, &mut mm))?;
+            app.mouse_map = mm;
             last_draw = tokio::time::Instant::now();
         }
         if app.quit {
@@ -1262,7 +1285,21 @@ async fn ui_loop(
                     }
                 }
             }
-            Some(Ok(ev)) = crossterm_events.next() => handle_crossterm(ev, app, client).await,
+            maybe_ev = crossterm_events.next() => match maybe_ev {
+                Some(Ok(ev)) => handle_crossterm(ev, app, client).await,
+                Some(Err(e)) => {
+                    // Terminal read error — log once and exit the loop. A
+                    // TTY that died (SIGHUP, container detach) would
+                    // otherwise keep returning Err and we'd spin on ticks.
+                    tracing::error!(error = %e, "crossterm read failed — quitting");
+                    app.quit = true;
+                }
+                None => {
+                    // Stream ended (EOF on stdin). Exit gracefully.
+                    tracing::info!("crossterm event stream ended — quitting");
+                    app.quit = true;
+                }
+            },
             _ = tick.tick() => {
                 app.ticks = app.ticks.wrapping_add(1);
                 app.tick_status();
@@ -1399,10 +1436,8 @@ fn handle_focus_key(code: KeyCode, _mods: KeyModifiers, app: &mut App) {
 /// tool card's header row (2nd click toggles), re-pin live tail when the
 /// user clicks the ⬇ chip.
 fn on_mouse_click(x: u16, y: u16, app: &mut App) {
-    // Live-tail chip first. Copy out the rect so the Ref<_> is dropped
-    // before we mutate app.
-    let live_tail = app.mouse_map.borrow().live_tail_chip;
-    if let Some(r) = live_tail
+    // Live-tail chip first.
+    if let Some(r) = app.mouse_map.live_tail_chip
         && rect_contains(r, x, y)
     {
         app.scroll = None;
@@ -1411,8 +1446,7 @@ fn on_mouse_click(x: u16, y: u16, app: &mut App) {
         return;
     }
     // Transcript hit-test.
-    let hit = app.mouse_map.borrow().entry_at(x, y);
-    let Some(idx) = hit else {
+    let Some(idx) = app.mouse_map.entry_at(x, y) else {
         return;
     };
     // If the clicked entry is a tool call AND we're already focused on it
@@ -3073,7 +3107,7 @@ fn parse_bash_result(command: &str, v: &serde_json::Value) -> BashExec {
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-fn draw(f: &mut ratatui::Frame, app: &App) {
+fn draw(f: &mut ratatui::Frame, app: &App, mm: &mut MouseMap) {
     let area = f.area();
 
     // Ext-ui widgets above/below the editor get their own strips.
@@ -3165,7 +3199,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let footer = rects[idx];
 
     draw_header(f, header, app);
-    draw_body(f, body, app);
+    draw_body(f, body, app, mm);
     if let Some(r) = above_rect {
         draw_widgets(f, r, &above_widgets);
     }
@@ -4556,7 +4590,7 @@ fn retry_lines(r: &Retry, t: &Theme) -> Vec<Line<'static>> {
     ])]
 }
 
-fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
+fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App, mm: &mut MouseMap) {
     let t = &app.theme;
     let border_color = if app.focus_idx.is_some() {
         t.border_active
@@ -4669,11 +4703,8 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
     };
 
     // Reset hit-test map for this frame.
-    {
-        let mut mm = app.mouse_map.borrow_mut();
-        mm.clear();
-        mm.body_rect = content;
-    }
+    mm.clear();
+    mm.body_rect = content;
 
     // Render visuals that intersect [offset .. offset+viewport).
     let mut y_cursor: u16 = 0;
@@ -4712,10 +4743,7 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
             }
         }
         // Record the on-screen rect of this visual for mouse hit-testing.
-        {
-            let mut mm = app.mouse_map.borrow_mut();
-            mm.visible.push((target.y, target.y + target.height, i));
-        }
+        mm.visible.push((target.y, target.y + target.height, i));
         draw_y = draw_y.saturating_add(draw_h);
         if draw_y >= end_y {
             break;
@@ -4741,7 +4769,7 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 ))),
                 rect,
             );
-            app.mouse_map.borrow_mut().live_tail_chip = Some(rect);
+            mm.live_tail_chip = Some(rect);
         }
     }
 
@@ -4846,6 +4874,7 @@ fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let [bar, hints] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
     // Context gauge row.
@@ -4880,51 +4909,51 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
     // Hints + flash message row.
     let mut spans = if app.is_streaming {
         vec![
-            kb("Esc"),
+            kb("Esc", t),
             Span::raw(" abort · "),
-            kb("Ctrl+Space"),
+            kb("Ctrl+Space", t),
             Span::raw(" cycle · "),
-            kb("F7"),
+            kb("F7", t),
             Span::raw(" stats · "),
-            kb("Ctrl+T"),
+            kb("Ctrl+T", t),
             Span::raw(" thinking · "),
-            kb("PgUp/PgDn"),
+            kb("PgUp/PgDn", t),
             Span::raw(" scroll · "),
-            kb("Ctrl+C"),
+            kb("Ctrl+C", t),
             Span::raw(" quit"),
         ]
     } else if app.focus_idx.is_some() {
         vec![
-            kb("j/k"),
+            kb("j/k", t),
             Span::raw(" nav · "),
-            kb("Enter"),
+            kb("Enter", t),
             Span::raw(" expand · "),
-            kb("g/G"),
+            kb("g/G", t),
             Span::raw(" top/bot · "),
-            kb("Esc"),
+            kb("Esc", t),
             Span::raw(" exit · "),
-            kb("Ctrl+C"),
+            kb("Ctrl+C", t),
             Span::raw(" quit"),
         ]
     } else {
         vec![
-            kb("Enter"),
+            kb("Enter", t),
             Span::raw(" send · "),
-            kb("/"),
+            kb("/", t),
             Span::raw(" cmds · "),
-            kb("Ctrl+F"),
+            kb("Ctrl+F", t),
             Span::raw(" focus · "),
-            kb("F5"),
+            kb("F5", t),
             Span::raw(" model · "),
-            kb("F6"),
+            kb("F6", t),
             Span::raw(" think · "),
-            kb("F7"),
+            kb("F7", t),
             Span::raw(" stats · "),
-            kb("Alt+T"),
+            kb("Alt+T", t),
             Span::raw(" theme · "),
-            kb("?"),
+            kb("?", t),
             Span::raw(" help · "),
-            kb("Ctrl+C"),
+            kb("Ctrl+C", t),
             Span::raw(" quit"),
         ]
     };
@@ -4951,8 +4980,16 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
     );
 }
 
-fn kb(s: &str) -> Span<'static> {
-    Span::styled(s.to_string(), Style::default().fg(Color::Cyan))
+/// Render a keybinding chip. Uses the active theme's `accent_strong` so the
+/// hints match whichever theme is in effect (was hardcoded to `Color::Cyan`
+/// before V2.11.3 — broke light themes).
+fn kb(s: &str, t: &Theme) -> Span<'static> {
+    Span::styled(
+        s.to_string(),
+        Style::default()
+            .fg(t.accent_strong)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 // ───────────────────────────────────────────────────────── modals ──
@@ -5891,15 +5928,15 @@ fn commands_selected_line(list: &ListModal<crate::ui::commands::MenuItem>) -> u1
 fn help_text(t: &Theme) -> Text<'static> {
     Text::from(vec![
         Line::from(vec![
-            kb("Enter"),
+            kb("Enter", t),
             Span::raw(" submit   "),
-            kb("Shift+Enter"),
+            kb("Shift+Enter", t),
             Span::raw(" newline (deferred)"),
         ]),
         Line::from(vec![
-            kb("!cmd"),
+            kb("!cmd", t),
             Span::raw(" bash RPC · "),
-            kb("/"),
+            kb("/", t),
             Span::raw(" commands"),
         ]),
         Line::from(vec![
@@ -5910,64 +5947,64 @@ fn help_text(t: &Theme) -> Text<'static> {
             ),
         ]),
         Line::from(vec![
-            kb("Esc"),
+            kb("Esc", t),
             Span::raw(" abort/clear/quit · "),
-            kb("Ctrl+C"),
+            kb("Ctrl+C", t),
             Span::raw(" quit"),
         ]),
         Line::from(vec![
-            kb("Ctrl+R"),
+            kb("Ctrl+R", t),
             Span::raw(" history search · "),
-            kb("Ctrl+S"),
+            kb("Ctrl+S", t),
             Span::raw(" export markdown · "),
-            kb("↑/↓"),
+            kb("↑/↓", t),
             Span::raw(" history"),
         ]),
         Line::default(),
         Line::from(vec![
-            kb("Ctrl+T"),
+            kb("Ctrl+T", t),
             Span::raw(" thinking · "),
-            kb("Ctrl+Shift+T"),
+            kb("Ctrl+Shift+T", t),
             Span::raw(" cycle theme · "),
-            kb("/theme <name>"),
+            kb("/theme <name>", t),
             Span::raw(" pick"),
         ]),
         Line::from(vec![
-            kb("Ctrl+E"),
+            kb("Ctrl+E", t),
             Span::raw(" expand/collapse last tool card"),
         ]),
         Line::from(vec![
-            kb("Ctrl+Space"),
+            kb("Ctrl+Space", t),
             Span::raw(" cycle composer mode (steer / follow-up)"),
         ]),
         Line::default(),
         Line::from(vec![
-            kb("F1"),
+            kb("F1", t),
             Span::raw(" commands   "),
-            kb("F5"),
+            kb("F5", t),
             Span::raw(" model   "),
-            kb("F6"),
+            kb("F6", t),
             Span::raw(" thinking"),
         ]),
         Line::from(vec![
-            kb("F7"),
+            kb("F7", t),
             Span::raw(" stats   "),
-            kb("F8"),
+            kb("F8", t),
             Span::raw(" compact now   "),
-            kb("F9"),
+            kb("F9", t),
             Span::raw(" auto-compact"),
         ]),
         Line::from(vec![
-            kb("F10"),
+            kb("F10", t),
             Span::raw(" auto-retry   "),
-            kb("?"),
+            kb("?", t),
             Span::raw(" this help"),
         ]),
         Line::default(),
         Line::from(vec![
-            kb("PgUp/PgDn"),
+            kb("PgUp/PgDn", t),
             Span::raw(" scroll · "),
-            kb("End"),
+            kb("End", t),
             Span::raw(" auto-follow"),
         ]),
     ])

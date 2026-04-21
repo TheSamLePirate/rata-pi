@@ -477,6 +477,52 @@ Plan-mode work shipped in V2.9. TODO widget + `/diagnostics` deferred to V2.11+.
 
 ---
 
+## V2.11.3 — Cleanup sweep: RefCell kill, themed kb, state_dir, small fixes ✅
+
+Closes the P3 + P4 items from the audit plus several smaller items (#8, #15, #16, #19, #23).
+
+### P3 · #7 · Kill `RefCell<MouseMap>`
+- [x] `MouseMap` is now a plain `MouseMap` field on App (no interior mutability).
+- [x] `draw(f, app, &mut mm)` and `draw_body(f, area, app, &mut mm)` take the map as an explicit out-argument — the render produces it.
+- [x] `ui_loop`: `let mut mm = MouseMap::default(); terminal.draw(|f| draw(f, app, &mut mm))?; app.mouse_map = mm;`. Clean frame-scoped data flow.
+- [x] `on_mouse_click` reads fields directly: `app.mouse_map.live_tail_chip`, `app.mouse_map.entry_at(x, y)` — no borrow dance.
+- [x] `std::cell::RefCell` import dropped from app.rs.
+
+### P3 · #13 · Theme the `kb()` helper
+- [x] `kb(s: &str, t: &Theme)` now uses `t.accent_strong` + BOLD instead of hardcoded `Color::Cyan`. Light themes + Solarized now read correctly.
+- [x] 44 call sites updated. `draw_footer` aliases `let t = &app.theme;` at the top so the kb invocations read cleanly.
+
+### P3 · #14 · Crash dump to `state_dir`
+- [x] `write_crash_dump` now prefers `BaseDirs::state_dir()` (Linux XDG `~/.local/state/`) and falls back to `data_local_dir` elsewhere. Matches the PLAN_V2 §11 spec verbatim; cosmetic on macOS/Windows where `state_dir` isn't populated.
+
+### Smaller audit items bundled
+- [x] **#8 · composer unwraps** — `word_right` replaces `.chars().next().unwrap()` with `let Some(c) = ... else break/return` patterns. Same behavior, no panic risk. `history.rs:100` likewise.
+- [x] **#15 · crossterm error handling** — the `Some(Ok(ev))` pattern in `tokio::select!` is replaced with a full match: `Some(Ok(ev))` dispatches, `Some(Err(e))` logs + sets `app.quit = true`, `None` (EOF) logs + quits gracefully. A dying TTY (SIGHUP / container detach) no longer spins forever on ticks.
+- [x] **#16 · history load cap** — `History::load()` caps in-memory entries to the last `MAX_HISTORY = 5_000`. The JSONL file on disk is untouched; future writes continue to append. Prevents unbounded startup memory growth after months of use.
+- [x] **#19 · dead code removal** — deleted `git::is_repo` (never called; `git::status` does the work). Removed stale `#[allow(dead_code)]` on `FileList::empty` (now actually used by `open_file_finder`) and `RpcClient::send_ext_ui_response` (used by ext-UI dispatch in 8 places).
+- [x] **#23 · `dummy_events` → `offline_events`** — renamed with a proper doc explaining why the dead-channel placeholder is correct. No behavior change.
+
+### P4 · #18 · Release opt-level 3
+- [x] `Cargo.toml` flipped `opt-level = "s"` → `opt-level = 3`. Binary grew from **4.2 MB → 4.9 MB** (+730 KB). Acceptable for a TUI (nothing near a size budget). Expected CPU wins in the markdown/syntect hot paths.
+
+### Not done (scoped out, justified)
+- [—] **#17 · cache `merged_commands`** — on reflection, this runs once per modal-open (user action), not per frame. The cost is bounded and caching adds complexity without a measurable win.
+- [—] **#20 · `eprintln!` in panic hook** — replaced the write would happen after tracing's file writer may be disposed. Keeping `eprintln!` is correct; the audit flagged style, not correctness.
+- [—] **P2 · module split** — deferred to its own milestone (V2.12 candidate). Too large and mechanical to mix with behavioral fixes.
+
+### Gates
+- **114 tests pass** (no new tests — all fixes are surgical).
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo fmt --check` clean.
+- Release build: **5 172 400 bytes** (was 4 429 792 — +17%).
+
+### Notes
+- Eliminating `RefCell<MouseMap>` removes the last piece of interior mutability on `App`. The render path is now a truly pure fn of `(State, &mut MouseMap)`: `draw(f, app, mm)` can be snapshot-tested by constructing a mock frame and a fresh MouseMap.
+- The `kb()` change means every keybinding hint now respects the active theme. Test manually by switching to Solarized via `/theme solarized-dark` — hints are now the same hue as the accent border, not bare cyan.
+- Dead-code sweep kept all `#[allow(dead_code)]` that document genuine speculative surface (`HistoryEntry::path`, `Mode::label`, `McpStatus::{Connected,Disconnected}`, etc.) — these are future-wired intentionally.
+
+---
+
 ## V2.11.2 — Render hot-path: visuals + heights cache, parallel bootstrap, async history ✅
 
 Closes the P0 + P1 items from the full codebase audit.

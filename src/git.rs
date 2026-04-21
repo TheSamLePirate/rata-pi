@@ -64,17 +64,6 @@ async fn git_timeout(args: &[&str], dur: Duration) -> Result<String, String> {
     }
 }
 
-#[allow(dead_code)]
-pub async fn is_repo() -> bool {
-    git_timeout(
-        &["rev-parse", "--is-inside-work-tree"],
-        Duration::from_millis(500),
-    )
-    .await
-    .map(|s| s.trim() == "true")
-    .unwrap_or(false)
-}
-
 /// Read a lightweight status summary. Uses `git status --porcelain=v2 --branch`.
 pub async fn status() -> GitStatus {
     let mut st = GitStatus::default();

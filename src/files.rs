@@ -24,7 +24,6 @@ pub struct FileList {
 }
 
 impl FileList {
-    #[allow(dead_code)] // public constructor for tests / future callers
     pub fn empty() -> Self {
         Self {
             root: PathBuf::from("."),

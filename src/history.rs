@@ -28,10 +28,16 @@ pub struct History {
     stash: Option<String>,
 }
 
+/// Soft cap on in-memory history entries. After months of use the JSONL
+/// file can grow unboundedly; we only ever need the tail for `prev()`
+/// walking, so load the tail and forget the rest. The file on disk is
+/// untouched.
+pub const MAX_HISTORY: usize = 5_000;
+
 impl History {
     pub fn load() -> Self {
         let path = resolve_path();
-        let entries = path
+        let mut entries: Vec<HistoryEntry> = path
             .as_ref()
             .and_then(|p| File::open(p).ok())
             .map(|f| {
@@ -42,6 +48,11 @@ impl History {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // V2.11.3 · cap in-memory length to the most recent MAX_HISTORY.
+        if entries.len() > MAX_HISTORY {
+            let keep_from = entries.len() - MAX_HISTORY;
+            entries.drain(..keep_from);
+        }
         Self {
             entries,
             path,
@@ -101,7 +112,11 @@ impl History {
             self.cursor = Some(self.entries.len() - 1);
             return Some(self.entries[self.entries.len() - 1].text.clone());
         }
-        let i = self.cursor.unwrap();
+        let Some(i) = self.cursor else {
+            // Unreachable: we set cursor = Some(...) above in the same
+            // function body. Defensive: if it does happen, yield None.
+            return None;
+        };
         if i == 0 {
             return Some(self.entries[0].text.clone());
         }
