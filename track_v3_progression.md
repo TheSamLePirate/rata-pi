@@ -44,7 +44,7 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
   - [x] Visuals cache early-outs when epoch unchanged (`visuals_cache_skips_walk_when_epoch_unchanged`)
   - [x] Visuals cache walks after mutation (`visuals_cache_walks_after_mutation`)
 
-**Shipped as** `<tbd>`
+**Shipped as** `41bb7f8`
 
 ---
 
