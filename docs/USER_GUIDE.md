@@ -20,7 +20,8 @@ This guide documents **every feature**: command-line arguments, key bindings, sl
 10. [Mouse](#mouse)
 11. [Modals](#modals)
 12. [Plan mode](#plan-mode)
-13. [File finder and `@path`](#file-finder-and-path)
+13. [Interview mode](#interview-mode)
+14. [File finder and `@path`](#file-finder-and-path)
 14. [Git integration](#git-integration)
 15. [Themes](#themes)
 16. [Vim mode](#vim-mode)
@@ -487,6 +488,9 @@ Readiness checks (see [First-run sanity check](#first-run-sanity-check)).
 ### `Mcp` (`/mcp`)
 Placeholder showing "pi does not expose MCP server state over RPC yet" until pi adds that capability.
 
+### `Interview` (agent-initiated)
+Agent-authored structured form. Opens when the agent emits `[[INTERVIEW: …json…]]` in assistant text. See [Interview mode](#interview-mode) for the full field-type reference, keyboard shortcuts, and JSON schema.
+
 ### Extension UI dialogs
 When a pi extension calls `ext_ui_select`, `ext_ui_confirm`, `ext_ui_input`, or `ext_ui_editor`, a dialog modal opens. `↑↓` (select), `Y/N/←→` (confirm), type-to-fill (input/editor). Enter submits, Esc cancels.
 
@@ -536,6 +540,142 @@ With `/plan auto on`, every `agent_end` with pending steps auto-queues a "contin
 * The per-step attempt counter hits `MAX_ATTEMPTS = 3`.
 
 You can always interrupt: `Esc` aborts; `/plan fail <reason>` halts.
+
+---
+
+## Interview mode
+
+Interview mode is the agent's way of asking you **structured** questions instead of a wall of text. When the agent needs multiple related answers — names, toggles, choices, numbers — it emits a single marker describing a form; rata-pi parses it and opens a full-screen modal with labeled fields, sections, required-field markers, defaults, and keyboard-first controls. You fill it in, press `Ctrl+Enter`, and rata-pi sends your answers back as a single JSON payload so the agent can parse it deterministically.
+
+### How it starts
+
+The agent emits exactly one marker in its assistant text:
+
+```
+[[INTERVIEW: { ...json form definition... }]]
+```
+
+rata-pi parses the JSON on `agent_end`, strips the noise from the visible transcript, and opens the Interview modal. A flash message appears: *"agent opened an interview — answer and Ctrl+Enter to submit"*.
+
+The capability hint explaining this grammar is automatically appended to your outgoing prompts (when no plan is active), so the agent knows the feature exists without you prompting for it.
+
+### Field types
+
+| Type | Render | How to edit |
+|---|---|---|
+| `section` | `── Title ──────────` + optional description | non-interactive (grouping only) |
+| `info` | `ℹ note text` | non-interactive |
+| `text` | `> │value_` (with placeholder when empty) | type to edit, Alt+←/→ word motion, Ctrl+A/E/U/K/W kill bindings |
+| `text` + `multiline: true` | multi-row box | same as text; `Shift+Enter` inserts a newline |
+| `toggle` | `[x] yes` / `[ ] no` | `Space` / `Enter` toggles; `←` / `→` set false/true explicitly |
+| `select` | `(●) A   ( ) B   ( ) C` | `←` / `→` cycle; `1..9` numeric shortcut |
+| `multiselect` (alias `checkboxes`) | `[x] A   [ ] B   [x] C` — the cursor highlights one option | `←` / `→` move cursor between options; `Space` / `Enter` toggle the current option |
+| `number` | `> │123_` | only digits / sign / decimal / `e` are accepted; auto-clamped to `min` / `max` if set |
+
+### Required fields
+
+Any `text`, `select`, or `number` can declare `"required": true`. Required fields show a red `*` after the label; `Ctrl+Enter` on a form with missing required answers refuses to submit and jumps focus to the first missing field plus a red validation row at the top of the modal. The submit button also flips from the accent color to a dim gray while validation fails.
+
+### Defaults and hydration
+
+Every field supports a `default`:
+
+* `text` / `number` — seeded string (number gets formatted as `5173`, not `5173.0`, for whole integers).
+* `toggle` — `true` / `false` (defaults to false when omitted).
+* `select` — a string that must be one of the `options`; if unmatched, falls back to the first option.
+* `multiselect` — an array of pre-checked option names.
+
+### Keyboard reference (Interview modal)
+
+| Key | Action |
+|---|---|
+| `Tab` | Next interactive field (skips sections) |
+| `Shift+Tab` | Previous interactive field |
+| `↓` / `↑` | Same as Tab / Shift+Tab (unless in a multiline text field where ↓/↑ still move focus — one field per field) |
+| `←` / `→` | Field-specific: cycle select, move multiselect cursor, set toggle, move text cursor |
+| `Alt+←` / `Alt+→` | Word-left / word-right inside a text or number field |
+| `Home` / `Ctrl+A` | Start of the current text field |
+| `End` / `Ctrl+E` | End of the current text field |
+| `Space` | Toggle a checkbox / boolean / multiselect option |
+| `1..9` | On a select, jump to option *N* |
+| `Backspace` / `Delete` | Delete char before / after cursor |
+| `Ctrl+U` | Kill to start of the current text field |
+| `Ctrl+K` | Kill to end of the current text field |
+| `Ctrl+W` | Kill word back |
+| `Shift+Enter` | Insert newline (in a `multiline` text field only) |
+| `Ctrl+Enter` or `Ctrl+S` | Submit — send answers to the agent |
+| `Esc` | Cancel — close the modal without sending |
+
+### What pi receives on submit
+
+A normal user message is dispatched with a structured block inside:
+
+```
+<interview-response>
+{
+  "title": "Project setup",
+  "answers": {
+    "name": "my-app",
+    "framework": "Vue",
+    "typescript": true,
+    "features": ["router", "testing"],
+    "port": 5173,
+    "notes": ""
+  }
+}
+</interview-response>
+```
+
+* Values are typed (booleans, numbers, arrays, strings) — not stringified.
+* `section` and `info` fields produce no keys.
+* Empty optional fields still emit the key with an empty value so the agent doesn't have to guess.
+* A summary line is also pushed into the transcript as a user card: `(interview) interview submitted · name=my-app · typescript=yes · features=[router,testing]`.
+
+If you submitted while the agent was still streaming, rata-pi uses `steer` or `follow_up` depending on the composer's current intent (the same rule as regular submits). Otherwise it's a fresh `prompt`.
+
+### Full example the agent can emit
+
+```json
+{
+  "title": "Project setup",
+  "description": "Let's scaffold a new app.",
+  "submitLabel": "Create",
+  "fields": [
+    { "type": "section", "title": "Basics" },
+    { "type": "text", "id": "name", "label": "Project name",
+      "placeholder": "my-app", "required": true },
+    { "type": "select", "id": "framework", "label": "Framework",
+      "options": ["React", "Vue", "Svelte", "None"], "default": "Vue" },
+
+    { "type": "section", "title": "Options" },
+    { "type": "toggle", "id": "typescript", "label": "Use TypeScript?", "default": true },
+    { "type": "multiselect", "id": "features", "label": "Include features",
+      "options": ["router", "store", "testing", "i18n"],
+      "default": ["router", "testing"] },
+    { "type": "number", "id": "port", "label": "Dev-server port",
+      "min": 1024, "max": 65535, "default": 5173 },
+
+    { "type": "section", "title": "Extra" },
+    { "type": "info", "text": "We'll add more scaffolding later." },
+    { "type": "text", "id": "notes", "label": "Additional notes", "multiline": true }
+  ]
+}
+```
+
+### Tips for agents
+
+* Prefer **one interview** over several free-form questions when the questions are related — a single form round-trip is much cheaper for the user than five messages.
+* Use `section` generously; grouping makes long forms scannable.
+* Set `default`s whenever a sensible choice exists — a user who just presses `Ctrl+Enter` on a mostly-filled form is a happy user.
+* Never emit more than one `[[INTERVIEW]]` per agent turn; only the first is parsed.
+* The markers are stripped from the visible transcript, but the `<interview-response>` block you receive IS a normal user message — don't try to "hide" it from the conversation history.
+
+### Tips for users
+
+* You can always back out with `Esc` — nothing is sent.
+* If you see a red validation row, jump straight to the red `*` field (focus already moved there).
+* For long forms, the modal scrolls naturally with the content; `Tab` / `Shift+Tab` moves the cursor and the viewport follows.
+* `Ctrl+S` submits too (same as `Ctrl+Enter`) — handy on terminals that intercept Ctrl+Enter.
 
 ---
 

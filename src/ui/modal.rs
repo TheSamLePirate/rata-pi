@@ -129,6 +129,10 @@ pub enum Modal {
     /// V2.11 · MCP servers (if pi exposes any).
     Mcp(Vec<McpRow>),
 
+    /// V2.12.g · interview mode — agent-authored structured form.
+    /// Boxed because `InterviewState` is the largest modal payload.
+    Interview(Box<crate::interview::InterviewState>),
+
     Help,
 
     /// Extension UI dialog: select from a list of strings.

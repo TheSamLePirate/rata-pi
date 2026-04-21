@@ -486,6 +486,17 @@ impl App {
             return;
         };
 
+        // V2.12.g · interview markers come first so the modal opens
+        // before the plan-mode auto-continue fires. Skipped when we're
+        // already in a modal (pre-existing interview or other blocker).
+        if self.modal.is_none()
+            && let Some((iv, _)) = crate::interview::parse_marker(&text)
+        {
+            let state = crate::interview::InterviewState::from_interview(iv);
+            self.modal = Some(Modal::Interview(Box::new(state)));
+            self.flash("agent opened an interview — answer and Ctrl+Enter to submit");
+        }
+
         let mut advanced = false;
         let mut created_plan = false;
         for m in crate::plan::parse_markers(&text) {
@@ -892,9 +903,11 @@ fn wrap_with_plan(plan: &crate::plan::Plan, user_text: &str) -> String {
         out.push_str(user_text);
         out
     } else {
-        let mut out = String::with_capacity(user_text.len() + 200);
+        let mut out = String::with_capacity(user_text.len() + 400);
         out.push_str(user_text);
         out.push_str(crate::plan::capability_hint());
+        // V2.12.g · let the agent know about the Interview marker too.
+        out.push_str(crate::interview::capability_hint());
         out
     }
 }
@@ -1846,7 +1859,7 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
 
 async fn handle_modal_key(
     code: KeyCode,
-    _mods: KeyModifiers,
+    mods: KeyModifiers,
     app: &mut App,
     client: Option<&RpcClient>,
 ) {
@@ -2227,6 +2240,22 @@ async fn handle_modal_key(
             }
             _ => {}
         },
+        // V2.12.g · interview modal — see `interview_key` below.
+        Modal::Interview(state) => {
+            let submit = interview_key(state.as_mut(), code, mods);
+            if submit {
+                // User pressed Ctrl+Enter on a valid form: serialise the
+                // response, close the modal, dispatch to pi.
+                let response = state.as_response();
+                let summary = state.human_summary();
+                app.modal = None;
+                if let Some(c) = client {
+                    dispatch_interview_response(app, c, response, summary).await;
+                } else {
+                    app.flash("interview needs pi (offline) — response discarded");
+                }
+            }
+        }
         Modal::ExtInput {
             request_id, value, ..
         }
@@ -2452,6 +2481,366 @@ fn handle_vim_normal(ch: char, app: &mut App) {
             // activate double-letter ops.
             c.pending_op = None;
         }
+    }
+}
+
+// ───────────────────────────────────────────────── interview mode ──
+
+/// Process one keypress against the live interview modal state.
+/// Returns `true` when the user pressed Ctrl+Enter on a valid form —
+/// the caller then dispatches the response.
+fn interview_key(
+    state: &mut crate::interview::InterviewState,
+    code: KeyCode,
+    mods: KeyModifiers,
+) -> bool {
+    use crate::interview::FieldValue;
+
+    // Global: Tab / Shift+Tab navigate between interactive fields.
+    match (code, mods) {
+        (KeyCode::Tab, _) => {
+            state.focus_next();
+            return false;
+        }
+        (KeyCode::BackTab, _) => {
+            state.focus_prev();
+            return false;
+        }
+        (KeyCode::Down, m) if !m.contains(KeyModifiers::ALT) => {
+            // Alt+Down could be reserved for moving selection inside a
+            // multiselect; we'll handle ↓ ↑ inside the field-specific
+            // arms below. Otherwise: move to the next interactive field.
+            match &state.fields[state.focus] {
+                FieldValue::Text {
+                    multiline: true, ..
+                } => {
+                    // In a multiline textarea ↓ may mean "next line";
+                    // but our composer is a single String with `\n`
+                    // chars — we keep text fields simple: ↓ = next field.
+                    state.focus_next();
+                }
+                _ => state.focus_next(),
+            }
+            return false;
+        }
+        (KeyCode::Up, m) if !m.contains(KeyModifiers::ALT) => {
+            state.focus_prev();
+            return false;
+        }
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
+            return try_submit_interview(state);
+        }
+        (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
+            return try_submit_interview(state);
+        }
+        _ => {}
+    }
+
+    // Field-specific dispatch on the focused field.
+    match &mut state.fields[state.focus] {
+        FieldValue::Section { .. } | FieldValue::Info { .. } => {
+            // Non-interactive shouldn't be focused; guard anyway.
+        }
+        FieldValue::Toggle { value, .. } => match code {
+            KeyCode::Char(' ') | KeyCode::Char('x') => *value = !*value,
+            KeyCode::Left if *value => *value = false,
+            KeyCode::Right if !*value => *value = true,
+            KeyCode::Enter => *value = !*value,
+            _ => {}
+        },
+        FieldValue::Select {
+            options, selected, ..
+        } => match code {
+            KeyCode::Left => {
+                if *selected > 0 {
+                    *selected -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if *selected + 1 < options.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Char(ch) if ch.is_ascii_digit() => {
+                // Numeric shortcut: 1..9 picks the Nth option.
+                let idx = ch.to_digit(10).unwrap_or(0) as usize;
+                if idx >= 1 && idx <= options.len() {
+                    *selected = idx - 1;
+                }
+            }
+            _ => {}
+        },
+        FieldValue::Multiselect {
+            options,
+            checked,
+            cursor,
+            ..
+        } => match code {
+            KeyCode::Left => {
+                if *cursor > 0 {
+                    *cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if *cursor + 1 < options.len() {
+                    *cursor += 1;
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Char('x') => {
+                if let Some(c) = checked.get_mut(*cursor) {
+                    *c = !*c;
+                }
+            }
+            _ => {}
+        },
+        FieldValue::Text {
+            value,
+            cursor,
+            multiline,
+            ..
+        } => {
+            text_field_key(value, cursor, *multiline, code, mods);
+        }
+        FieldValue::Number {
+            value,
+            cursor,
+            min,
+            max,
+            ..
+        } => {
+            // Gate non-numeric chars so the user can only type digits /
+            // sign / decimal point.
+            if let KeyCode::Char(ch) = code {
+                let allowed = ch.is_ascii_digit()
+                    || ch == '.'
+                    || ch == '-'
+                    || ch == 'e'
+                    || ch == 'E'
+                    || ch == '+';
+                if !allowed {
+                    return false;
+                }
+            }
+            text_field_key(value, cursor, false, code, mods);
+            // Clamp on every edit so the user can't exceed bounds.
+            if let (Ok(n), _) = (value.parse::<f64>(), ()) {
+                let mut fixed = n;
+                if let Some(lo) = min {
+                    fixed = fixed.max(*lo);
+                }
+                if let Some(hi) = max {
+                    fixed = fixed.min(*hi);
+                }
+                if (fixed - n).abs() > f64::EPSILON {
+                    *value = if fixed.fract() == 0.0 {
+                        format!("{:.0}", fixed)
+                    } else {
+                        format!("{fixed}")
+                    };
+                    *cursor = value.len();
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Apply a keystroke to a plain-String text buffer. Handles insert,
+/// backspace, delete, cursor motion (including word motion via Alt+←/→
+/// and line kill via Ctrl+U/K/W), and multiline newlines.
+fn text_field_key(
+    value: &mut String,
+    cursor: &mut usize,
+    multiline: bool,
+    code: KeyCode,
+    mods: KeyModifiers,
+) {
+    match (code, mods) {
+        (KeyCode::Char(ch), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            value.insert_str(*cursor, s);
+            *cursor += s.len();
+        }
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) && multiline => {
+            value.insert(*cursor, '\n');
+            *cursor += 1;
+        }
+        (KeyCode::Backspace, _) => {
+            if *cursor > 0 {
+                let prev = prev_char_boundary(value, *cursor);
+                value.drain(prev..*cursor);
+                *cursor = prev;
+            }
+        }
+        (KeyCode::Delete, _) => {
+            if *cursor < value.len() {
+                let next = next_char_boundary(value, *cursor);
+                value.drain(*cursor..next);
+            }
+        }
+        (KeyCode::Left, m) if !m.contains(KeyModifiers::ALT) => {
+            if *cursor > 0 {
+                *cursor = prev_char_boundary(value, *cursor);
+            }
+        }
+        (KeyCode::Right, m) if !m.contains(KeyModifiers::ALT) => {
+            if *cursor < value.len() {
+                *cursor = next_char_boundary(value, *cursor);
+            }
+        }
+        (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) => {
+            *cursor = word_left_index(value, *cursor);
+        }
+        (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) => {
+            *cursor = word_right_index(value, *cursor);
+        }
+        (KeyCode::Home, _) => {
+            *cursor = 0;
+        }
+        (KeyCode::Char('a'), m) if m.contains(KeyModifiers::CONTROL) => {
+            *cursor = 0;
+        }
+        (KeyCode::End, _) => {
+            *cursor = value.len();
+        }
+        (KeyCode::Char('e'), m) if m.contains(KeyModifiers::CONTROL) => {
+            *cursor = value.len();
+        }
+        (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
+            value.drain(..*cursor);
+            *cursor = 0;
+        }
+        (KeyCode::Char('k'), m) if m.contains(KeyModifiers::CONTROL) => {
+            value.truncate(*cursor);
+        }
+        (KeyCode::Char('w'), m) if m.contains(KeyModifiers::CONTROL) => {
+            let start = word_left_index(value, *cursor);
+            value.drain(start..*cursor);
+            *cursor = start;
+        }
+        _ => {}
+    }
+}
+
+fn prev_char_boundary(s: &str, i: usize) -> usize {
+    let mut j = i.saturating_sub(1);
+    while j > 0 && !s.is_char_boundary(j) {
+        j -= 1;
+    }
+    j
+}
+
+fn next_char_boundary(s: &str, i: usize) -> usize {
+    let mut j = i.saturating_add(1).min(s.len());
+    while j < s.len() && !s.is_char_boundary(j) {
+        j += 1;
+    }
+    j
+}
+
+fn word_left_index(s: &str, mut i: usize) -> usize {
+    // Skip any trailing non-word chars, then the word.
+    while i > 0 {
+        let p = prev_char_boundary(s, i);
+        let c = s[p..i].chars().next();
+        if matches!(c, Some(c) if c.is_alphanumeric() || c == '_') {
+            break;
+        }
+        i = p;
+    }
+    while i > 0 {
+        let p = prev_char_boundary(s, i);
+        let c = s[p..i].chars().next();
+        if !matches!(c, Some(c) if c.is_alphanumeric() || c == '_') {
+            break;
+        }
+        i = p;
+    }
+    i
+}
+
+fn word_right_index(s: &str, mut i: usize) -> usize {
+    // Skip current word, then leading non-word chars.
+    while i < s.len() {
+        let c = s[i..].chars().next();
+        if !matches!(c, Some(c) if c.is_alphanumeric() || c == '_') {
+            break;
+        }
+        i = next_char_boundary(s, i);
+    }
+    while i < s.len() {
+        let c = s[i..].chars().next();
+        if matches!(c, Some(c) if c.is_alphanumeric() || c == '_') {
+            break;
+        }
+        i = next_char_boundary(s, i);
+    }
+    i
+}
+
+fn try_submit_interview(state: &mut crate::interview::InterviewState) -> bool {
+    match state.first_missing_required() {
+        None => {
+            state.validation_error = None;
+            true
+        }
+        Some(label) => {
+            state.validation_error = Some(format!("required: {label}"));
+            // Jump focus to the first missing interactive field for the user.
+            for i in 0..state.fields.len() {
+                if state.fields[i].missing_required() {
+                    state.focus = i;
+                    break;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Send the interview's serialized response to pi and record a
+/// transcript entry so the user has a trail.
+async fn dispatch_interview_response(
+    app: &mut App,
+    client: &RpcClient,
+    response: String,
+    summary: String,
+) {
+    // Show the submission in the transcript first.
+    let line = if summary.is_empty() {
+        "interview submitted".to_string()
+    } else {
+        format!("interview submitted · {summary}")
+    };
+    app.transcript
+        .push(Entry::User(format!("(interview) {line}")));
+    app.history.record(&response);
+
+    let rpc = if app.is_streaming {
+        match app.composer_mode {
+            ComposerMode::FollowUp => RpcCommand::FollowUp {
+                message: response,
+                images: vec![],
+            },
+            _ => RpcCommand::Steer {
+                message: response,
+                images: vec![],
+            },
+        }
+    } else {
+        app.set_live(LiveState::Sending);
+        RpcCommand::Prompt {
+            message: response,
+            images: vec![],
+            streaming_behavior: None,
+        }
+    };
+    if let Err(e) = client.fire(rpc).await {
+        app.transcript
+            .push(Entry::Error(format!("interview dispatch failed: {e}")));
     }
 }
 
@@ -4027,6 +4416,13 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             80,
             18,
         ),
+        Modal::Interview(state) => (
+            format!(" ✍ interview · {} ", state.title),
+            Text::from(interview_body(state, theme)),
+            "Tab next · Shift+Tab prev · Space toggle · Ctrl+Enter submit · Esc cancel".to_string(),
+            110,
+            32,
+        ),
         Modal::ExtSelect {
             title,
             options,
@@ -4579,6 +4975,446 @@ fn mcp_body(rows: &[crate::ui::modal::McpRow], t: &Theme) -> Vec<Line<'static>> 
         Style::default().fg(t.dim),
     )));
     out
+}
+
+/// Render the Interview modal body: header with title / description,
+/// then one block per field. Focused interactive field gets a `▶`
+/// marker + accent color; required-but-empty fields get a red chip.
+fn interview_body(state: &crate::interview::InterviewState, t: &Theme) -> Vec<Line<'static>> {
+    use crate::interview::FieldValue;
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    // Top-matter: description + validation error.
+    if let Some(desc) = &state.description {
+        out.push(Line::from(Span::styled(
+            format!("  {desc}"),
+            Style::default().fg(t.muted),
+        )));
+        out.push(Line::default());
+    }
+    if let Some(err) = &state.validation_error {
+        out.push(Line::from(vec![
+            Span::styled(
+                "  ✗ ",
+                Style::default().fg(t.error).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(err.clone(), Style::default().fg(t.error)),
+        ]));
+        out.push(Line::default());
+    }
+
+    // Fields.
+    for (i, f) in state.fields.iter().enumerate() {
+        let focused = i == state.focus && f.is_interactive();
+        let marker = if focused { "▶" } else { " " };
+        let marker_style = if focused {
+            Style::default()
+                .fg(t.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.dim)
+        };
+        let label_color = if focused { t.accent_strong } else { t.text };
+
+        match f {
+            FieldValue::Section { title, description } => {
+                // Blank line above for visual spacing, then a heading.
+                if i > 0 {
+                    out.push(Line::default());
+                }
+                let rule = "─".repeat(60);
+                out.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("{title}  "),
+                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(rule, Style::default().fg(t.dim)),
+                ]));
+                if let Some(d) = description {
+                    out.push(Line::from(Span::styled(
+                        format!("  {d}"),
+                        Style::default().fg(t.muted),
+                    )));
+                }
+                out.push(Line::default());
+            }
+            FieldValue::Info { text } => {
+                out.push(Line::from(vec![
+                    Span::styled("  ℹ  ", Style::default().fg(t.accent_strong)),
+                    Span::styled(text.clone(), Style::default().fg(t.muted)),
+                ]));
+                out.push(Line::default());
+            }
+            FieldValue::Text {
+                label,
+                description,
+                placeholder,
+                value,
+                cursor,
+                required,
+                multiline,
+                ..
+            } => {
+                out.push(interview_label_line(
+                    marker,
+                    marker_style,
+                    label,
+                    *required,
+                    label_color,
+                    t,
+                ));
+                if let Some(d) = description {
+                    out.push(interview_desc_line(d, t));
+                }
+                out.extend(interview_text_display(
+                    value,
+                    *cursor,
+                    focused,
+                    placeholder.as_deref(),
+                    *multiline,
+                    t,
+                ));
+                out.push(Line::default());
+            }
+            FieldValue::Toggle {
+                label,
+                description,
+                value,
+                ..
+            } => {
+                out.push(interview_label_line(
+                    marker,
+                    marker_style,
+                    label,
+                    false,
+                    label_color,
+                    t,
+                ));
+                if let Some(d) = description {
+                    out.push(interview_desc_line(d, t));
+                }
+                let box_color = if focused { t.accent_strong } else { t.text };
+                let glyph = if *value { "[x]" } else { "[ ]" };
+                let yn = if *value { "yes" } else { "no" };
+                out.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(
+                        format!("{glyph} "),
+                        Style::default().fg(box_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(yn.to_string(), Style::default().fg(t.muted)),
+                ]));
+                out.push(Line::default());
+            }
+            FieldValue::Select {
+                label,
+                description,
+                options,
+                selected,
+                required,
+                ..
+            } => {
+                out.push(interview_label_line(
+                    marker,
+                    marker_style,
+                    label,
+                    *required,
+                    label_color,
+                    t,
+                ));
+                if let Some(d) = description {
+                    out.push(interview_desc_line(d, t));
+                }
+                let mut row: Vec<Span<'static>> = vec![Span::raw("     ")];
+                for (j, opt) in options.iter().enumerate() {
+                    let is_sel = j == *selected;
+                    let glyph = if is_sel { "(●)" } else { "( )" };
+                    let glyph_color = if is_sel {
+                        if focused { t.accent_strong } else { t.accent }
+                    } else {
+                        t.dim
+                    };
+                    let text_color = if is_sel { t.text } else { t.muted };
+                    row.push(Span::styled(
+                        format!("{glyph} "),
+                        Style::default()
+                            .fg(glyph_color)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    row.push(Span::styled(opt.clone(), Style::default().fg(text_color)));
+                    if j + 1 < options.len() {
+                        row.push(Span::raw("   "));
+                    }
+                }
+                out.push(Line::from(row));
+                out.push(Line::default());
+            }
+            FieldValue::Multiselect {
+                label,
+                description,
+                options,
+                checked,
+                cursor,
+                ..
+            } => {
+                out.push(interview_label_line(
+                    marker,
+                    marker_style,
+                    label,
+                    false,
+                    label_color,
+                    t,
+                ));
+                if let Some(d) = description {
+                    out.push(interview_desc_line(d, t));
+                }
+                let mut row: Vec<Span<'static>> = vec![Span::raw("     ")];
+                for (j, opt) in options.iter().enumerate() {
+                    let c = checked.get(j).copied().unwrap_or(false);
+                    let is_cur = focused && j == *cursor;
+                    let glyph = if c { "[x]" } else { "[ ]" };
+                    let glyph_color = if c {
+                        t.accent_strong
+                    } else if is_cur {
+                        t.accent
+                    } else {
+                        t.dim
+                    };
+                    let text_style = if is_cur {
+                        Style::default()
+                            .fg(t.text)
+                            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    } else if c {
+                        Style::default().fg(t.text)
+                    } else {
+                        Style::default().fg(t.muted)
+                    };
+                    row.push(Span::styled(
+                        format!("{glyph} "),
+                        Style::default()
+                            .fg(glyph_color)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    row.push(Span::styled(opt.clone(), text_style));
+                    if j + 1 < options.len() {
+                        row.push(Span::raw("   "));
+                    }
+                }
+                out.push(Line::from(row));
+                out.push(Line::default());
+            }
+            FieldValue::Number {
+                label,
+                description,
+                min,
+                max,
+                value,
+                cursor,
+                required,
+                ..
+            } => {
+                out.push(interview_label_line(
+                    marker,
+                    marker_style,
+                    label,
+                    *required,
+                    label_color,
+                    t,
+                ));
+                let range = match (min, max) {
+                    (Some(lo), Some(hi)) => Some(format!(
+                        "{}–{}",
+                        format_number_for_hint(*lo),
+                        format_number_for_hint(*hi)
+                    )),
+                    (Some(lo), None) => Some(format!("≥ {}", format_number_for_hint(*lo))),
+                    (None, Some(hi)) => Some(format!("≤ {}", format_number_for_hint(*hi))),
+                    (None, None) => None,
+                };
+                if let Some(d) = description {
+                    out.push(interview_desc_line(d, t));
+                }
+                if let Some(r) = range {
+                    out.push(interview_desc_line(&format!("range: {r}"), t));
+                }
+                out.extend(interview_text_display(
+                    value, *cursor, focused, None, false, t,
+                ));
+                out.push(Line::default());
+            }
+        }
+    }
+
+    // Submit button row.
+    let can_submit = state.first_missing_required().is_none();
+    let submit_color = if can_submit { t.success } else { t.dim };
+    out.push(Line::default());
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!(" ▶ {} ", state.submit_label),
+            Style::default()
+                .fg(Color::Rgb(0, 0, 0))
+                .bg(submit_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            if can_submit {
+                "Ctrl+Enter to submit"
+            } else {
+                "fill required fields, then Ctrl+Enter"
+            }
+            .to_string(),
+            Style::default().fg(t.muted),
+        ),
+    ]));
+
+    out
+}
+
+fn interview_label_line(
+    marker: &'static str,
+    marker_style: Style,
+    label: &str,
+    required: bool,
+    label_color: Color,
+    t: &Theme,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(format!("  {marker} "), marker_style),
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(label_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if required {
+        spans.push(Span::styled(
+            " *",
+            Style::default().fg(t.error).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn interview_desc_line(desc: &str, t: &Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("     {desc}"),
+        Style::default().fg(t.dim),
+    ))
+}
+
+fn interview_text_display(
+    value: &str,
+    cursor: usize,
+    focused: bool,
+    placeholder: Option<&str>,
+    multiline: bool,
+    t: &Theme,
+) -> Vec<Line<'static>> {
+    // Split into display lines; when cursor is in the buffer and focus
+    // is active, overlay a reversed cell at the cursor column on the
+    // target row.
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if value.is_empty() {
+        let shown = placeholder.map(|p| format!("({p})"));
+        let ph_style = Style::default().fg(t.dim);
+        let base = shown.unwrap_or_else(|| " ".to_string());
+        if focused {
+            out.push(Line::from(vec![
+                Span::raw("     "),
+                Span::styled(
+                    " ",
+                    Style::default().fg(t.text).add_modifier(Modifier::REVERSED),
+                ),
+                Span::styled(base, ph_style),
+            ]));
+        } else {
+            out.push(Line::from(vec![
+                Span::raw("     "),
+                Span::styled(base, ph_style),
+            ]));
+        }
+        return out;
+    }
+
+    // Compute the row / column of the cursor.
+    if multiline {
+        // Find which line the cursor is on.
+        let mut prefix_len = 0usize;
+        let mut row_idx = 0usize;
+        let mut col_in_row = cursor;
+        for (i, line) in value.split_inclusive('\n').enumerate() {
+            let line_end = prefix_len + line.len();
+            // The '\n' itself lives at line_end-1 if present; cursor may
+            // legitimately sit at line_end (end of the inclusive range).
+            if cursor <= line_end {
+                row_idx = i;
+                col_in_row = cursor - prefix_len;
+                break;
+            }
+            prefix_len = line_end;
+            row_idx = i + 1;
+            col_in_row = cursor - prefix_len;
+        }
+        for (i, line) in value.split('\n').enumerate() {
+            let line_str = line.to_string();
+            if focused && i == row_idx {
+                out.push(line_with_cursor(
+                    "     ",
+                    &line_str,
+                    col_in_row.min(line_str.len()),
+                    t,
+                ));
+            } else {
+                out.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(line_str, Style::default().fg(t.text)),
+                ]));
+            }
+        }
+    } else if focused {
+        out.push(line_with_cursor("     ", value, cursor.min(value.len()), t));
+    } else {
+        out.push(Line::from(vec![
+            Span::raw("     "),
+            Span::styled(value.to_string(), Style::default().fg(t.text)),
+        ]));
+    }
+    out
+}
+
+fn line_with_cursor(prefix: &'static str, line: &str, col: usize, t: &Theme) -> Line<'static> {
+    let before = line[..col.min(line.len())].to_string();
+    let rest = &line[col.min(line.len())..];
+    let (under, after) = match rest.chars().next() {
+        Some(c) => {
+            let cb = c.len_utf8();
+            (rest[..cb].to_string(), rest[cb..].to_string())
+        }
+        None => (" ".to_string(), String::new()),
+    };
+    let cursor_style = Style::default()
+        .fg(t.text)
+        .add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    Line::from(vec![
+        Span::raw(prefix),
+        Span::styled(before, Style::default().fg(t.text)),
+        Span::styled(under, cursor_style),
+        Span::styled(after, Style::default().fg(t.text)),
+    ])
+}
+
+fn format_number_for_hint(n: f64) -> String {
+    if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {
+        format!("{:.0}", n)
+    } else {
+        format!("{n}")
+    }
 }
 
 fn status_row(label: &str, count: u32, color: Color, t: &Theme) -> Line<'static> {
@@ -6028,6 +6864,64 @@ mod reducer_tests {
             }
             other => panic!("expected Entry::Error, got {other:?}"),
         }
+    }
+
+    // ── V2.12.g · interview mode ──────────────────────────────────────
+
+    #[test]
+    fn agent_end_with_interview_marker_opens_modal() {
+        // When the agent's assistant text contains [[INTERVIEW: ...]],
+        // agent_end should open the Interview modal with the defaults
+        // hydrated.
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(text_delta(
+            r#"Let's get started.
+[[INTERVIEW: {
+    "title": "Project setup",
+    "fields": [
+        { "type": "text", "id": "name", "label": "Project name", "default": "my-app" },
+        { "type": "toggle", "id": "typescript", "label": "Use TypeScript?", "default": true }
+    ]
+}]]
+"#,
+        ));
+        a.on_event(Incoming::AgentEnd { messages: vec![] });
+
+        match &a.modal {
+            Some(Modal::Interview(state)) => {
+                assert_eq!(state.title, "Project setup");
+                assert_eq!(state.fields.len(), 2);
+                // Focus starts on the first interactive field (Text).
+                assert!(matches!(
+                    state.fields[state.focus],
+                    crate::interview::FieldValue::Text { .. }
+                ));
+            }
+            other => panic!("expected Modal::Interview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interview_response_includes_answers_as_json() {
+        // Hydrate a state, fill the text field, serialise, assert shape.
+        let src = r#"[[INTERVIEW: {
+            "title": "Quick",
+            "fields": [
+                { "type": "text", "id": "note", "label": "Note" },
+                { "type": "toggle", "id": "ok", "label": "OK", "default": true }
+            ]
+        }]]"#;
+        let (iv, _) = crate::interview::parse_marker(src).unwrap();
+        let mut state = crate::interview::InterviewState::from_interview(iv);
+        if let crate::interview::FieldValue::Text { value, cursor, .. } = &mut state.fields[0] {
+            *value = "hello".into();
+            *cursor = 5;
+        }
+        let resp = state.as_response();
+        assert!(resp.contains("<interview-response>"));
+        assert!(resp.contains("\"note\": \"hello\""));
+        assert!(resp.contains("\"ok\": true"));
     }
 
     #[test]

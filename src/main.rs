@@ -6,6 +6,7 @@ mod composer;
 mod files;
 mod git;
 mod history;
+mod interview;
 mod log;
 mod notify;
 mod plan;
