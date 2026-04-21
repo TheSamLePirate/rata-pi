@@ -493,15 +493,17 @@ impl App {
         // Skipped when we're already in a modal (pre-existing interview
         // or other blocker).
         if self.modal.is_none()
-            && let Some((iv, range)) = crate::interview::detect_interview(&text)
+            && let Some((iv, ranges)) = crate::interview::detect_interview(&text)
         {
-            let stripped = crate::interview::strip_range(&text, range);
+            let stripped = crate::interview::strip_ranges(&text, ranges);
             self.transcript.rewrite_last_assistant(stripped);
             let title = iv.title.clone();
+            let n_fields = iv.fields.iter().filter(|f| f.is_interactive()).count();
+            let plur = if n_fields == 1 { "" } else { "s" };
             let state = crate::interview::InterviewState::from_interview(iv);
             self.modal = Some(Modal::Interview(Box::new(state)));
             self.transcript.push(Entry::Info(format!(
-                "✍ agent opened an interview: \"{title}\" — answer and Ctrl+Enter to submit (Esc cancels)"
+                "✍ agent opened an interview: \"{title}\" ({n_fields} question{plur}) — answer and Ctrl+Enter to submit (Esc cancels)"
             )));
             self.flash(format!("interview · {title}"));
         }
@@ -6909,6 +6911,61 @@ mod reducer_tests {
             }
             other => panic!("expected Modal::Interview, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_end_opens_modal_from_ask_markers() {
+        // Primary path: flat [[ASK_*]] markers (plan-mode style). Verify
+        // the modal opens, the markers are stripped from the visible
+        // assistant card, and the info row is pushed.
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(text_delta(
+            "\
+Let me set up your project.
+
+[[ASK_TITLE: Project setup]]
+[[ASK_SECTION: Basics]]
+[[ASK_TEXT!: name | Project name | my-app]]
+[[ASK_PICK: framework | Framework | React | Vue* | Svelte]]
+[[ASK_YESNO: typescript | Use TypeScript? | yes]]
+[[ASK_SUBMIT: Create]]
+
+I'll take it from here.",
+        ));
+        a.on_event(Incoming::AgentEnd { messages: vec![] });
+
+        match &a.modal {
+            Some(Modal::Interview(state)) => {
+                assert_eq!(state.title, "Project setup");
+                assert_eq!(state.submit_label, "Create");
+                // 1 section + 3 interactive = 4 fields total.
+                assert_eq!(state.fields.len(), 4);
+            }
+            other => panic!("expected Modal::Interview, got {other:?}"),
+        }
+
+        // Card no longer contains any [[ASK_ markers.
+        let text = a
+            .transcript
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Entry::Assistant(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(!text.contains("[[ASK_"), "got {text:?}");
+        assert!(text.contains("Let me set up your project"));
+        assert!(text.contains("I'll take it from here"));
+
+        // Info row lands with the count.
+        let has_info = a.transcript.entries().iter().any(|e| {
+            matches!(e, Entry::Info(s)
+                if s.contains("Project setup") && s.contains("3 question"))
+        });
+        assert!(has_info, "expected info row about the interview");
     }
 
     #[test]

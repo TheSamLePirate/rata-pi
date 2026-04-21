@@ -604,6 +604,383 @@ fn format_number(n: f64) -> String {
     }
 }
 
+// ─────────────────────────────────────── flat-marker grammar (primary) ──
+//
+// Mirrors plan-mode's marker style. One marker per line, pipe-separated
+// fields. Models in the wild emit these FAR more reliably than nested
+// JSON. If any `[[ASK_*]]` marker appears in assistant text, we collect
+// all of them (in document order) and build a single `Interview`.
+
+/// One parsed `[[ASK_*]]` marker plus the byte-range it occupied in the
+/// source text (so the caller can strip every marker from the display).
+#[derive(Debug, Clone)]
+struct ParsedAsk {
+    kind: AskKind,
+    range: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Clone)]
+enum AskKind {
+    Title(String),
+    Desc(String),
+    Section(String),
+    Info(String),
+    Submit(String),
+    Text {
+        id: String,
+        label: String,
+        default: Option<String>,
+        required: bool,
+        multiline: bool,
+    },
+    Yesno {
+        id: String,
+        label: String,
+        default: bool,
+    },
+    Num {
+        id: String,
+        label: String,
+        default: Option<f64>,
+        min: Option<f64>,
+        max: Option<f64>,
+        required: bool,
+    },
+    Pick {
+        id: String,
+        label: String,
+        options: Vec<String>,
+        default: Option<String>,
+        required: bool,
+    },
+    Multi {
+        id: String,
+        label: String,
+        options: Vec<String>,
+        default: Vec<String>,
+    },
+}
+
+fn scan_ask_markers(text: &str) -> Vec<ParsedAsk> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(rel) = text[i..].find("[[ASK_") {
+        let start = i + rel;
+        let after_open = start + 2; // after "[[", pointing at "ASK_…"
+        let Some(close_rel) = text[after_open..].find("]]") else {
+            break;
+        };
+        let body_end = after_open + close_rel;
+        let end = body_end + 2;
+        let body = &text[after_open..body_end];
+        if let Some(kind) = parse_ask_body(body) {
+            out.push(ParsedAsk {
+                kind,
+                range: start..end,
+            });
+        }
+        i = end;
+    }
+    out
+}
+
+fn parse_ask_body(body: &str) -> Option<AskKind> {
+    // Expected shape: `ASK_KIND[!]:<payload>`
+    let colon = body.find(':')?;
+    let head = body[..colon].trim();
+    let payload = body[colon + 1..].trim();
+
+    let (kind_name, required) = match head.strip_suffix('!') {
+        Some(k) => (k.trim_end(), true),
+        None => (head, false),
+    };
+    let kind_name = kind_name.strip_prefix("ASK_")?;
+
+    match kind_name {
+        "TITLE" => Some(AskKind::Title(payload.to_string())),
+        "DESC" => Some(AskKind::Desc(payload.to_string())),
+        "SECTION" => Some(AskKind::Section(payload.to_string())),
+        "INFO" => Some(AskKind::Info(payload.to_string())),
+        "SUBMIT" => Some(AskKind::Submit(payload.to_string())),
+
+        "TEXT" | "AREA" => {
+            let parts = pipe_split(payload);
+            if parts.len() < 2 {
+                return None;
+            }
+            Some(AskKind::Text {
+                id: parts[0].clone(),
+                label: parts[1].clone(),
+                default: parts.get(2).cloned().filter(|s| !s.is_empty()),
+                required,
+                multiline: kind_name == "AREA",
+            })
+        }
+
+        "YESNO" => {
+            let parts = pipe_split(payload);
+            if parts.len() < 2 {
+                return None;
+            }
+            let default = parts
+                .get(2)
+                .map(|s| parse_bool(s).unwrap_or(false))
+                .unwrap_or(false);
+            Some(AskKind::Yesno {
+                id: parts[0].clone(),
+                label: parts[1].clone(),
+                default,
+            })
+        }
+
+        "NUM" => {
+            let parts = pipe_split(payload);
+            if parts.len() < 2 {
+                return None;
+            }
+            let default = parts.get(2).and_then(|s| s.parse::<f64>().ok());
+            let (min, max) = parts.get(3).map(|s| parse_range(s)).unwrap_or((None, None));
+            Some(AskKind::Num {
+                id: parts[0].clone(),
+                label: parts[1].clone(),
+                default,
+                min,
+                max,
+                required,
+            })
+        }
+
+        "PICK" => {
+            let parts = pipe_split(payload);
+            if parts.len() < 3 {
+                return None;
+            }
+            let id = parts[0].clone();
+            let label = parts[1].clone();
+            let (options, default) = extract_options_and_default(&parts[2..]);
+            Some(AskKind::Pick {
+                id,
+                label,
+                options,
+                default,
+                required,
+            })
+        }
+
+        "MULTI" => {
+            let parts = pipe_split(payload);
+            if parts.len() < 3 {
+                return None;
+            }
+            let id = parts[0].clone();
+            let label = parts[1].clone();
+            let (options, defaults) = extract_options_and_multi_defaults(&parts[2..]);
+            Some(AskKind::Multi {
+                id,
+                label,
+                options,
+                default: defaults,
+            })
+        }
+
+        _ => None,
+    }
+}
+
+fn pipe_split(s: &str) -> Vec<String> {
+    s.split('|').map(|p| p.trim().to_string()).collect()
+}
+
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "yes" | "y" | "true" | "on" | "1" => Some(true),
+        "no" | "n" | "false" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_range(s: &str) -> (Option<f64>, Option<f64>) {
+    // Accept "min-max", "min..max", "min,max". All parts optional.
+    let sep = s
+        .find("..")
+        .map(|i| (i, 2))
+        .or_else(|| s.find('-').map(|i| (i, 1)))
+        .or_else(|| s.find(',').map(|i| (i, 1)));
+    if let Some((i, len)) = sep {
+        let lo = s[..i].trim();
+        let hi = s[i + len..].trim();
+        (lo.parse::<f64>().ok(), hi.parse::<f64>().ok())
+    } else {
+        (None, None)
+    }
+}
+
+fn extract_options_and_default(parts: &[String]) -> (Vec<String>, Option<String>) {
+    let mut options = Vec::new();
+    let mut default = None;
+    for raw in parts {
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some(name) = raw.strip_suffix('*') {
+            let name = name.trim().to_string();
+            options.push(name.clone());
+            default = Some(name);
+        } else {
+            options.push(raw.clone());
+        }
+    }
+    (options, default)
+}
+
+fn extract_options_and_multi_defaults(parts: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut options = Vec::new();
+    let mut defaults = Vec::new();
+    for raw in parts {
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some(name) = raw.strip_suffix('*') {
+            let name = name.trim().to_string();
+            options.push(name.clone());
+            defaults.push(name);
+        } else {
+            options.push(raw.clone());
+        }
+    }
+    (options, defaults)
+}
+
+/// Build an [`Interview`] from a run of ASK markers (in document order).
+/// Returns None if the run has no interactive fields.
+fn assemble_interview(asks: Vec<ParsedAsk>) -> Option<Interview> {
+    let mut title: Option<String> = None;
+    let mut description: Option<String> = None;
+    let mut submit_label: Option<String> = None;
+    let mut fields: Vec<Field> = Vec::new();
+    let mut has_interactive = false;
+
+    for a in asks {
+        match a.kind {
+            AskKind::Title(t) if title.is_none() => title = Some(t),
+            AskKind::Desc(d) if description.is_none() => description = Some(d),
+            AskKind::Submit(s) if submit_label.is_none() => submit_label = Some(s),
+            AskKind::Title(_) | AskKind::Desc(_) | AskKind::Submit(_) => {}
+
+            AskKind::Section(title) => {
+                fields.push(Field::Section {
+                    title,
+                    description: None,
+                });
+            }
+            AskKind::Info(text) => {
+                fields.push(Field::Info { text });
+            }
+            AskKind::Text {
+                id,
+                label,
+                default,
+                required,
+                multiline,
+            } => {
+                has_interactive = true;
+                fields.push(Field::Text {
+                    id,
+                    label,
+                    description: None,
+                    placeholder: None,
+                    default,
+                    required,
+                    multiline,
+                });
+            }
+            AskKind::Yesno { id, label, default } => {
+                has_interactive = true;
+                fields.push(Field::Toggle {
+                    id,
+                    label,
+                    description: None,
+                    default,
+                });
+            }
+            AskKind::Num {
+                id,
+                label,
+                default,
+                min,
+                max,
+                required,
+            } => {
+                has_interactive = true;
+                fields.push(Field::Number {
+                    id,
+                    label,
+                    description: None,
+                    min,
+                    max,
+                    default,
+                    required,
+                });
+            }
+            AskKind::Pick {
+                id,
+                label,
+                options,
+                default,
+                required,
+            } => {
+                has_interactive = true;
+                fields.push(Field::Select {
+                    id,
+                    label,
+                    description: None,
+                    options,
+                    default,
+                    required,
+                });
+            }
+            AskKind::Multi {
+                id,
+                label,
+                options,
+                default,
+            } => {
+                has_interactive = true;
+                fields.push(Field::Multiselect {
+                    id,
+                    label,
+                    description: None,
+                    options,
+                    default,
+                });
+            }
+        }
+    }
+
+    if !has_interactive {
+        return None;
+    }
+    Some(Interview {
+        title: title.unwrap_or_else(|| "Questions".to_string()),
+        description,
+        submit_label,
+        fields,
+    })
+}
+
+/// Primary marker-based detector. Scans for `[[ASK_*]]` markers and,
+/// if at least one interactive field is present, returns the assembled
+/// interview plus the full list of byte-ranges to strip from display.
+pub fn parse_ask_markers(text: &str) -> Option<(Interview, Vec<std::ops::Range<usize>>)> {
+    let asks = scan_ask_markers(text);
+    if asks.is_empty() {
+        return None;
+    }
+    let ranges: Vec<std::ops::Range<usize>> = asks.iter().map(|a| a.range.clone()).collect();
+    let iv = assemble_interview(asks)?;
+    Some((iv, ranges))
+}
+
 // ─────────────────────────────────────────────────────────── parsing ──
 
 const MARKER_OPEN: &str = "[[INTERVIEW:";
@@ -693,29 +1070,74 @@ pub fn strip_range(text: &str, range: std::ops::Range<usize>) -> String {
 
 /// Robust interview detector: tries multiple shapes in priority order.
 ///
-/// 1. The canonical `[[INTERVIEW: …]]` marker (per [`parse_marker`]).
-/// 2. Any fenced code block whose body deserializes as an [`Interview`]
-///    and has at least one recognized field type.
-/// 3. A bare JSON object in the text that deserializes the same way.
+/// 1. **Flat ASK markers** (primary, mirrors plan-mode's reliable style):
+///    a run of `[[ASK_TEXT: …]]`, `[[ASK_PICK: …]]`, etc. Each marker is
+///    one line, pipe-separated fields, no JSON. Models emit these
+///    correctly almost every time.
+/// 2. Canonical `[[INTERVIEW: …json…]]` marker (advanced, for agents
+///    that prefer a single structured payload).
+/// 3. Any fenced code block whose body deserializes as an [`Interview`].
+/// 4. A bare JSON object that deserializes the same way.
 ///
-/// Fallbacks 2 and 3 exist because agents in the wild often drop the
-/// wrapper — they write "Here's a form:" followed by a fenced JSON
-/// block, or just the JSON on its own. Requiring the exact marker is
-/// correct in theory but brittle in practice, so we accept any
-/// interview-shaped JSON that clearly isn't accidental (validated via
-/// non-empty `title` + non-empty `fields` + at least one field with a
-/// known `type`).
-///
-/// Returns the parsed Interview plus the byte-range in `text` to strip
-/// from the visible transcript.
-pub fn detect_interview(text: &str) -> Option<(Interview, std::ops::Range<usize>)> {
-    if let Some(hit) = parse_marker(text) {
+/// Returns the parsed Interview plus a list of byte-ranges to strip from
+/// the visible transcript (so the user sees the agent's prose without
+/// raw markers or JSON). The flat-marker path returns one range per
+/// marker; the JSON paths return a single range.
+pub fn detect_interview(text: &str) -> Option<(Interview, Vec<std::ops::Range<usize>>)> {
+    // Primary: flat ASK markers, one per line.
+    if let Some(hit) = parse_ask_markers(text) {
         return Some(hit);
     }
-    if let Some(hit) = scan_fenced_blocks(text) {
-        return Some(hit);
+    // Fallback 1: JSON marker.
+    if let Some((iv, range)) = parse_marker(text) {
+        return Some((iv, vec![range]));
     }
-    scan_bare_json(text)
+    // Fallback 2: fenced JSON code block.
+    if let Some((iv, range)) = scan_fenced_blocks(text) {
+        return Some((iv, vec![range]));
+    }
+    // Fallback 3: bare JSON object.
+    let (iv, range) = scan_bare_json(text)?;
+    Some((iv, vec![range]))
+}
+
+/// Strip a set of byte-ranges (possibly overlapping) from `text` and
+/// return the remainder with surrounding whitespace collapsed.
+pub fn strip_ranges(text: &str, mut ranges: Vec<std::ops::Range<usize>>) -> String {
+    // Sort by start, coalesce overlaps, then strip right-to-left so
+    // earlier indices stay valid.
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for r in ranges {
+        if let Some(last) = merged.last_mut()
+            && r.start <= last.end
+        {
+            last.end = last.end.max(r.end);
+            continue;
+        }
+        merged.push(r);
+    }
+    let mut out = text.to_string();
+    for r in merged.into_iter().rev() {
+        let r = r.start.min(out.len())..r.end.min(out.len());
+        out.replace_range(r, "");
+    }
+    // Collapse 3+ newlines to 2 (common after stripping a block of
+    // markers separated by newlines).
+    let mut collapsed = String::with_capacity(out.len());
+    let mut newline_run = 0usize;
+    for ch in out.chars() {
+        if ch == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                collapsed.push(ch);
+            }
+        } else {
+            newline_run = 0;
+            collapsed.push(ch);
+        }
+    }
+    collapsed.trim().to_string()
 }
 
 /// Find the first fenced code block (``` … ```) whose body parses as an
@@ -827,22 +1249,27 @@ fn try_parse_interview(s: &str) -> Option<Interview> {
 /// prompts so the agent knows it can author an interview.
 pub fn capability_hint() -> &'static str {
     concat!(
-        "\n\n[rata-pi] When you need structured input from the user ",
-        "(multiple related questions), emit ONE interview form in your ",
-        "reply. Preferred wrapper (renders cleanest):\n",
-        "  [[INTERVIEW: {\"title\":\"…\",\"fields\":[ … ]}]]\n",
-        "Also accepted (same JSON body): a ```json fenced block, or the ",
-        "bare JSON object on its own — the UI detects any of these.\n",
-        "When detected, a form modal opens; the user's answers arrive ",
-        "as a JSON <interview-response> block in their next message, ",
-        "and the raw JSON is stripped from your visible card.\n",
-        "Field types: `text` (+ optional `multiline`), `toggle`, ",
-        "`select` (radio), `multiselect` (checkboxes), `number` (with ",
-        "optional `min`/`max`), `section` (divider), `info` (note). ",
-        "Every interactive field must have `id` + `label`; use ",
-        "`required: true` to block empty submits and `default` to ",
-        "preseed. Prefer one interview over many `ask` round-trips when ",
-        "the questions are related.",
+        "\n\n(rata-pi interview protocol — when you need several related ",
+        "answers from the user, emit these one-per-line markers. Pipe (|) ",
+        "separates fields; trailing `!` on the kind = required; trailing ",
+        "`*` on an option = default / preselected. All markers are ",
+        "stripped from your visible card, the modal opens, and the ",
+        "user's answers come back as a <interview-response> JSON block.\n",
+        "\n",
+        "  [[ASK_TITLE: Project setup]]\n",
+        "  [[ASK_DESC: Tell me how to scaffold this]]\n",
+        "  [[ASK_SECTION: Basics]]\n",
+        "  [[ASK_INFO: Any note or guidance]]\n",
+        "  [[ASK_TEXT!: name | Project name | my-app]]        // required\n",
+        "  [[ASK_AREA: notes | Additional notes]]             // multiline\n",
+        "  [[ASK_YESNO: typescript | Use TypeScript? | yes]]\n",
+        "  [[ASK_PICK: fw | Framework | React | Vue* | Svelte]] // * = default\n",
+        "  [[ASK_MULTI: features | Features | router* | store | testing*]]\n",
+        "  [[ASK_NUM!: port | Port | 5173 | 1024-65535]]\n",
+        "  [[ASK_SUBMIT: Create]]                             // optional button label\n",
+        "\n",
+        "Prefer ONE interview over several free-form questions when the ",
+        "questions are related.)",
     )
 }
 
@@ -970,9 +1397,12 @@ mod tests {
     }
 
     #[test]
-    fn capability_hint_is_not_empty() {
+    fn capability_hint_documents_ask_markers() {
         let h = capability_hint();
-        assert!(h.contains("INTERVIEW"));
+        assert!(h.contains("ASK_TEXT"));
+        assert!(h.contains("ASK_PICK"));
+        assert!(h.contains("ASK_MULTI"));
+        assert!(h.contains("ASK_YESNO"));
         assert!(h.contains("interview-response"));
     }
 
@@ -1132,15 +1562,228 @@ mod tests {
         assert_eq!(answers["port"], 5173.0);
     }
 
+    // ── flat ASK markers (primary grammar — plan-mode style) ────────────
+
+    #[test]
+    fn ask_text_marker_parses_with_default() {
+        let src = "Fill this in: [[ASK_TEXT: name | Project name | my-app]]";
+        let (iv, ranges) = parse_ask_markers(src).expect("parses");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(iv.title, "Questions");
+        assert_eq!(iv.fields.len(), 1);
+        match &iv.fields[0] {
+            Field::Text {
+                id,
+                label,
+                default,
+                required,
+                multiline,
+                ..
+            } => {
+                assert_eq!(id, "name");
+                assert_eq!(label, "Project name");
+                assert_eq!(default.as_deref(), Some("my-app"));
+                assert!(!*required);
+                assert!(!*multiline);
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn ask_bang_means_required() {
+        let src = "[[ASK_TEXT!: email | Email]]";
+        let (iv, _) = parse_ask_markers(src).unwrap();
+        match &iv.fields[0] {
+            Field::Text { required, .. } => assert!(required),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn ask_area_is_multiline() {
+        let src = "[[ASK_AREA: notes | Notes]]";
+        let (iv, _) = parse_ask_markers(src).unwrap();
+        match &iv.fields[0] {
+            Field::Text { multiline, .. } => assert!(multiline),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn ask_yesno_accepts_various_bools() {
+        for (input, expected) in [
+            ("yes", true),
+            ("YES", true),
+            ("true", true),
+            ("1", true),
+            ("no", false),
+            ("false", false),
+            ("0", false),
+        ] {
+            let src = format!("[[ASK_YESNO: x | X | {input}]]");
+            let (iv, _) = parse_ask_markers(&src).unwrap();
+            match &iv.fields[0] {
+                Field::Toggle { default, .. } => assert_eq!(*default, expected),
+                _ => panic!(),
+            }
+        }
+    }
+
+    #[test]
+    fn ask_pick_star_marks_default() {
+        let src = "[[ASK_PICK: fw | Framework | React | Vue* | Svelte | None]]";
+        let (iv, _) = parse_ask_markers(src).unwrap();
+        match &iv.fields[0] {
+            Field::Select {
+                options, default, ..
+            } => {
+                assert_eq!(options, &vec!["React", "Vue", "Svelte", "None"]);
+                assert_eq!(default.as_deref(), Some("Vue"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn ask_multi_stars_preselect() {
+        let src = "[[ASK_MULTI: features | Features | router* | store | testing* | i18n]]";
+        let (iv, _) = parse_ask_markers(src).unwrap();
+        match &iv.fields[0] {
+            Field::Multiselect {
+                options, default, ..
+            } => {
+                assert_eq!(options, &vec!["router", "store", "testing", "i18n"]);
+                assert_eq!(default, &vec!["router".to_string(), "testing".to_string()]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn ask_num_parses_range() {
+        let src = "[[ASK_NUM: port | Port | 5173 | 1024-65535]]";
+        let (iv, _) = parse_ask_markers(src).unwrap();
+        match &iv.fields[0] {
+            Field::Number {
+                default, min, max, ..
+            } => {
+                assert_eq!(*default, Some(5173.0));
+                assert_eq!(*min, Some(1024.0));
+                assert_eq!(*max, Some(65535.0));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn ask_title_desc_submit_are_meta() {
+        let src = "\
+            [[ASK_TITLE: Project setup]]\
+            [[ASK_DESC: Tell me about the project]]\
+            [[ASK_SUBMIT: Create]]\
+            [[ASK_TEXT: name | Name]]\
+        ";
+        let (iv, _) = parse_ask_markers(src).unwrap();
+        assert_eq!(iv.title, "Project setup");
+        assert_eq!(iv.description.as_deref(), Some("Tell me about the project"));
+        assert_eq!(iv.submit_label.as_deref(), Some("Create"));
+    }
+
+    #[test]
+    fn ask_section_and_info_are_noninteractive() {
+        let src = "\
+            [[ASK_SECTION: Basics]]\
+            [[ASK_INFO: Any note]]\
+            [[ASK_TEXT: a | A]]\
+        ";
+        let (iv, _) = parse_ask_markers(src).unwrap();
+        assert_eq!(iv.fields.len(), 3);
+        assert!(matches!(&iv.fields[0], Field::Section { title, .. } if title == "Basics"));
+        assert!(matches!(&iv.fields[1], Field::Info { text } if text == "Any note"));
+    }
+
+    #[test]
+    fn ask_without_interactive_returns_none() {
+        // Only meta + section markers — not enough to build a real form.
+        let src = "[[ASK_TITLE: T]] [[ASK_SECTION: S]] [[ASK_INFO: i]]";
+        assert!(parse_ask_markers(src).is_none());
+    }
+
+    #[test]
+    fn full_realistic_agent_emission() {
+        let src = "\
+Let me set up your project for you.
+
+[[ASK_TITLE: Project setup]]
+[[ASK_DESC: Tell me how to scaffold this]]
+
+[[ASK_SECTION: Basics]]
+[[ASK_TEXT!: name | Project name | my-app]]
+[[ASK_PICK: framework | Framework | React | Vue* | Svelte | None]]
+
+[[ASK_SECTION: Options]]
+[[ASK_YESNO: typescript | Use TypeScript? | yes]]
+[[ASK_MULTI: features | Include features | router* | store | testing* | i18n]]
+[[ASK_NUM!: port | Dev-server port | 5173 | 1024-65535]]
+[[ASK_AREA: notes | Additional notes]]
+[[ASK_SUBMIT: Create]]
+
+Once you fill that out I'll scaffold it.";
+        let (iv, ranges) = parse_ask_markers(src).expect("parses full form");
+        assert_eq!(iv.title, "Project setup");
+        assert_eq!(iv.submit_label.as_deref(), Some("Create"));
+        // 2 sections + 6 interactive fields = 8 fields total.
+        assert_eq!(iv.fields.len(), 8);
+        // 11 ASK markers in the text → 11 strip ranges.
+        assert_eq!(ranges.len(), 11);
+
+        // detect_interview also finds it via the primary path.
+        let (iv2, _) = detect_interview(src).unwrap();
+        assert_eq!(iv2.title, "Project setup");
+    }
+
+    #[test]
+    fn strip_ranges_removes_markers_preserves_prose() {
+        let src = "\
+Let me set up your project.
+
+[[ASK_TITLE: Setup]]
+[[ASK_TEXT: name | Name]]
+[[ASK_SUBMIT: Go]]
+
+I'll take it from here.";
+        let (_, ranges) = parse_ask_markers(src).unwrap();
+        let stripped = strip_ranges(src, ranges);
+        assert!(!stripped.contains("[["));
+        assert!(stripped.contains("Let me set up your project"));
+        assert!(stripped.contains("I'll take it from here"));
+    }
+
     // ── lenient detection (fenced + bare JSON fallbacks) ─────────────────
 
     #[test]
-    fn detect_prefers_marker_when_present() {
+    fn detect_falls_back_to_json_marker_when_no_ask_markers() {
+        // Still accepted — flat ASK markers are primary but the JSON
+        // marker path is supported for agents that prefer it.
         let src = r#"lorem [[INTERVIEW: {"title":"M","fields":[
             {"type":"text","id":"a","label":"A"}
         ]}]] ipsum"#;
         let (iv, _) = detect_interview(src).unwrap();
         assert_eq!(iv.title, "M");
+    }
+
+    #[test]
+    fn detect_prefers_ask_markers_over_json_fallback() {
+        // When both ASK markers and JSON are present, the flat marker
+        // path wins.
+        let src = "\
+[[ASK_TITLE: Flat]]
+[[ASK_TEXT: a | A]]
+Also here's JSON: [[INTERVIEW: {\"title\":\"JSON\",\"fields\":[{\"type\":\"text\",\"id\":\"b\",\"label\":\"B\"}]}]]
+";
+        let (iv, _) = detect_interview(src).unwrap();
+        assert_eq!(iv.title, "Flat");
     }
 
     #[test]
@@ -1157,12 +1800,13 @@ mod tests {
 ```
 
 Please fill it out."#;
-        let (iv, range) = detect_interview(src).expect("detects fenced");
+        let (iv, ranges) = detect_interview(src).expect("detects fenced");
         assert_eq!(iv.title, "Setup");
         // The range must include the entire fenced block so stripping
         // removes the triple-backticks too.
-        assert!(src[range.start..range.end].starts_with("```"));
-        assert!(src[range.start..range.end].ends_with("```"));
+        let r = &ranges[0];
+        assert!(src[r.start..r.end].starts_with("```"));
+        assert!(src[r.start..r.end].ends_with("```"));
     }
 
     #[test]
@@ -1185,10 +1829,11 @@ Please fill it out."#;
 }
 
 End of message."#;
-        let (iv, range) = detect_interview(src).expect("detects bare json");
+        let (iv, ranges) = detect_interview(src).expect("detects bare json");
         assert_eq!(iv.title, "Onboarding");
-        assert!(src[range.start..range.end].trim().starts_with('{'));
-        assert!(src[range.start..range.end].trim().ends_with('}'));
+        let r = &ranges[0];
+        assert!(src[r.start..r.end].trim().starts_with('{'));
+        assert!(src[r.start..r.end].trim().ends_with('}'));
     }
 
     #[test]

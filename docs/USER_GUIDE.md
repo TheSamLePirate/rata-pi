@@ -549,33 +549,73 @@ Interview mode is the agent's way of asking you **structured** questions instead
 
 ### How it starts
 
-The agent can emit the form in any of three shapes — rata-pi's detector tries them in order:
+rata-pi's primary grammar is a set of **flat, one-per-line markers** — the same style as plan mode (`[[PLAN_SET: …]]`, `[[STEP_DONE]]`) — because LLMs emit those reliably. No JSON, no nested structures, no escaping. When any `[[ASK_*]]` marker appears in assistant text, rata-pi collects all of them in document order, builds a form, and opens the modal.
 
-1. **Canonical marker** (preferred, renders cleanest):
-   ```
-   [[INTERVIEW: { "title": "...", "fields": [ ... ] }]]
-   ```
-2. **Fenced code block** (commonly used by chat-trained agents):
-   ```
-   ```json
-   { "title": "...", "fields": [ ... ] }
-   ```
-   ```
-   Any language tag works (`json`, `interview`, none).
-3. **Bare JSON object** in the message body. Must deserialize as a valid Interview and carry at least one interactive field — accidental JSON snippets are rejected.
+**Marker reference**
+
+```text
+[[ASK_TITLE: Project setup]]                              # optional, defaults to "Questions"
+[[ASK_DESC: Short description shown above the fields]]    # optional
+[[ASK_SECTION: Basics]]                                   # group header (non-interactive)
+[[ASK_INFO: Any note or guidance shown inline]]           # non-interactive
+
+[[ASK_TEXT:  id | Label | default]]                       # text input
+[[ASK_TEXT!: id | Label | default]]                       # required
+[[ASK_AREA:  id | Label | default]]                       # multi-line text
+[[ASK_YESNO: id | Label | yes]]                           # yes/no toggle (default accepts yes/no/true/false/1/0)
+[[ASK_PICK:  id | Label | React | Vue* | Svelte | None]]  # pick one; * marks the default
+[[ASK_PICK!: id | Label | A | B | C]]                     # pick one, required
+[[ASK_MULTI: id | Label | router* | store | testing* | i18n]]  # pick many; * marks preselected
+[[ASK_NUM:   id | Label | default | min-max]]             # numeric input
+[[ASK_NUM!:  id | Label | default | min-max]]             # required
+
+[[ASK_SUBMIT: Create]]                                    # optional submit-button label
+```
+
+Grammar rules:
+* `|` separates fields. Whitespace around each field is trimmed.
+* Trailing `!` on the kind = required (applies to `TEXT`, `AREA`, `PICK`, `NUM`).
+* Trailing `*` on an option (in `PICK` / `MULTI`) = default or preselected.
+* Range syntax for `ASK_NUM`: `min-max`, `min..max`, or `min,max` — any or both sides can be omitted.
+* Bool literal for `ASK_YESNO`: any of `yes` / `no` / `true` / `false` / `y` / `n` / `on` / `off` / `1` / `0` (case-insensitive).
+
+**Realistic agent emission:**
+
+```text
+Let me set up your project.
+
+[[ASK_TITLE: Project setup]]
+[[ASK_DESC: Tell me how to scaffold this]]
+
+[[ASK_SECTION: Basics]]
+[[ASK_TEXT!: name | Project name | my-app]]
+[[ASK_PICK: framework | Framework | React | Vue* | Svelte | None]]
+
+[[ASK_SECTION: Options]]
+[[ASK_YESNO: typescript | Use TypeScript? | yes]]
+[[ASK_MULTI: features | Include features | router* | store | testing* | i18n]]
+[[ASK_NUM!: port | Dev-server port | 5173 | 1024-65535]]
+[[ASK_AREA: notes | Additional notes]]
+[[ASK_SUBMIT: Create]]
+
+Once you fill that out I'll scaffold.
+```
+
+**Alternative syntaxes (fallbacks, still supported for sophisticated agents):**
+
+1. `[[INTERVIEW: { "title":"…", "fields":[ … ] }]]` — single JSON payload
+2. Fenced code block containing the same JSON: ```` ```json …``` ````
+3. Bare JSON object in the message body (must validate as a non-accidental Interview)
+
+The flat-marker path is tried first; the JSON fallbacks only fire when no `[[ASK_*]]` marker is found.
 
 On detection rata-pi:
-* **Strips** the form JSON (including the surrounding markers / fences) from the visible assistant card — you're not left staring at raw JSON.
+* **Strips every marker** (or the whole JSON block) from the visible assistant card — you're not left staring at raw markers.
 * **Opens** the Interview modal with defaults hydrated.
-* **Pushes** an `Info` row into the transcript: `✍ agent opened an interview: "Title" — answer and Ctrl+Enter to submit (Esc cancels)`.
+* **Pushes** an `Info` row into the transcript: `✍ agent opened an interview: "Title" (N questions) — answer and Ctrl+Enter to submit (Esc cancels)`.
 * **Flashes** `interview · Title` in the status bar.
 
-The capability hint describing all three shapes is automatically appended to your outgoing prompts (when no plan is active), so the agent knows the feature exists without you prompting for it.
-
-**Validation** (prevents accidental triggering on unrelated JSON):
-* `title` must be a non-empty string.
-* `fields` must be a non-empty array.
-* At least one field must have a recognized interactive `type` (not just `section` / `info`).
+The capability hint describing the marker grammar is automatically appended to your outgoing prompts (when no plan is active), so the agent learns the feature exists without you having to explain it.
 
 ### Field types
 
@@ -651,7 +691,9 @@ A normal user message is dispatched with a structured block inside:
 
 If you submitted while the agent was still streaming, rata-pi uses `steer` or `follow_up` depending on the composer's current intent (the same rule as regular submits). Otherwise it's a fresh `prompt`.
 
-### Full example the agent can emit
+### Full JSON example (fallback syntax)
+
+If the agent prefers a single structured payload over the marker grammar, it can emit any of these three equivalent forms:
 
 ```json
 {
@@ -678,6 +720,24 @@ If you submitted while the agent was still streaming, rata-pi uses `steer` or `f
     { "type": "text", "id": "notes", "label": "Additional notes", "multiline": true }
   ]
 }
+```
+
+Equivalent flat-marker form (preferred — more reliable across models):
+
+```text
+[[ASK_TITLE: Project setup]]
+[[ASK_DESC: Let's scaffold a new app]]
+[[ASK_SECTION: Basics]]
+[[ASK_TEXT!: name | Project name | my-app]]
+[[ASK_PICK: framework | Framework | React | Vue* | Svelte | None]]
+[[ASK_SECTION: Options]]
+[[ASK_YESNO: typescript | Use TypeScript? | yes]]
+[[ASK_MULTI: features | Include features | router* | store | testing* | i18n]]
+[[ASK_NUM: port | Dev-server port | 5173 | 1024-65535]]
+[[ASK_SECTION: Extra]]
+[[ASK_INFO: We'll add more scaffolding later.]]
+[[ASK_AREA: notes | Additional notes]]
+[[ASK_SUBMIT: Create]]
 ```
 
 ### Tips for agents
