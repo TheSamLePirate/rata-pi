@@ -379,6 +379,52 @@ pub fn spawn(pi_bin: &str, pi_argv: &[String], debug_rpc: bool) -> Result<(RpcCl
     Ok(RpcClient::spawn(pi, debug_rpc))
 }
 
+/// V3.h · test-only harness that wraps an `RpcClient` plus the receiver end
+/// of the writer channel so tests can drive `call` / `fire` and inspect
+/// exactly what would have been written to pi's stdin. Has no reader or
+/// stderr tasks — response-correlation paths that require a live pi need
+/// a real spawned child.
+#[cfg(test)]
+pub(crate) struct TestHarness {
+    pub(crate) client: RpcClient,
+    writes: mpsc::Receiver<OutMsg>,
+}
+
+#[cfg(test)]
+impl TestHarness {
+    pub(crate) fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<OutMsg>(64);
+        let client = RpcClient {
+            tx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            id_counter: AtomicU64::new(1),
+            debug_rpc: false,
+        };
+        Self { client, writes: rx }
+    }
+
+    /// Non-blocking: return the next JSON payload that `call` / `fire`
+    /// emitted, or `None` if the writer queue is empty.
+    pub(crate) fn try_next_write(&mut self) -> Option<String> {
+        loop {
+            match self.writes.try_recv() {
+                Ok(OutMsg::Json(s)) => return Some(s),
+                Ok(OutMsg::Shutdown) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Drain every pending write and return them in order.
+    pub(crate) fn drain_writes(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(s) = self.try_next_write() {
+            out.push(s);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

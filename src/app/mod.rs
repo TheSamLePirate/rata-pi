@@ -43,7 +43,7 @@ use modals::settings::{
 };
 // Re-exported for the reducer_tests module; not used in prod code paths.
 #[cfg(test)]
-use modals::settings::{CycleAction, SettingsAction, SettingsRow, ToggleAction};
+use modals::settings::{CycleAction, CycleDir, SettingsAction, SettingsRow, ToggleAction};
 
 use std::collections::VecDeque;
 use std::io::{Stdout, stdout};
@@ -6556,6 +6556,225 @@ I'll take it from here.",
                 "offline settings flash should be Warn-kind"
             );
         }
+    }
+
+    // ── V3.h · dispatch + lifecycle hardening ─────────────────────────
+
+    /// V3.h · every RPC-backed settings cycle fires the correct command
+    /// over the writer channel. Drive each CycleAction with a live
+    /// TestHarness and assert the serialized payload.
+    #[tokio::test]
+    async fn settings_cycle_dispatch_fires_correct_rpc() {
+        use crate::rpc::client::TestHarness;
+
+        let cases: &[(CycleAction, &str)] = &[
+            (CycleAction::ThinkingLevel, "\"cycle_thinking_level\""),
+            (CycleAction::Model, "\"cycle_model\""),
+            (CycleAction::SteeringMode, "\"set_steering_mode\""),
+            (CycleAction::FollowUpMode, "\"set_follow_up_mode\""),
+        ];
+
+        for (action, expected_fragment) in cases {
+            let mut a = app();
+            let mut h = TestHarness::new();
+            dispatch_settings_action(
+                &mut a,
+                Some(&h.client),
+                SettingsAction::Cycle(*action, CycleDir::Forward),
+            )
+            .await;
+            let writes = h.drain_writes();
+            assert_eq!(
+                writes.len(),
+                1,
+                "{action:?} should produce exactly one RPC write"
+            );
+            assert!(
+                writes[0].contains(expected_fragment),
+                "{action:?} payload missing {expected_fragment:?}: {w}",
+                w = writes[0]
+            );
+        }
+    }
+
+    /// V3.h · RPC-backed toggles (AutoCompact / AutoRetry) fire the
+    /// correct `set_*` command with the flipped boolean.
+    #[tokio::test]
+    async fn settings_toggle_rpc_fires_with_new_value() {
+        use crate::rpc::client::TestHarness;
+
+        for (action, expected_fragment) in [
+            (ToggleAction::AutoCompact, "\"set_auto_compaction\""),
+            (ToggleAction::AutoRetry, "\"set_auto_retry\""),
+        ] {
+            let mut a = app();
+            let mut h = TestHarness::new();
+            dispatch_settings_action(&mut a, Some(&h.client), SettingsAction::Toggle(action)).await;
+            let writes = h.drain_writes();
+            assert_eq!(writes.len(), 1, "{action:?} should fire one RPC");
+            assert!(
+                writes[0].contains(expected_fragment),
+                "{action:?} missing {expected_fragment:?} in {:?}",
+                writes[0]
+            );
+        }
+    }
+
+    /// V3.h · Theme cycle is purely local — no RPC should fire.
+    #[tokio::test]
+    async fn settings_theme_cycle_does_not_hit_pi() {
+        use crate::rpc::client::TestHarness;
+        let mut a = app();
+        let mut h = TestHarness::new();
+        let before_name = a.theme.name;
+        dispatch_settings_action(
+            &mut a,
+            Some(&h.client),
+            SettingsAction::Cycle(CycleAction::Theme, CycleDir::Forward),
+        )
+        .await;
+        assert_ne!(a.theme.name, before_name, "theme should cycle locally");
+        assert!(h.drain_writes().is_empty(), "theme cycle must not hit pi");
+    }
+
+    /// V3.h · ShowRawMarkers is a local-only flag; flipping it must
+    /// not cause any RPC traffic either.
+    #[tokio::test]
+    async fn show_raw_markers_toggle_does_not_hit_pi() {
+        use crate::rpc::client::TestHarness;
+        let mut a = app();
+        let mut h = TestHarness::new();
+        dispatch_settings_action(
+            &mut a,
+            Some(&h.client),
+            SettingsAction::Toggle(ToggleAction::ShowRawMarkers),
+        )
+        .await;
+        assert!(a.show_raw_markers);
+        assert!(h.drain_writes().is_empty());
+    }
+
+    /// V3.h · dispatch_interview_response fires the right RPC variant
+    /// based on composer mode + streaming state. When idle it submits
+    /// as Prompt; mid-stream FollowUp mode it submits as follow_up;
+    /// mid-stream otherwise it submits as steer.
+    #[tokio::test]
+    async fn interview_dispatch_chooses_correct_rpc_by_mode() {
+        use crate::rpc::client::TestHarness;
+
+        // Idle — Prompt.
+        let mut a = app();
+        let mut h = TestHarness::new();
+        crate::app::modals::interview::dispatch_interview_response(
+            &mut a,
+            &h.client,
+            "{\"x\":1}".into(),
+            "one".into(),
+        )
+        .await;
+        let w = h.drain_writes();
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("\"prompt\""),
+            "idle dispatch not prompt: {:?}",
+            w[0]
+        );
+
+        // Streaming + Steer (default ComposerMode::Prompt cycles first to
+        // Steer when streaming starts — use Steer directly).
+        let mut a = app();
+        a.is_streaming = true;
+        a.composer_mode = ComposerMode::Steer;
+        let mut h = TestHarness::new();
+        crate::app::modals::interview::dispatch_interview_response(
+            &mut a,
+            &h.client,
+            "{\"x\":1}".into(),
+            "two".into(),
+        )
+        .await;
+        let w = h.drain_writes();
+        assert!(
+            w[0].contains("\"steer\""),
+            "streaming+Steer not steer: {:?}",
+            w[0]
+        );
+
+        // Streaming + FollowUp.
+        let mut a = app();
+        a.is_streaming = true;
+        a.composer_mode = ComposerMode::FollowUp;
+        let mut h = TestHarness::new();
+        crate::app::modals::interview::dispatch_interview_response(
+            &mut a,
+            &h.client,
+            "{\"x\":1}".into(),
+            "three".into(),
+        )
+        .await;
+        let w = h.drain_writes();
+        assert!(
+            w[0].contains("\"follow_up\""),
+            "streaming+FollowUp not follow_up: {:?}",
+            w[0]
+        );
+    }
+
+    /// V3.h · full plan lifecycle through the reducer: propose →
+    /// accept → STEP_DONE → STEP_DONE → plan complete. Exercises the
+    /// accepted-plan path end-to-end including transcript info rows.
+    #[test]
+    fn plan_full_lifecycle_propose_accept_advance_complete() {
+        let mut a = app();
+        // Propose.
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("[[PLAN_SET: alpha | beta]]"));
+        assert!(a.proposed_plan.is_some());
+        // Accept.
+        a.accept_proposed_plan();
+        assert_eq!(a.plan.count_done(), 0);
+        assert!(a.plan.is_active());
+
+        // Agent completes alpha.
+        a.pending_auto_prompt = None;
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("done with alpha. [[STEP_DONE]]"));
+        assert_eq!(a.plan.count_done(), 1);
+        assert_eq!(a.plan.items[1].status, crate::plan::Status::Active);
+
+        // Agent completes beta.
+        a.pending_auto_prompt = None;
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("done with beta. [[STEP_DONE]]"));
+        assert!(a.plan.all_done());
+        // Transcript should include a "plan complete ✓" info row.
+        assert!(
+            a.transcript
+                .entries()
+                .iter()
+                .any(|e| matches!(e, Entry::Info(s) if s.contains("plan complete"))),
+            "plan complete marker missing"
+        );
+    }
+
+    /// V3.h · Shortcuts modal scroll regression. PgDn bumps by 10;
+    /// Home resets to 0; Esc closes.
+    #[tokio::test]
+    async fn shortcuts_modal_scroll_and_close_bindings() {
+        let mut a = app();
+        a.modal = Some(Modal::Shortcuts { scroll: 0 });
+        handle_modal_key(KeyCode::PageDown, KeyModifiers::NONE, &mut a, None).await;
+        match &a.modal {
+            Some(Modal::Shortcuts { scroll }) => assert_eq!(*scroll, 10),
+            _ => panic!("Shortcuts modal gone after PageDown"),
+        }
+        handle_modal_key(KeyCode::Home, KeyModifiers::NONE, &mut a, None).await;
+        match &a.modal {
+            Some(Modal::Shortcuts { scroll }) => assert_eq!(*scroll, 0),
+            _ => panic!("Shortcuts modal gone after Home"),
+        }
+        handle_modal_key(KeyCode::Char('q'), KeyModifiers::NONE, &mut a, None).await;
+        assert!(a.modal.is_none(), "q should close Shortcuts");
     }
 
     /// V3.e.3 · every flash_* helper tags the stored FlashKind so the
