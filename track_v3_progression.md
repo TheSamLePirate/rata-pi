@@ -100,64 +100,68 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 ---
 
-## V3.f — Plan approval flow
+## V3.f — Plan approval flow ✅
 
 ### State model
-- [ ] `PlanOrigin { Agent, User }` enum
-- [ ] `ProposedPlan` struct
-- [ ] `App.proposed_plan: Option<ProposedPlan>`
-- [ ] `App.active_plan` (renamed from `App.plan`)
-- [ ] Invariant: `wrap_with_plan` reads only `active_plan`
+- [x] `PlanOrigin { Agent, User }` enum
+- [x] `ProposedPlan` struct + `ProposalKind { NewPlan, Amendment }`
+- [x] `App.proposed_plan: Option<ProposedPlan>`
+- [—] `App.active_plan` rename — kept as `App.plan` to avoid 30+ call-site churn. Behavior matches spec.
+- [x] Invariant: `wrap_with_plan` reads only `app.plan` (accepted plan). Proposal never participates.
 
 ### Parsing
-- [ ] `apply_plan_markers_on_agent_end(&AgentEnd)` parses from `agent_end.messages`
-- [ ] Transcript tail kept as fallback
+- [x] `apply_plan_markers_on_agent_end(&[AgentMessage])` parses from the payload
+- [x] Transcript tail kept as fallback
 
 ### Modal
-- [ ] `Modal::PlanReview(PlanReviewState)` variant
-- [ ] Review mode: `↑↓ j k Enter Esc a e d t`
-- [ ] Edit mode: `↑↓ Enter/i a x/Del t Ctrl+S Esc`
-- [ ] Draw body matches spec
+- [x] `Modal::PlanReview(Box<PlanReviewState>)` variant
+- [x] Review mode: `↑↓/j/k`, `h/l/←/→` (chip focus), `Enter`, `Esc`, `a`, `e`, `d`, `t`
+- [x] Edit mode: `↑↓/j/k`, `Enter/i` edit, `a` add-below, `x/Del` delete, `t` auto-run toggle, `Ctrl+S` accept, `Esc` back
+- [x] Text-entry sub-mode inside Edit: printable insert, `←→`, `Home/End`, `Backspace/Delete`, `Enter` commit, `Esc` cancel
+- [x] Draw body renders Review chips vs Edit focus list with inline cursor
 
 ### Lifecycle
-- [ ] `PLAN_SET` on agent_end → proposal + review modal + info row + `flash_info("review proposed plan")`
-- [ ] Accept → `active_plan` populated, YOLO kick-off if `auto_run`
-- [ ] Deny → proposal cleared + info row + flash
-- [ ] Edit → Accept → edited items become active
-- [ ] `PLAN_ADD` on active plan → amendment proposal (review modal)
-- [ ] User `/plan set` activates immediately (no review)
-- [ ] `STEP_DONE` / `STEP_FAILED` ignored when only `proposed_plan` exists
+- [x] `PLAN_SET` on agent_end → proposal + review modal + info row + flash
+- [x] Accept (new plan) → `plan.set_all` + YOLO kick-off if auto-run
+- [x] Accept (amendment) → `plan.merge_amendment` preserving status on matching steps
+- [x] Deny → proposal cleared + info row + flash
+- [x] Edit → Accept → edited items become active
+- [x] `PLAN_ADD` on active plan → amendment proposal (review modal)
+- [x] User `/plan set` activates immediately (no review, unchanged)
+- [x] `STEP_DONE` / `STEP_FAILED` ignored when only `proposed_plan` exists
+- [x] `STEP_DONE` advances when the plan is accepted
 
 ### Marker visibility
-- [ ] `plan::strip_ranges` added
-- [ ] Plan markers stripped from transcript (parallel to interview strip)
-- [ ] `/settings → Appearance → show raw markers` toggle (`ToggleAction::ShowRawMarkers`)
-- [ ] `App.show_raw_markers: bool` (default false) — when true, strip passes skipped
+- [x] `plan::strip_markers` added (drops `PLAN_SET`/`PLAN_ADD`/`STEP_DONE`/`STEP_FAILED`, keeps foreign `[[…]]`)
+- [x] Plan markers stripped from transcript tail after each agent_end (when toggle is off)
+- [x] `/settings → Appearance → show raw markers` toggle (`ToggleAction::ShowRawMarkers`)
+- [x] `App.show_raw_markers: bool` (default false) gates the strip pass
 
-### Tests (cover full acceptance matrix)
-- [ ] PLAN_SET on agent_end → proposal, no activation
-- [ ] `wrap_with_plan` unchanged while proposal exists
-- [ ] Accept path
-- [ ] Deny path
-- [ ] Edit → delete + add + edit text → Accept path
-- [ ] Parsing from `agent_end.messages` wins over transcript tail
-- [ ] PLAN_ADD on active plan creates amendment
-- [ ] STEP_DONE no-op with only proposal
-- [ ] `/plan set` bypasses review
-- [ ] Plan markers stripped by default; visible with toggle on
+### Tests — V3.f adds 10 new reducer/integration tests:
+- [x] `plan_set_from_agent_creates_proposal_not_active_plan`
+- [x] `accept_proposed_plan_activates_and_stages_first_step`
+- [x] `deny_proposed_plan_clears_it`
+- [x] `step_done_ignored_without_accepted_plan`
+- [x] `step_done_advances_accepted_plan`
+- [x] `plan_set_parses_from_agent_end_messages_not_transcript_tail`
+- [x] `plan_review_edit_delete_add_accept` (Edit → delete → add → Ctrl+S)
+- [x] `plan_markers_stripped_from_transcript_by_default`
+- [x] `show_raw_markers_toggle_preserves_brackets`
+- [x] `amendment_acceptance_preserves_step_status`
+- [x] Plus 3 plan::strip_markers unit tests
 
 ### Acceptance criteria (from `plan_approval_flow.md`)
-- [ ] 1. Agent PLAN_SET does not immediately become active
-- [ ] 2. Agent PLAN_SET opens review modal automatically
-- [ ] 3. Accept/Deny/Edit available
-- [ ] 4. No auto-run before acceptance
-- [ ] 5. Only accepted plan affects `wrap_with_plan`
-- [ ] 6. STEP_DONE/STEP_FAILED only on accepted active plans
-- [ ] 7. Visible transcript feedback for all transitions
-- [ ] 8. Parsing from `agent_end.messages`
-- [ ] 9. Marker visibility policy consistent
+- [x] 1. Agent PLAN_SET does not immediately become active
+- [x] 2. Agent PLAN_SET opens review modal automatically
+- [x] 3. Accept/Deny/Edit available
+- [x] 4. No auto-run before acceptance
+- [x] 5. Only accepted plan affects `wrap_with_plan` (via `plan.is_active` gate)
+- [x] 6. STEP_DONE/STEP_FAILED only on accepted active plans
+- [x] 7. Visible transcript feedback for all transitions
+- [x] 8. Parsing from `agent_end.messages`
+- [x] 9. Marker visibility policy consistent
 
-**Shipped as** ``
+**Shipped as** V3.f.1 `e6c390d` · V3.f.2 `521fddd` · V3.f.3 `<tbd>`
 
 ---
 
@@ -229,25 +233,32 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 | | V2.13 | V3.a | V3.b | V3.c | V3.d | V3.e | V3.f | V3.g | V3.h | V3.i | V3.j |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| Tests | 194 | 197 | 203 | 203 | 203 | **207** | | | ≥ 220 | | |
-| `src/app/mod.rs` LoC | 8 266 | 8 311 | 8 348 | 8 348 | 6 132 | 6 204 | | | | | |
-| Modules under `src/app/` | 3 | 3 | 3 | 3 | 8 | 8 | | | | | |
-| Flash color-coded by kind | no | no | no | no | no | **yes** | | | | | |
-| Release binary (MiB) | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | | | | | |
-| Hardcoded `Color::X` in markdown/syntax | many | many | many | many | many | many | | | | | |
-| CI test OS count | 2 | 2 | 2 | 3 | 3 | 3 | | | | | |
-| CI jobs total | 4 | 4 | 4 | 6 | 6 | 6 | | | | | |
-| Clippy `-D warnings` enforced in CI | no | no | no | yes | yes | yes | | | | | |
-| Per-frame I/O in /settings | 3+ | 3+ | 0 | 0 | 0 | 0 | | | | | |
-| Per-frame transcript hash walk | O(n) | O(n) | O(1) idle | O(1) idle | O(1) idle | O(1) idle | | | | | |
-| Clippy clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | | | | |
-| Fmt clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | | | | |
+| Tests | 194 | 197 | 203 | 203 | 203 | 207 | **220** | | ≥ 220 | | |
+| `src/app/mod.rs` LoC | 8 266 | 8 311 | 8 348 | 8 348 | 6 132 | 6 204 | 6 769 | | | | |
+| Modules under `src/app/` | 3 | 3 | 3 | 3 | 8 | 8 | 8 | | | | |
+| Agent plans require user accept | no | no | no | no | no | no | **yes** | | | | |
+| Plan markers visible in transcript | yes | yes | yes | yes | yes | yes | **no** (default) | | | | |
+| Flash color-coded by kind | no | no | no | no | no | yes | yes | | | | |
+| Release binary (MiB) | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | | | | |
+| Hardcoded `Color::X` in markdown/syntax | many | many | many | many | many | many | many | | | | |
+| CI test OS count | 2 | 2 | 2 | 3 | 3 | 3 | 3 | | | | |
+| CI jobs total | 4 | 4 | 4 | 6 | 6 | 6 | 6 | | | | |
+| Clippy `-D warnings` enforced in CI | no | no | no | yes | yes | yes | yes | | | | |
+| Per-frame I/O in /settings | 3+ | 3+ | 0 | 0 | 0 | 0 | 0 | | | | |
+| Per-frame transcript hash walk | O(n) | O(n) | O(1) idle | O(1) idle | O(1) idle | O(1) idle | O(1) idle | | | | |
+| Clippy clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | | | |
+| Fmt clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | | | |
 
 ---
 
 ## Deviations
 
 *(If any task deviates from `PLAN_V3.md`, record it below with: sub-milestone · task · what changed · why. Blank section = on plan.)*
+
+### 3. V3.f · `App.plan` kept its name (not renamed to `active_plan`)
+**What changed.** `plan_approval_flow.md` proposed renaming `App.plan` → `App.active_plan`. We kept the existing name.
+
+**Why.** The spec's goal was making the proposal-vs-accepted distinction clear in code. We hit that by introducing `App.proposed_plan: Option<ProposedPlan>` alongside the existing `App.plan` — the pair `(proposed_plan, plan)` already reads as draft-vs-committed. Renaming `plan` → `active_plan` would touch ~30 call sites across mod.rs, events.rs, input.rs, modals/settings.rs, plan slash handling, and existing tests, with no behavior benefit. Kept simple: `plan` is the accepted one; `proposed_plan` is the draft under review.
 
 ### 2. V3.d · mod.rs ended at 6 132 lines, not ≤ 5 100
 **What changed.** The plan targeted `src/app/mod.rs` ≤ 5 100 after the medium split; final LoC is 6 132.

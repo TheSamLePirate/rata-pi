@@ -174,6 +174,35 @@ impl Plan {
         self.fail_reason = None;
     }
 
+    /// V3.f.3 · merge an amendment into the active plan. Items whose
+    /// text matches an existing step keep their status + attempts;
+    /// new texts are appended as Pending. If nothing is Active after
+    /// the merge, the first Pending is promoted so the plan doesn't
+    /// silently stall.
+    pub fn merge_amendment(&mut self, new_items: Vec<String>) {
+        let mut out = Vec::with_capacity(new_items.len());
+        for text in new_items {
+            let keep = self
+                .items
+                .iter()
+                .position(|it| it.text == text)
+                .map(|i| self.items.remove(i));
+            out.push(keep.unwrap_or(Item {
+                text,
+                status: Status::Pending,
+                attempts: 0,
+            }));
+        }
+        if !out.iter().any(|it| it.status == Status::Active)
+            && let Some(next) = out.iter_mut().find(|it| it.status == Status::Pending)
+        {
+            next.status = Status::Active;
+            next.attempts = 0;
+        }
+        self.items = out;
+        self.fail_reason = None;
+    }
+
     /// Parse `"item a | item b | item c"` into a `Vec<String>`.
     pub fn parse_list(s: &str) -> Vec<String> {
         s.split('|')
@@ -223,12 +252,24 @@ pub enum PlanOrigin {
 /// V3.f · a plan proposed by the agent but not yet accepted by the user.
 /// Lives alongside the real `Plan` so `wrap_with_plan()` can ignore it —
 /// only accepted plans participate in prompt wrapping or auto-run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalKind {
+    /// Brand-new plan from `[[PLAN_SET: …]]` — acceptance replaces any
+    /// active plan wholesale.
+    NewPlan,
+    /// `[[PLAN_ADD: …]]` against an existing active plan — acceptance
+    /// merges the amended list via `Plan::merge_amendment`, preserving
+    /// status on matching steps.
+    Amendment,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProposedPlan {
     pub items: Vec<String>,
     /// V3.f.2 reads this to branch on the Edit-mode semantics.
     #[allow(dead_code)]
     pub origin: PlanOrigin,
+    pub kind: ProposalKind,
     /// Agent-suggested auto-run hint. The user may override in the review
     /// modal before accepting. Per V3 answer #3 we keep the answer YOLO:
     /// acceptance defaults to ON unless the user flips it.
@@ -295,6 +336,50 @@ pub fn parse_markers(text: &str) -> Vec<Marker> {
         }
     }
     out
+}
+
+/// V3.f.3 · strip every `[[PLAN_SET: …]]`, `[[PLAN_ADD: …]]`,
+/// `[[STEP_DONE]]`, and `[[STEP_FAILED: …]]` marker from `text`. Used
+/// to hide protocol bracket syntax from the transcript once its
+/// semantic effect has been applied — mirror of interview's strip.
+/// When `show_raw_markers` is on in /settings, `apply_plan_markers_on_agent_end`
+/// skips this pass so the raw bracket text shows through for debugging.
+pub fn strip_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("[[") {
+        // Push text before the "[[".
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("]]") else {
+            // Unterminated "[[" — push it as-is and stop.
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let body = &after[..close];
+        let body_upper = body.split_once(':').map(|(h, _)| h).unwrap_or(body);
+        let is_plan_marker = matches!(
+            body_upper.trim(),
+            "STEP_DONE" | "STEP_FAILED" | "PLAN_SET" | "PLAN_ADD"
+        );
+        if is_plan_marker {
+            // Drop the whole marker AND absorb a trailing newline if
+            // any so we don't leave visual gaps in the assistant text.
+            let consumed = after.as_ptr() as usize - rest.as_ptr() as usize + close + 2;
+            rest = &rest[consumed..];
+            if let Some(stripped_nl) = rest.strip_prefix('\n') {
+                rest = stripped_nl;
+            }
+        } else {
+            // Foreign "[[…]]" — keep it intact.
+            out.push_str("[[");
+            out.push_str(body);
+            out.push_str("]]");
+            rest = &after[close + 2..];
+        }
+    }
+    out.push_str(rest);
+    out.trim_end().to_string()
 }
 
 /// Short capability hint appended to user prompts when no plan is active.
@@ -417,5 +502,40 @@ mod tests {
         assert_eq!(p.bump_attempt(), 1);
         assert_eq!(p.bump_attempt(), 2);
         assert_eq!(p.items[0].attempts, 2);
+    }
+
+    /// V3.f.3 · strip every plan marker from assistant text, leaving the
+    /// prose intact.
+    #[test]
+    fn strip_markers_removes_all_four_kinds() {
+        let src = "Sure, here's the plan: [[PLAN_SET: a | b | c]]\n\
+                   Working on a. [[PLAN_ADD: d]]\n\
+                   [[STEP_DONE]]\n\
+                   But I had to give up. [[STEP_FAILED: tool missing]]";
+        let out = strip_markers(src);
+        assert!(!out.contains("[[PLAN_"), "markers leaked: {out}");
+        assert!(!out.contains("[[STEP_"), "markers leaked: {out}");
+        assert!(out.contains("Sure, here's the plan:"));
+        assert!(out.contains("Working on a."));
+        assert!(out.contains("But I had to give up."));
+    }
+
+    /// V3.f.3 · non-plan `[[foo]]` passages are untouched.
+    #[test]
+    fn strip_markers_keeps_foreign_brackets() {
+        let src = "See [[Reference]] and [[OTHER: payload]] and [[STEP_DONE]]";
+        let out = strip_markers(src);
+        assert!(out.contains("[[Reference]]"));
+        assert!(out.contains("[[OTHER: payload]]"));
+        assert!(!out.contains("[[STEP_DONE]]"));
+    }
+
+    #[test]
+    fn strip_markers_handles_unterminated() {
+        // An unterminated "[[" must not panic or drop the tail.
+        let src = "broken [[PLAN_SET: a";
+        let out = strip_markers(src);
+        assert!(out.contains("broken"));
+        assert!(out.contains("[[PLAN_SET: a"));
     }
 }

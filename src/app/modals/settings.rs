@@ -199,6 +199,17 @@ pub(crate) async fn dispatch_settings_action(
                 if app.plan.auto_run { "on" } else { "off" }
             ));
         }
+        SettingsAction::Toggle(ToggleAction::ShowRawMarkers) => {
+            app.show_raw_markers = !app.show_raw_markers;
+            app.flash(format!(
+                "raw markers {}",
+                if app.show_raw_markers {
+                    "visible"
+                } else {
+                    "hidden"
+                }
+            ));
+        }
 
         SettingsAction::Cycle(CycleAction::Theme, _) => {
             app.cycle_theme();
@@ -274,6 +285,9 @@ pub(crate) enum ToggleAction {
     AutoCompact,
     AutoRetry,
     PlanAutoRun,
+    /// V3.f.3 · leave protocol markers (plan + interview) visible in
+    /// the transcript for debugging.
+    ShowRawMarkers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -381,6 +395,14 @@ pub(crate) fn build_settings_rows(app: &App) -> Vec<SettingsRow> {
         label: "vim mode".into(),
         value: app.vim_enabled,
         action: ToggleAction::Vim,
+    });
+    // V3.f.3 · leave plan / interview markers visible in the transcript
+    // tail. Off by default; flipping it re-renders the strip pass as a
+    // no-op so future agent_ends show raw brackets through.
+    rows.push(R::Toggle {
+        label: "show raw markers".into(),
+        value: app.show_raw_markers,
+        action: ToggleAction::ShowRawMarkers,
     });
 
     rows.push(R::Header("Live state"));

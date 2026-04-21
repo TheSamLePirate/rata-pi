@@ -393,6 +393,10 @@ pub(super) struct App {
     /// read-only from the perspective of `wrap_with_plan` / auto-run;
     /// only `app.plan` (the accepted plan) participates in those paths.
     proposed_plan: Option<crate::plan::ProposedPlan>,
+    /// V3.f.3 · when true, protocol markers (plan + interview) remain
+    /// visible in the transcript for debugging. Default false. Toggled
+    /// via `/settings → Appearance → show raw markers`.
+    show_raw_markers: bool,
 
     // ── V2.11: notifications ───────────────────────────────────────────
     /// Tick count when the current turn started (on `agent_start`). Used
@@ -543,6 +547,7 @@ impl App {
             plan: crate::plan::Plan::default(),
             pending_auto_prompt: None,
             proposed_plan: None,
+            show_raw_markers: false,
             agent_start_tick: None,
             tool_calls_this_turn: 0,
             notify_enabled: true,
@@ -642,6 +647,24 @@ impl App {
             self.flash(format!("interview · {title}"));
         }
 
+        // V3.f.3 · strip plan markers from the visible transcript tail
+        // unless the user opted into raw-marker view in /settings. Text
+        // itself (the parsing source above) is kept intact for marker
+        // extraction below.
+        if !self.show_raw_markers
+            && let Some(tail_idx) = self
+                .transcript
+                .entries()
+                .iter()
+                .rposition(|e| matches!(e, Entry::Assistant(_)))
+            && let Some(Entry::Assistant(tail)) = self.transcript.entries().get(tail_idx)
+        {
+            let stripped = crate::plan::strip_markers(tail);
+            if stripped != *tail {
+                self.transcript.rewrite_last_assistant(stripped);
+            }
+        }
+
         let mut advanced = false;
         for m in crate::plan::parse_markers(&text) {
             match m {
@@ -724,6 +747,7 @@ impl App {
         self.proposed_plan = Some(crate::plan::ProposedPlan {
             items: items.clone(),
             origin: crate::plan::PlanOrigin::Agent,
+            kind: crate::plan::ProposalKind::NewPlan,
             suggested_auto_run: true,
             created_at_tick: self.ticks,
         });
@@ -751,6 +775,7 @@ impl App {
         self.proposed_plan = Some(crate::plan::ProposedPlan {
             items: preview.clone(),
             origin: crate::plan::PlanOrigin::Agent,
+            kind: crate::plan::ProposalKind::Amendment,
             suggested_auto_run: self.plan.auto_run,
             created_at_tick: self.ticks,
         });
@@ -769,20 +794,32 @@ impl App {
     /// V3.f · accept the current proposal. Moves items into `self.plan`,
     /// clears the proposal, and (per V3 answer #3) kicks off auto-run
     /// immediately when the user left that toggle on — YOLO mode.
+    /// Amendment proposals merge into the active plan instead of
+    /// replacing it, preserving status + attempts on matching steps.
     pub(super) fn accept_proposed_plan(&mut self) {
         let Some(proposal) = self.proposed_plan.take() else {
             return;
         };
         let count = proposal.items.len();
-        self.plan.set_all(proposal.items);
-        // set_all forces auto_run = true; respect the user's toggle from
-        // the review modal (they may have flipped it off).
-        self.plan.auto_run = proposal.suggested_auto_run;
-        self.transcript
-            .push(Entry::Info(format!("plan accepted: {count} steps")));
+        match proposal.kind {
+            crate::plan::ProposalKind::NewPlan => {
+                self.plan.set_all(proposal.items);
+                // set_all forces auto_run = true; respect the user's
+                // toggle from the review modal.
+                self.plan.auto_run = proposal.suggested_auto_run;
+                self.transcript
+                    .push(Entry::Info(format!("plan accepted: {count} steps")));
+            }
+            crate::plan::ProposalKind::Amendment => {
+                self.plan.merge_amendment(proposal.items);
+                self.plan.auto_run = proposal.suggested_auto_run;
+                self.transcript.push(Entry::Info(format!(
+                    "plan amendment accepted: {count} steps"
+                )));
+            }
+        }
         self.flash_success("plan accepted");
-        // YOLO kick-off: stage the first-step prompt so the ui_loop
-        // fires it on the next tick.
+        // YOLO kick-off: stage the first-step prompt when auto-run is on.
         if self.plan.auto_run
             && let Some(cur) = self.plan.current()
         {
@@ -6747,6 +6784,95 @@ I'll take it from here.",
         // Payload contains the PLAN_SET; transcript tail doesn't.
         a.on_event(assistant_end("[[PLAN_SET: x | y]]"));
         assert!(a.proposed_plan.is_some(), "payload should have won");
+    }
+
+    /// V3.f.3 · plan markers are stripped from the assistant transcript
+    /// tail by default. The proposal still fires (parser reads the raw
+    /// payload), but the user-visible text no longer carries bracket
+    /// syntax.
+    #[test]
+    fn plan_markers_stripped_from_transcript_by_default() {
+        let mut a = app();
+        let body = "Here's the plan: [[PLAN_SET: step a | step b]]";
+        a.on_event(Incoming::AgentStart);
+        // Simulate streaming: the transcript tail carries the full raw
+        // marker text by the time agent_end fires.
+        a.on_event(text_delta(body));
+        a.on_event(assistant_end(body));
+        assert!(a.proposed_plan.is_some());
+        let last = a
+            .transcript
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Entry::Assistant(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("assistant entry should exist");
+        assert!(
+            !last.contains("[[PLAN_SET"),
+            "marker leaked into transcript: {last:?}"
+        );
+        assert!(last.contains("Here's the plan:"));
+    }
+
+    /// V3.f.3 · flipping show_raw_markers preserves markers on subsequent
+    /// agent_end events.
+    #[tokio::test]
+    async fn show_raw_markers_toggle_preserves_brackets() {
+        let mut a = app();
+        dispatch_settings_action(
+            &mut a,
+            None,
+            SettingsAction::Toggle(ToggleAction::ShowRawMarkers),
+        )
+        .await;
+        assert!(a.show_raw_markers);
+        let body = "Here's the plan: [[PLAN_SET: one | two]]";
+        a.on_event(Incoming::AgentStart);
+        a.on_event(text_delta(body));
+        a.on_event(assistant_end(body));
+        let last = a
+            .transcript
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Entry::Assistant(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            last.contains("[[PLAN_SET: one | two]]"),
+            "raw marker missing with toggle on: {last:?}"
+        );
+    }
+
+    /// V3.f.3 · amendment acceptance merges into the active plan,
+    /// preserving step status for matching texts.
+    #[test]
+    fn amendment_acceptance_preserves_step_status() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("[[PLAN_SET: alpha | beta]]"));
+        a.accept_proposed_plan();
+        assert_eq!(a.plan.total(), 2);
+        a.plan.mark_done();
+        assert_eq!(a.plan.items[0].status, crate::plan::Status::Done);
+        assert_eq!(a.plan.items[1].status, crate::plan::Status::Active);
+        // Agent emits an amendment adding gamma.
+        a.pending_auto_prompt = None;
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("[[PLAN_ADD: gamma]]"));
+        let prop = a.proposed_plan.as_ref().expect("amendment proposal");
+        assert_eq!(prop.kind, crate::plan::ProposalKind::Amendment);
+        assert_eq!(prop.items, vec!["alpha", "beta", "gamma"]);
+        a.accept_proposed_plan();
+        assert_eq!(a.plan.total(), 3);
+        assert_eq!(a.plan.items[0].status, crate::plan::Status::Done);
+        assert_eq!(a.plan.items[1].status, crate::plan::Status::Active);
+        assert_eq!(a.plan.items[2].status, crate::plan::Status::Pending);
     }
 
     // ── V2.13.a · /shortcuts modal ──────────────────────────────────────
