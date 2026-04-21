@@ -295,6 +295,20 @@ pub fn builtins() -> Vec<MenuItem> {
         ),
         b!(
             View,
+            "vim",
+            "enable vim normal/insert composer mode",
+            "",
+            "/vim"
+        ),
+        b!(
+            View,
+            "default",
+            "disable vim mode (Esc clears composer again)",
+            "",
+            "/default"
+        ),
+        b!(
+            View,
             "plan",
             "open the plan view (no-arg) or manage steps",
             "[set|add|done|fail|next|clear|auto]",

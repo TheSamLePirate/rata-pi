@@ -227,7 +227,7 @@ struct SessionState {
 
 struct App {
     transcript: Transcript,
-    input: String,
+    composer: crate::composer::Composer,
     is_streaming: bool,
     ticks: u64,
     quit: bool,
@@ -264,6 +264,9 @@ struct App {
     // ── V2.7: git status (refreshed on stats_tick) ───────────────────────
     git_status: Option<crate::git::GitStatus>,
 
+    // ── V2.10: vim mode toggle ──────────────────────────────────────────
+    vim_enabled: bool,
+
     // ── V2.9: plan mode ─────────────────────────────────────────────────
     plan: crate::plan::Plan,
     /// Continue-prompt staged for automatic follow-up dispatch after
@@ -275,7 +278,7 @@ impl App {
     fn new(spawn_error: Option<String>) -> Self {
         Self {
             transcript: Transcript::default(),
-            input: String::new(),
+            composer: crate::composer::Composer::default(),
             is_streaming: false,
             ticks: 0,
             quit: false,
@@ -306,6 +309,7 @@ impl App {
             turn_count: 0,
             last_sec_tick: 0,
             git_status: None,
+            vim_enabled: false,
             plan: crate::plan::Plan::default(),
             pending_auto_prompt: None,
         }
@@ -962,7 +966,7 @@ async fn handle_ext_request(req: ExtReq, app: &mut App, client: Option<&RpcClien
             app.ext_ui.terminal_title = Some(title);
         }
         ExtReq::SetEditorText { text } => {
-            app.input = text;
+            app.composer.set_text(&text);
         }
         ExtReq::Unknown(m) => {
             // We've lost the id by the time we get here (parse only keeps it
@@ -1068,9 +1072,9 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
         Event::Paste(text) => {
             for ch in text.chars() {
                 if ch == '\n' || ch == '\r' {
-                    app.input.push(' ');
+                    app.composer.insert_char(' ');
                 } else {
-                    app.input.push(ch);
+                    app.composer.insert_char(ch);
                 }
             }
             app.history.reset_walk();
@@ -1339,21 +1343,29 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
             }
         }
         (KeyCode::Up, KeyModifiers::NONE) => {
-            if let Some(t) = app.history.prev(&app.input) {
-                app.input = t;
+            if let Some(t) = app.history.prev(&app.composer.text()) {
+                app.composer.set_text(&t);
             }
         }
         (KeyCode::Down, KeyModifiers::NONE) => {
             if let Some(t) = app.history.next() {
-                app.input = t;
+                app.composer.set_text(&t);
             }
         }
-        (KeyCode::Char('/'), KeyModifiers::NONE) if app.input.is_empty() => {
+        (KeyCode::Char('/'), KeyModifiers::NONE) if app.composer.is_empty() => {
             app.modal = Some(Modal::Commands(ListModal::new(
                 "/ commands",
                 "type to filter · Enter apply/insert · Esc close",
                 merged_commands(&app.session.commands),
             )));
+        }
+        (KeyCode::Esc, _)
+            if app.vim_enabled
+                && app.composer.mode == crate::composer::Mode::Insert
+                && !app.composer.is_empty() =>
+        {
+            // Vim: Esc leaves insert mode. Only active when /vim is on.
+            app.composer.mode = crate::composer::Mode::Normal;
         }
         (KeyCode::Esc, _) => {
             if app.is_streaming {
@@ -1361,26 +1373,67 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
                     let _ = c.fire(RpcCommand::Abort).await;
                     app.transcript.push(Entry::Warn("aborted".into()));
                 }
-            } else if !app.input.is_empty() {
-                app.input.clear();
+            } else if !app.composer.is_empty() {
+                app.composer.clear();
             } else {
                 app.quit = true;
             }
         }
+        // Shift+Enter or Ctrl+J = newline. Plain Enter = submit.
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
+            app.composer.insert_newline();
+        }
+        (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+            app.composer.insert_newline();
+        }
         (KeyCode::Enter, _) => submit(app, client).await,
-        (KeyCode::Backspace, _) => {
-            app.input.pop();
+
+        // Cursor motion (work in both insert and normal mode).
+        (KeyCode::Left, KeyModifiers::NONE) => app.composer.left(),
+        (KeyCode::Right, KeyModifiers::NONE) => app.composer.right(),
+        (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) => app.composer.word_left(),
+        (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) => app.composer.word_right(),
+        (KeyCode::Home, _) => app.composer.home(),
+        (KeyCode::End, _) if app.composer.is_empty() => app.scroll = None,
+        (KeyCode::End, _) => app.composer.end(),
+
+        // Emacs-lite kill bindings in Insert mode.
+        (KeyCode::Char('a'), KeyModifiers::CONTROL) => app.composer.home(),
+        // (Ctrl+E is owned by the transcript expand-last-tool binding; use
+        // `End` for composer end-of-line.)
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.composer.kill_line_back(),
+        (KeyCode::Char('k'), KeyModifiers::CONTROL) => app.composer.kill_line_forward(),
+        (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+            // Kill word back.
+            let before = app.composer.col;
+            app.composer.word_left();
+            let start = app.composer.col;
+            let row = app.composer.row;
+            let line = &mut app.composer.lines[row];
+            line.drain(start..before);
+        }
+        (KeyCode::Backspace, _) => app.composer.backspace(),
+        (KeyCode::Delete, _) => app.composer.delete_char_forward(),
+
+        // Normal-mode dispatch before the default-insert arm so vim keys
+        // take precedence over plain-char insertion.
+        (KeyCode::Char(ch), m)
+            if app.vim_enabled
+                && app.composer.mode == crate::composer::Mode::Normal
+                && !m.contains(KeyModifiers::CONTROL)
+                && !m.contains(KeyModifiers::ALT) =>
+        {
+            handle_vim_normal(ch, app);
         }
         (KeyCode::Char(ch), m)
             if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
         {
-            app.input.push(ch);
+            app.composer.insert_char(ch);
             app.history.reset_walk();
-            // Typing `@` at a word boundary opens the file finder in
-            // `AtToken` mode so the picked path replaces the partial.
             let opens_picker = ch == '@' && {
-                let before = app.input.len().saturating_sub(1);
-                let prev = app.input.as_bytes().get(before.saturating_sub(1)).copied();
+                let text = app.composer.text();
+                let before = text.len().saturating_sub(1);
+                let prev = text.as_bytes().get(before.saturating_sub(1)).copied();
                 before == 0 || matches!(prev, Some(b' ' | b'\t'))
             };
             if opens_picker {
@@ -1395,10 +1448,6 @@ async fn handle_key(code: KeyCode, mods: KeyModifiers, app: &mut App, client: Op
             let cur = app.scroll.unwrap_or(0);
             app.scroll = Some(cur.saturating_add(10));
         }
-        (KeyCode::Home, _) => {
-            app.scroll = Some(0);
-        }
-        (KeyCode::End, _) => app.scroll = None,
         _ => {}
     }
 }
@@ -1527,10 +1576,10 @@ async fn handle_modal_key(
                     if cmd.is_builtin() {
                         let needs_arg = !cmd.args.is_empty();
                         if needs_arg {
-                            app.input.clear();
-                            app.input.push('/');
-                            app.input.push_str(&cmd.name);
-                            app.input.push(' ');
+                            app.composer.clear();
+                            app.composer.insert_char('/');
+                            app.composer.insert_str(&cmd.name);
+                            app.composer.insert_char(' ');
                         } else {
                             app.modal = None;
                             let name = cmd.name.clone();
@@ -1548,10 +1597,10 @@ async fn handle_modal_key(
                     }
                     // Pi command — prefill the composer with /name so the
                     // user can type arguments and submit.
-                    app.input.clear();
-                    app.input.push('/');
-                    app.input.push_str(&cmd.name);
-                    app.input.push(' ');
+                    app.composer.clear();
+                    app.composer.insert_char('/');
+                    app.composer.insert_str(&cmd.name);
+                    app.composer.insert_char(' ');
                     app.modal = None;
                 }
                 _ => {}
@@ -1603,7 +1652,7 @@ async fn handle_modal_key(
                         .nth(list.selected)
                         .cloned()
                     {
-                        app.input = entry.text;
+                        app.composer.set_text(&entry.text);
                     }
                     app.modal = None;
                 }
@@ -1909,25 +1958,93 @@ fn insert_file_ref(app: &mut App, path: &str, mode: crate::ui::modal::FilePickMo
     let token = format!("@{path}");
     match mode {
         FilePickMode::Insert => {
-            if app.input.is_empty() {
-                app.input = token;
+            if app.composer.is_empty() {
+                app.composer.set_text(&token);
             } else {
-                if !app.input.ends_with(' ') {
-                    app.input.push(' ');
+                if !app.composer.text().ends_with(' ') {
+                    app.composer.insert_char(' ');
                 }
-                app.input.push_str(&token);
+                app.composer.insert_str(&token);
             }
         }
         FilePickMode::AtToken => {
-            if let Some(pos) = app.input.rfind('@') {
-                app.input.truncate(pos);
-                app.input.push_str(&token);
+            let full = app.composer.text();
+            if let Some(pos) = full.rfind('@') {
+                let mut new_text = full[..pos].to_string();
+                new_text.push_str(&token);
+                app.composer.set_text(&new_text);
             } else {
-                app.input.push_str(&token);
+                app.composer.insert_str(&token);
             }
         }
     }
     app.history.reset_walk();
+}
+
+/// Vim normal-mode key dispatcher. Deliberately small subset — we rely
+/// on the user falling back to insert mode for anything not covered.
+fn handle_vim_normal(ch: char, app: &mut App) {
+    use crate::composer::Mode;
+    let c = &mut app.composer;
+    match ch {
+        'h' => c.left(),
+        'l' => c.right(),
+        'j' => c.down(),
+        'k' => c.up(),
+        'w' => c.word_right(),
+        'b' => c.word_left(),
+        '0' => c.home(),
+        '$' => c.end(),
+        'i' => c.mode = Mode::Insert,
+        'a' => {
+            if c.col < c.lines[c.row].len() {
+                c.right();
+            }
+            c.mode = Mode::Insert;
+        }
+        'A' => {
+            c.end();
+            c.mode = Mode::Insert;
+        }
+        'I' => {
+            c.home();
+            c.mode = Mode::Insert;
+        }
+        'o' => {
+            c.end();
+            c.insert_newline();
+            c.mode = Mode::Insert;
+        }
+        'O' => {
+            c.home();
+            c.lines.insert(c.row, String::new());
+            c.mode = Mode::Insert;
+        }
+        'x' => c.delete_char_forward(),
+        'g' => {
+            // Expect `gg` — use pending_op as the "g pressed" sentinel.
+            if c.pending_op == Some('g') {
+                c.top();
+                c.pending_op = None;
+            } else {
+                c.pending_op = Some('g');
+            }
+        }
+        'G' => c.bottom(),
+        'd' => {
+            if c.pending_op == Some('d') {
+                c.delete_line();
+                c.pending_op = None;
+            } else {
+                c.pending_op = Some('d');
+            }
+        }
+        _ => {
+            // Unknown key: drop any pending `g`/`d` so stray keys don't
+            // activate double-letter ops.
+            c.pending_op = None;
+        }
+    }
 }
 
 fn handle_plan_slash(app: &mut App, arg: &str) {
@@ -2149,6 +2266,18 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
         }
         "plan" => {
             handle_plan_slash(app, arg);
+            true
+        }
+        "vim" => {
+            app.vim_enabled = true;
+            app.composer.mode = crate::composer::Mode::Insert;
+            app.flash("vim mode on — Esc → NORMAL · i/a/o insert · hjkl/wb move");
+            true
+        }
+        "default" | "emacs" => {
+            app.vim_enabled = false;
+            app.composer.mode = crate::composer::Mode::Insert;
+            app.flash("default editor mode · Esc clears composer");
             true
         }
         // ── git (all local: we shell out to `git`) ───────────────────
@@ -2546,11 +2675,11 @@ async fn try_pi_slash(app: &mut App, client: &RpcClient, name: &str, arg: &str) 
 }
 
 async fn submit(app: &mut App, client: Option<&RpcClient>) {
-    let text = app.input.trim().to_string();
+    let text = app.composer.text().trim().to_string();
     if text.is_empty() {
         return;
     }
-    app.input.clear();
+    app.composer.clear();
     app.history.record(&text);
 
     // 1) Local slash commands — these work even without pi connected.
@@ -2709,7 +2838,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         if plan_h > 0 {
             c.push(Constraint::Length(plan_h));
         }
-        c.push(Constraint::Length(3)); // editor
+        // Editor height grows with the composer content — min 3, max 10.
+        let composer_rows = app.composer.desired_rows(8);
+        c.push(Constraint::Length(composer_rows.saturating_add(2))); // +2 borders
         if below_h > 0 {
             c.push(Constraint::Length(below_h));
         }
@@ -4223,7 +4354,18 @@ fn draw_scrollbar(
 
 fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let t = &app.theme;
-    let is_bash = app.input.trim_start().starts_with('!');
+    let text = app.composer.text();
+    let is_bash = text.trim_start().starts_with('!');
+
+    let mode_chip = if app.vim_enabled {
+        match app.composer.mode {
+            crate::composer::Mode::Insert => " · INS",
+            crate::composer::Mode::Normal => " · NORM",
+        }
+    } else {
+        ""
+    };
+
     let (color, title) = if is_bash {
         (t.role_bash, " bash (! prefix · Enter run) ".to_string())
     } else if app.is_streaming {
@@ -4233,12 +4375,12 @@ fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &App) {
         };
         (
             t.border_active,
-            format!(" {label} (Ctrl+Space cycle · Esc abort) "),
+            format!(" {label}{mode_chip} (Ctrl+Space cycle · Esc abort) "),
         )
     } else {
         (
             t.border_idle,
-            " prompt (Enter submit · / commands · Esc clear) ".to_string(),
+            format!(" prompt{mode_chip} (Enter send · Shift+Enter/Ctrl+J newline · Esc clear) "),
         )
     };
     let block = Block::default()
@@ -4248,12 +4390,11 @@ fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let spans = vec![
-        Span::styled(app.input.as_str(), Style::default().fg(t.text)),
-        Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
-    ];
+    // Multi-line render via Composer::render — the cursor is baked into
+    // the line using Modifier::REVERSED on the current char/column.
+    let lines = app.composer.render(t, true);
     f.render_widget(
-        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
         inner,
     );
 }

@@ -2,6 +2,7 @@ mod anim;
 mod app;
 mod cli;
 mod clipboard;
+mod composer;
 mod files;
 mod git;
 mod history;
