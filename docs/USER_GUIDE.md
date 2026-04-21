@@ -19,9 +19,11 @@ This guide documents **every feature**: command-line arguments, key bindings, sl
 9. [Keyboard shortcuts (full reference)](#keyboard-shortcuts-full-reference)
 10. [Mouse](#mouse)
 11. [Modals](#modals)
-12. [Plan mode](#plan-mode)
-13. [Interview mode](#interview-mode)
-14. [File finder and `@path`](#file-finder-and-path)
+12. [Settings panel (`/settings`)](#settings-panel)
+13. [Shortcuts panel (`/shortcuts`)](#shortcuts-panel)
+14. [Plan mode](#plan-mode)
+15. [Interview mode](#interview-mode)
+16. [File finder and `@path`](#file-finder-and-path)
 14. [Git integration](#git-integration)
 15. [Themes](#themes)
 16. [Vim mode](#vim-mode)
@@ -117,39 +119,38 @@ Hit `Esc` to close.
 From top to bottom:
 
 ```
-┌─ header ────────────────────────────────────────────────┐
-│ rata-pi · model · thinking chip · state chip · git chip │
-├─ transcript ────────────────────────────────────────────┤
-│                                                         │
-│  ❯ user card      ← rounded-border card with role icon │
-│  ✦ thinking card  ← italic muted, blockquote style     │
-│  ✦ pi · streaming ← assistant card, live cursor at tail │
-│  ⚙ tool · running ← bash / edit / read / grep / write  │
-│  · info row       ← inline meta rows (no border)       │
-│                                                ⬇ live   │ ← sticky tail chip
-├─ widgets strip (optional, ext-UI) ──────────────────────┤
-├─ plan card (optional, when /plan is active) ────────────┤
-├─ editor ────────────────────────────────────────────────┤
-│ > │compose here — Shift+Enter for newline              │
-├─ widgets strip (optional, below the editor) ────────────┤
-├─ status widget ─────────────────────────────────────────┤
-│ ⠋ status · MM:SS · turn N · K running · N done         │
-│   throughput ▂▄█▆ · cost ▂▃▅ · session total           │
-├─ footer ────────────────────────────────────────────────┤
-│ context gauge: 42% · 52k / 200k tok · $0.14            │
-│ Enter send · / cmds · Ctrl+F focus · ? help            │
-└─────────────────────────────────────────────────────────┘
+┌─ header ─────────────────────────────────────────────────┐
+│  rata-pi   ● ⠋ claude-sonnet-4-6 · llm   ⎇ main●   t3   │  ← 1 row
+├─ transcript ─────────────────────────────────────────────┤
+│                                                          │
+│  ❯ user card      ← rounded-border card with role icon  │
+│  ✦ thinking card  ← italic muted, blockquote style      │
+│  ✦ pi · streaming ← assistant card, live cursor at tail  │
+│  ⚙ tool · running ← bash / edit / read / grep / write   │
+│  · info row       ← inline meta rows (no border)        │
+│                                                 ⬇ live   │ ← sticky tail chip
+├─ widgets strip (optional, ext-UI) ───────────────────────┤
+├─ plan card (optional, when /plan is active) ─────────────┤
+├─ editor ─────────────────────────────────────────────────┤
+│ > │compose here — Shift+Enter for newline               │
+├─ widgets strip (optional, below the editor) ─────────────┤
+├─ status · 00:12 ─────────────────────────────────────────┤  ← 3 rows (top rule)
+│ ⠋ llm · claude-sonnet-4-6  turn 3  2 running · 8 done   │
+│ throughput ▂▄█▆  82 t/s  cost ▂▃▅  $0.014  session $0.14│
+├─ footer ─────────────────────────────────────────────────┤  ← 1 row
+│ 42% · 52k / 200k tok · $0.14       ? help · /settings · /shortcuts
+└──────────────────────────────────────────────────────────┘
 ```
 
-* **Header** — one row. Shows model label, thinking level, live state, heartbeat dot, turn counter, queue sizes, and the git chip (branch · dirty dot · ahead/behind arrows).
+* **Header** — one row. Shows wordmark · heartbeat dot · spinner · model label · live state · (queue chips when non-zero) · (git chip when in a repo) · turn counter. Anything else that used to live here (thinking level, session name, connection label) moved to `/settings`.
 * **Transcript** — virtualized scroll. Only visible cards are rendered; a per-entry cache keeps markdown/syntect work out of the draw hot path.
 * **Widgets strip** — space for `set_widget` requests emitted by pi extensions (above or below the editor depending on placement).
 * **Plan card** — appears when a plan is active; collapses when cleared.
 * **Editor** — the composer. Grows from 1 row to 8 rows as you type.
-* **Status widget** — 4 rows. Hidden when terminal height < 20.
-* **Footer** — two rows: context gauge + keybinding hints. Hints adapt to the current state (streaming / focus / idle).
+* **Status widget** — 3 rows: a top rule titled `status · MM:SS` then state + metrics. Hidden when terminal height < 20.
+* **Footer** — one row. Left: context gauge + token/cost label. Right: `? help · /settings · /shortcuts` hint chip. When a flash message is active, it replaces the hint chip (warning color) for ~1.5 seconds.
 
-Toasts from pi extensions appear in the top-right corner.
+Toasts from pi extensions appear in the top-right corner. Keybinding hints that used to occupy a permanent second footer row are now in `/shortcuts` — the panel is always up-to-date with the real key handler.
 
 ---
 
@@ -254,6 +255,8 @@ Enter semantics:
 
 ### Session
 * `/help` — open the help modal with keybindings + commands.
+* `/settings` (aliases `/prefs`, `/preferences`) — every setting + state in one panel. See [Settings panel](#settings-panel).
+* `/shortcuts` (aliases `/keys`, `/hotkeys`) — full keybinding reference (read-only). See [Shortcuts panel](#shortcuts-panel).
 * `/stats` — open the session stats modal.
 * `/rename <name>` — set the session's display name.
 * `/new` — start a fresh pi session (keeps rata-pi running).
@@ -489,10 +492,74 @@ Readiness checks (see [First-run sanity check](#first-run-sanity-check)).
 Placeholder showing "pi does not expose MCP server state over RPC yet" until pi adds that capability.
 
 ### `Interview` (agent-initiated)
-Agent-authored structured form. Opens when the agent emits `[[INTERVIEW: …json…]]` in assistant text. See [Interview mode](#interview-mode) for the full field-type reference, keyboard shortcuts, and JSON schema.
+Agent-authored structured form. Opens when the agent emits `[[ASK_*]]` markers (or a JSON `[[INTERVIEW: …]]` wrapper) in assistant text. See [Interview mode](#interview-mode) for the full field-type reference, keyboard shortcuts, and marker grammar.
+
+### `Settings` (`/settings`)
+Every tunable setting and observable state, in one scrollable panel. See [Settings panel](#settings-panel).
+
+### `Shortcuts` (`/shortcuts`)
+Read-only keybinding reference for every context (global, editor, focus mode, modals, vim, interview, mouse). See [Shortcuts panel](#shortcuts-panel).
 
 ### Extension UI dialogs
 When a pi extension calls `ext_ui_select`, `ext_ui_confirm`, `ext_ui_input`, or `ext_ui_editor`, a dialog modal opens. `↑↓` (select), `Y/N/←→` (confirm), type-to-fill (input/editor). Enter submits, Esc cancels.
+
+---
+
+## Settings panel
+
+`/settings` (aliases: `/prefs`, `/preferences`) opens a single modal with every tunable setting and every observable piece of state — grouped into sections so nothing hides.
+
+### Sections
+
+| Section | Row kind | What's there |
+|---|---|---|
+| **Session** | Info | session name · connection status · pi binary path |
+| **Model** | Cycle | active model · thinking level · steering mode · follow-up mode |
+| **Behavior** | Toggle | show thinking · notifications · auto-compaction · auto-retry · plan auto-run |
+| **Appearance** | Cycle / Toggle | theme · vim mode |
+| **Live state** | Info | live label + elapsed · turn · tools running/done · queue sizes · context window usage · session cost |
+| **Capabilities** | Info | terminal kind · Kitty keyboard · graphics · clipboard backend · `notify` feature |
+| **Paths** | Info | history file · crash-dump directory |
+| **Build** | Info | rata-pi version · OS/arch |
+
+### Row kinds
+
+* **Info** rows are read-only (most of the "state" rows). `↑ ↓` steps past them to the next interactive row.
+* **Toggle** rows show `[x] yes` / `[ ] no`. `Enter` / `Space` flips them. Toggles that also need pi notified (auto-compaction / auto-retry) fire the corresponding RPC in the background.
+* **Cycle** rows show `◂ current ▸`. `Enter` / `Space` / `→` advances to the next value, `←` steps back (currently aliased to forward for theme/model because pi's RPC doesn't expose a reverse endpoint).
+
+### Keyboard
+
+| Key | Action |
+|---|---|
+| `↑` / `k` | Previous interactive row (skips Headers) |
+| `↓` / `j` | Next interactive row |
+| `Home` / `g` | First interactive row |
+| `End` / `G` | Last interactive row |
+| `PgUp` / `PgDn` | Move selection ±5 (pauses focus-follow auto-scroll) |
+| `Enter` / `Space` | Toggle or cycle-forward |
+| `→` | Cycle forward |
+| `←` | Cycle backward |
+| `Esc` | Close modal |
+
+The focused row has a `▶` marker and a bold label; the value side stays accent-colored. The modal auto-scrolls to keep the selection visible as you navigate, and the scrollbar widget appears on the right when the panel is taller than the modal frame.
+
+---
+
+## Shortcuts panel
+
+`/shortcuts` (aliases: `/keys`, `/hotkeys`) opens a read-only keybinding reference. Every key rata-pi responds to, grouped by context:
+
+1. **Global** — Ctrl+C, Ctrl+D
+2. **Editor (idle — no modal)** — submit, newline, focus mode, theme cycle, file finder, copy last assistant, history picker, export, F1–F10, `?`, `/`, history walk, scroll, End → pin live tail
+3. **Composer editing** — arrow motion, word motion (Alt+←/→), Home/End, Ctrl+A/E/U/K/W, Backspace/Delete
+4. **Focus mode (Ctrl+F)** — j/k/g/G/PgUp/PgDn, Enter/Space, y/c/Ctrl+Y, Esc/q
+5. **Modal — any** — ↑↓/PgUp/PgDn/Home/End/Enter/Esc/filter-query
+6. **Vim mode** — hjkl, wb, 0$, iaoIAO, x, dd, gg/G
+7. **Interview modal** — Tab/Shift+Tab, submit button flow, Ctrl+S / Ctrl+Enter, PgUp/PgDn scroll, Ctrl+Home/End
+8. **Mouse** — wheel, click, live-tail chip
+
+Navigation: `↑ ↓` / `j k` scroll one line, `PgUp` / `PgDn` scroll ten lines, `g` / `Home` jump to top, `G` / `End` jump to bottom, `Esc` / `q` close. This panel is always up-to-date with the real key handler — regression tests pin down that every section header is present.
 
 ---
 
@@ -901,27 +968,35 @@ Exports include turn dividers, user / thinking / assistant sections, tool call d
 
 ## Status widget and header
 
-### Header (1 row)
+### Header (1 row, V2.13.c slim)
+
 Left → right:
-1. `rata-pi` wordmark + heartbeat dot (green when recent event; yellow at 10 s silent during streaming; red at 100 ticks).
-2. Model label (`anthropic/claude-sonnet-4`).
-3. Thinking-level chip (`think: medium`).
-4. Session name if set via `/rename`.
-5. Connection state (`connected` / `offline`).
-6. Queue chips — `steer: N`, `follow-up: N` when non-zero.
-7. Git chip — `⎇ branch ●/○ ↑N ↓N` when in a repo.
+1. `rata-pi` wordmark.
+2. Heartbeat dot — color-coded: green on recent events, yellow after 10 s silent while streaming, red after 100 ticks or when pi is offline.
+3. Spinner — only spins while pi is actively streaming.
+4. Model label — shortened to `<id>` tail when the full `<provider>/<id>` is longer than 24 chars.
+5. Live state — `idle / sending / llm / thinking / tool / streaming / compacting / retrying / error`.
+6. Queue chips — `↻N` (steering) and `▸N` (follow-up), shown only when non-zero.
+7. Git chip — `⎇ branch●/○ ↑N ↓N` only when in a repo.
+8. Turn counter — `tN`, only once the first turn has started.
 
-### Status widget (4 rows, between editor and footer)
-Hidden when terminal height < 20. Shows:
-* Row 1 — spinner + state label (`llm / thinking / tool / streaming / compacting / retry N/M in Xms / error / idle`) + turn chip + running-tools chip.
-* Row 2 — throughput sparkline + t/s, cost sparkline + per-turn cost, session total.
-* Rows 3-4 — reserved for future use.
+Every other status-ish thing that used to live in the header (thinking level, session name, connection label, notify backend, capabilities) is now in `/settings`.
 
-Border color follows live state (idle / error / warning for retry / accent during streaming / accent_strong during compacting).
+### Status widget (3 rows, V2.13.d slim)
 
-### Footer (2 rows)
-* Row 1 — context gauge + label: `42% · 52k / 200k tok · $0.14`.
-* Row 2 — contextual keybinding hints (idle / streaming / focus).
+Between editor and footer. Hidden when terminal height < 20. Three rows:
+
+* Top **rule** — `── status · MM:SS ─────` divider. The rule color encodes live state (idle dim / warning yellow when retrying / accent during streaming / accent_strong during compacting / error red).
+* Row 1 — spinner + state label (`llm · <model> · turn N · K running · N done`).
+* Row 2 — `throughput ▂▄█▆ 82 t/s · cost ▂▃▅ $0.014 · session $0.14`.
+
+### Footer (1 row, V2.13.c slim)
+
+Single row with the context gauge on the left, right-aligned `? help · /settings · /shortcuts` hint chip on the right.
+
+When a flash message fires (e.g. "theme → dracula", "interview submitted"), the hint chip is temporarily replaced by `• <flash text>` in warning color for ~1.5 seconds, then reverts.
+
+The keybinding hint row that used to live here is gone — open `/shortcuts` for the complete, always-up-to-date reference.
 
 ---
 

@@ -41,9 +41,10 @@ pub(super) fn draw(f: &mut ratatui::Frame, app: &App, mm: &mut MouseMap) {
         .sum::<u16>()
         .min(8);
 
-    // StatusWidget takes a 4-row strip between the editor and footer, unless
-    // the terminal is too short.
-    let status_h: u16 = if area.height >= 20 { 4 } else { 0 };
+    // StatusWidget takes a 3-row strip between the editor and footer
+    // (V2.13.d · was 4; top-only rule instead of a full-box border saves
+    // one row). Hidden on short terminals.
+    let status_h: u16 = if area.height >= 20 { 3 } else { 0 };
 
     // Plan card above the editor when a plan is active. Height = items + 2
     // borders, capped so a long plan doesn't crowd out the transcript.
@@ -219,8 +220,11 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &App) {
         LiveState::Streaming | LiveState::Llm | LiveState::Sending => t.border_active,
         LiveState::Compacting => t.accent_strong,
     };
+    // V2.13.d · top-only rule with the title inline, saving one row
+    // compared to a full bordered box. Border color still encodes live
+    // state so the status strip is visually distinct when pi is busy.
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP)
         .title(Line::from(vec![
             Span::styled(" status ", Style::default().fg(t.muted)),
             Span::styled(
