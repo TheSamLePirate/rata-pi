@@ -161,7 +161,7 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 - [x] 8. Parsing from `agent_end.messages`
 - [x] 9. Marker visibility policy consistent
 
-**Shipped as** V3.f.1 `e6c390d` · V3.f.2 `521fddd` · V3.f.3 `<tbd>`
+**Shipped as** V3.f.1 `e6c390d` · V3.f.2 `521fddd` · V3.f.3 `2bbfd05`
 
 ---
 
