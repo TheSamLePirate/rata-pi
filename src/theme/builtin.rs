@@ -182,6 +182,41 @@ pub const NORD: Theme = Theme {
     syntect_name: "base16-ocean.dark",
 };
 
+// ──────────────────────────────────────────────── high-contrast ──
+//
+// V3.i.1 · a pure black/white palette with only theme.success,
+// warning, error carrying color — everything else is white, dim is
+// mid-grey, and accents are bright white. Targets CVD users and
+// low-color terminals; also useful for screenshot/review workflows
+// where the coloured themes are too busy.
+pub const HIGH_CONTRAST: Theme = Theme {
+    name: "high-contrast",
+    accent: rgb(0xff, 0xff, 0xff),
+    accent_strong: rgb(0xff, 0xff, 0xff),
+    muted: rgb(0xc0, 0xc0, 0xc0),
+    dim: rgb(0x80, 0x80, 0x80),
+    text: rgb(0xff, 0xff, 0xff),
+    success: rgb(0x00, 0xff, 0x00),
+    warning: rgb(0xff, 0xff, 0x00),
+    error: rgb(0xff, 0x30, 0x30),
+    role_user: rgb(0xff, 0xff, 0xff),
+    role_assistant: rgb(0xff, 0xff, 0xff),
+    role_thinking: rgb(0xc0, 0xc0, 0xc0),
+    role_tool: rgb(0xff, 0xff, 0x00),
+    role_bash: rgb(0xff, 0xff, 0xff),
+    border_idle: rgb(0x80, 0x80, 0x80),
+    border_active: rgb(0xff, 0xff, 0xff),
+    border_modal: rgb(0xff, 0xff, 0xff),
+    diff_add: rgb(0x00, 0xff, 0x00),
+    diff_remove: rgb(0xff, 0x30, 0x30),
+    diff_hunk: rgb(0xff, 0xff, 0xff),
+    diff_file: rgb(0xff, 0xff, 0xff),
+    gauge_low: rgb(0x00, 0xff, 0x00),
+    gauge_mid: rgb(0xff, 0xff, 0x00),
+    gauge_high: rgb(0xff, 0x30, 0x30),
+    syntect_name: "base16-ocean.dark",
+};
+
 /// Cycle order.
 pub const ALL: &[Theme] = &[
     TOKYO_NIGHT,
@@ -190,4 +225,5 @@ pub const ALL: &[Theme] = &[
     CATPPUCCIN_MOCHA,
     GRUVBOX_DARK,
     NORD,
+    HIGH_CONTRAST,
 ];

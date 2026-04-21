@@ -23,7 +23,17 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use crate::ui::cards::{Card, InlineRow};
 use crate::ui::transcript::{CompactionState, Entry, RetryState};
 
-use super::{App, LiveState, build_one_visual};
+use super::{App, FocusMarkerStyle, LiveState, build_one_visual};
+
+/// V3.i.2 · project the user-facing `FocusMarkerStyle` setting onto the
+/// UI-layer `FocusMode` that `Card::render` consumes.
+fn focus_mode_from_style(s: FocusMarkerStyle) -> crate::ui::cards::FocusMode {
+    match s {
+        FocusMarkerStyle::Both => crate::ui::cards::FocusMode::Both,
+        FocusMarkerStyle::BorderOnly => crate::ui::cards::FocusMode::BorderOnly,
+        FocusMarkerStyle::MarkerOnly => crate::ui::cards::FocusMode::MarkerOnly,
+    }
+}
 
 /// One rendered Entry. Sized (`height()`) and drawn (`render()`) without
 /// any allocation beyond what the cached body already holds.
@@ -43,11 +53,16 @@ impl Visual {
     pub(super) fn render(&self, f: &mut ratatui::Frame, area: Rect, idx: usize, app: &App) {
         match self {
             Self::Card(c) => {
-                // V2.11.2 · focus is an out-of-band lookup (no clone of the
-                // Card just to flip a flag). The renderer swaps to
-                // BorderType::Double + prepends a ▶ marker when focused.
-                let focused = app.focus_idx == Some(idx);
-                c.render(f, area, &app.theme, focused);
+                // V2.11.2 · focus is an out-of-band lookup.
+                // V3.i.2 · the Double-border + marker combo is now split
+                // into three user-selectable variants via the
+                // FocusMarkerStyle knob.
+                let focus = if app.focus_idx == Some(idx) {
+                    focus_mode_from_style(app.focus_marker)
+                } else {
+                    crate::ui::cards::FocusMode::None
+                };
+                c.render(f, area, &app.theme, focus);
             }
             Self::Inline(r) => r.render(f, area),
         }
@@ -108,14 +123,18 @@ fn render_card_clipped(
         borders |= Borders::BOTTOM;
     }
 
-    let btype = if focused {
+    // V3.i.2 · focus cue is toggleable. Default keeps both the Double
+    // border and the ▶ marker; users who find the combo noisy can drop
+    // one via /settings → Appearance → focus marker.
+    let marker_style = app.focus_marker;
+    let btype = if focused && marker_style.show_double_border() {
         BorderType::Double
     } else {
         BorderType::Rounded
     };
     let border_style = Style::default().fg(card.border_color);
 
-    let focus_mark = if focused && show_top {
+    let focus_mark = if focused && show_top && marker_style.show_marker() {
         vec![
             Span::styled(
                 " ▶",

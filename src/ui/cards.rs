@@ -14,6 +14,27 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 
 use crate::theme::Theme;
 
+/// V3.i.2 · how a focused card renders. `None` skips both focus cues;
+/// the other variants toggle the Double border and the ▶ marker
+/// independently so users can drop either encoding from `/settings →
+/// Appearance → focus marker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusMode {
+    None,
+    Both,
+    BorderOnly,
+    MarkerOnly,
+}
+
+impl FocusMode {
+    pub fn show_double_border(self) -> bool {
+        matches!(self, Self::Both | Self::BorderOnly)
+    }
+    pub fn show_marker(self) -> bool {
+        matches!(self, Self::Both | Self::MarkerOnly)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Card {
     pub icon: &'static str,
@@ -46,29 +67,29 @@ impl Card {
         body_h.saturating_add(2) // top + bottom border
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme, focused: bool) {
-        self.render_to_buffer(area, f.buffer_mut(), theme, focused);
+    pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme, focus: FocusMode) {
+        self.render_to_buffer(area, f.buffer_mut(), theme, focus);
     }
 
     /// Render into any buffer at `area`. Used directly by `render` and also
     /// by the transcript virtualization path when it needs a scratch buffer
     /// to clip a tall card to the visible window.
     ///
-    /// `focused` is passed in (not stored on `Card`) so the cached body and
+    /// `focus` is passed in (not stored on `Card`) so the cached body and
     /// chrome can be reused across focus toggles without rebuild.
-    pub fn render_to_buffer(&self, area: Rect, buf: &mut Buffer, _theme: &Theme, focused: bool) {
+    pub fn render_to_buffer(&self, area: Rect, buf: &mut Buffer, _theme: &Theme, focus: FocusMode) {
         let border_style = Style::default().fg(self.border_color);
         // Swap border weight based on focus so the focused card is obviously
         // different, without changing hue (role colors stay meaningful).
-        let btype = if focused {
+        // V3.i.2 · the focus-marker knob lets users drop one of the two
+        // encodings (border / marker) when both feel too loud.
+        let btype = if focus.show_double_border() {
             BorderType::Double
         } else {
             BorderType::Rounded
         };
 
-        // Leading marker + icon + title. The marker only appears when
-        // focused so the focused card gets a very clear "you are here" cue.
-        let focus_mark = if focused {
+        let focus_mark = if focus.show_marker() {
             vec![
                 Span::styled(
                     " ▶",

@@ -397,6 +397,9 @@ pub(super) struct App {
     /// visible in the transcript for debugging. Default false. Toggled
     /// via `/settings → Appearance → show raw markers`.
     show_raw_markers: bool,
+    /// V3.i.2 · how focused transcript cards distinguish themselves.
+    /// Cycled via `/settings → Appearance → focus marker`.
+    focus_marker: FocusMarkerStyle,
 
     // ── V2.11: notifications ───────────────────────────────────────────
     /// Tick count when the current turn started (on `agent_start`). Used
@@ -476,6 +479,39 @@ fn collect_assistant_text(messages: &[AgentMessage]) -> String {
     out
 }
 
+/// V3.i.2 · how focused transcript cards distinguish themselves. Default
+/// (`Both`) draws a Double border AND prepends a ▶ marker — some users
+/// find the combination visually noisy and prefer just one cue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FocusMarkerStyle {
+    Both,
+    BorderOnly,
+    MarkerOnly,
+}
+
+impl FocusMarkerStyle {
+    pub(super) fn cycle(self) -> Self {
+        match self {
+            Self::Both => Self::BorderOnly,
+            Self::BorderOnly => Self::MarkerOnly,
+            Self::MarkerOnly => Self::Both,
+        }
+    }
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Both => "border + marker",
+            Self::BorderOnly => "border only",
+            Self::MarkerOnly => "marker only",
+        }
+    }
+    pub(super) fn show_double_border(self) -> bool {
+        matches!(self, Self::Both | Self::BorderOnly)
+    }
+    pub(super) fn show_marker(self) -> bool {
+        matches!(self, Self::Both | Self::MarkerOnly)
+    }
+}
+
 /// V3.e.3 · kind of toast shown in the footer. Drives the text color so
 /// success/warn/error messages are visually distinguishable from info.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -548,6 +584,7 @@ impl App {
             pending_auto_prompt: None,
             proposed_plan: None,
             show_raw_markers: false,
+            focus_marker: FocusMarkerStyle::Both,
             agent_start_tick: None,
             tool_calls_this_turn: 0,
             notify_enabled: true,
@@ -1342,6 +1379,48 @@ async fn ui_loop(
 
 // ───────────────────────────────────────────────────────── input ──
 
+/// V3.i.2 · apply a wheel-scroll delta to the currently-open modal if
+/// it owns a scroll offset. Returns true when the scroll was consumed
+/// so the caller doesn't also scroll the transcript. `delta` is in
+/// rows (negative = up, positive = down).
+fn scroll_modal(app: &mut App, delta: i32) -> bool {
+    let Some(modal) = app.modal.as_mut() else {
+        return false;
+    };
+    let bump = |scroll: &mut u16, d: i32| {
+        if d < 0 {
+            *scroll = scroll.saturating_sub(d.unsigned_abs() as u16);
+        } else {
+            *scroll = scroll.saturating_add(d as u16);
+        }
+    };
+    match modal {
+        Modal::Shortcuts { scroll } => {
+            bump(scroll, delta);
+            true
+        }
+        Modal::Diff(d) => {
+            bump(&mut d.scroll, delta);
+            true
+        }
+        Modal::Settings(s) => {
+            bump(&mut s.scroll, delta);
+            s.user_scrolled = true;
+            true
+        }
+        Modal::Interview(s) => {
+            bump(&mut s.scroll, delta);
+            s.user_scrolled = true;
+            true
+        }
+        Modal::PlanReview(s) => {
+            bump(&mut s.scroll, delta);
+            true
+        }
+        _ => false,
+    }
+}
+
 async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) {
     // If a modal is open, route input to it first.
     if app.modal.is_some()
@@ -1373,12 +1452,22 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
             modifiers: _,
         }) => match kind {
             MouseEventKind::ScrollUp => {
-                let cur = app.scroll.unwrap_or(u16::MAX);
-                app.scroll = Some(cur.saturating_sub(4));
+                // V3.i.2 · route scroll to the open modal (when it
+                // owns a scroll offset) rather than the transcript.
+                if scroll_modal(app, -4) {
+                    // modal consumed
+                } else {
+                    let cur = app.scroll.unwrap_or(u16::MAX);
+                    app.scroll = Some(cur.saturating_sub(4));
+                }
             }
             MouseEventKind::ScrollDown => {
-                let cur = app.scroll.unwrap_or(0);
-                app.scroll = Some(cur.saturating_add(4));
+                if scroll_modal(app, 4) {
+                    // modal consumed
+                } else {
+                    let cur = app.scroll.unwrap_or(0);
+                    app.scroll = Some(cur.saturating_add(4));
+                }
             }
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 input::on_mouse_click(column, row, app);
@@ -6755,6 +6844,56 @@ I'll take it from here.",
                 .any(|e| matches!(e, Entry::Info(s) if s.contains("plan complete"))),
             "plan complete marker missing"
         );
+    }
+
+    /// V3.i.2 · cycling focus_marker through three states and back;
+    /// show_double_border/show_marker gates track correctly.
+    #[test]
+    fn focus_marker_cycle_and_gates() {
+        let mut s = FocusMarkerStyle::Both;
+        assert!(s.show_double_border());
+        assert!(s.show_marker());
+        s = s.cycle();
+        assert_eq!(s, FocusMarkerStyle::BorderOnly);
+        assert!(s.show_double_border());
+        assert!(!s.show_marker());
+        s = s.cycle();
+        assert_eq!(s, FocusMarkerStyle::MarkerOnly);
+        assert!(!s.show_double_border());
+        assert!(s.show_marker());
+        s = s.cycle();
+        assert_eq!(s, FocusMarkerStyle::Both);
+    }
+
+    /// V3.i.2 · wheel-scroll on an open modal routes into that modal
+    /// and does NOT move the transcript scroll.
+    #[test]
+    fn wheel_scroll_routes_to_open_modal() {
+        let mut a = app();
+        a.modal = Some(Modal::Shortcuts { scroll: 0 });
+        a.scroll = Some(77);
+        let consumed = scroll_modal(&mut a, 4);
+        assert!(consumed);
+        // Transcript scroll untouched.
+        assert_eq!(a.scroll, Some(77));
+        match &a.modal {
+            Some(Modal::Shortcuts { scroll }) => assert_eq!(*scroll, 4),
+            _ => panic!("modal gone"),
+        }
+        // Scroll up past zero saturates.
+        let _ = scroll_modal(&mut a, -100);
+        match &a.modal {
+            Some(Modal::Shortcuts { scroll }) => assert_eq!(*scroll, 0),
+            _ => panic!(),
+        }
+    }
+
+    /// V3.i.2 · with no modal open, scroll_modal is a no-op; the caller
+    /// then scrolls the transcript itself.
+    #[test]
+    fn wheel_scroll_without_modal_is_a_noop() {
+        let mut a = app();
+        assert!(!scroll_modal(&mut a, 4));
     }
 
     /// V3.h · Shortcuts modal scroll regression. PgDn bumps by 10;

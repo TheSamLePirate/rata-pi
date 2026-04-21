@@ -15,6 +15,7 @@ use crate::theme::Theme;
 use crate::ui::modal::Modal;
 
 use super::super::draw::fmt_elapsed;
+use super::super::helpers::ignore;
 use super::super::{App, on_off};
 
 /// One key applied to the Settings modal. Returns `(Some(action), _)`
@@ -166,9 +167,11 @@ pub(crate) async fn dispatch_settings_action(
             let next = !app.session.auto_compaction.unwrap_or(true);
             app.session.auto_compaction = Some(next);
             if let Some(c) = client {
-                let _ = c
-                    .fire(RpcCommand::SetAutoCompaction { enabled: next })
-                    .await;
+                ignore(
+                    c.fire(RpcCommand::SetAutoCompaction { enabled: next })
+                        .await,
+                    "set_auto_compaction fire-and-forget",
+                );
                 app.flash_success(format!("auto-compact {}", on_off(next)));
             } else {
                 // V3.a · local flag flipped but there's no pi to persist it.
@@ -183,7 +186,10 @@ pub(crate) async fn dispatch_settings_action(
             let next = !app.session.auto_retry.unwrap_or(true);
             app.session.auto_retry = Some(next);
             if let Some(c) = client {
-                let _ = c.fire(RpcCommand::SetAutoRetry { enabled: next }).await;
+                ignore(
+                    c.fire(RpcCommand::SetAutoRetry { enabled: next }).await,
+                    "set_auto_retry fire-and-forget",
+                );
                 app.flash_success(format!("auto-retry {}", on_off(next)));
             } else {
                 app.flash_warn(format!(
@@ -217,12 +223,18 @@ pub(crate) async fn dispatch_settings_action(
         }
         SettingsAction::Cycle(CycleAction::ThinkingLevel, _) => {
             if let Some(c) = client {
-                let _ = c.fire(RpcCommand::CycleThinkingLevel).await;
+                ignore(
+                    c.fire(RpcCommand::CycleThinkingLevel).await,
+                    "cycle_thinking_level fire-and-forget",
+                );
             }
         }
         SettingsAction::Cycle(CycleAction::Model, _) => {
             if let Some(c) = client {
-                let _ = c.fire(RpcCommand::CycleModel).await;
+                ignore(
+                    c.fire(RpcCommand::CycleModel).await,
+                    "cycle_model fire-and-forget",
+                );
             }
         }
         SettingsAction::Cycle(CycleAction::SteeringMode, _) => {
@@ -233,7 +245,10 @@ pub(crate) async fn dispatch_settings_action(
             };
             app.session.steering_mode = Some(next);
             if let Some(c) = client {
-                let _ = c.fire(RpcCommand::SetSteeringMode { mode: next }).await;
+                ignore(
+                    c.fire(RpcCommand::SetSteeringMode { mode: next }).await,
+                    "set_steering_mode fire-and-forget",
+                );
             }
         }
         SettingsAction::Cycle(CycleAction::FollowUpMode, _) => {
@@ -244,8 +259,15 @@ pub(crate) async fn dispatch_settings_action(
             };
             app.session.follow_up_mode = Some(next);
             if let Some(c) = client {
-                let _ = c.fire(RpcCommand::SetFollowUpMode { mode: next }).await;
+                ignore(
+                    c.fire(RpcCommand::SetFollowUpMode { mode: next }).await,
+                    "set_follow_up_mode fire-and-forget",
+                );
             }
+        }
+        SettingsAction::Cycle(CycleAction::FocusMarker, _) => {
+            app.focus_marker = app.focus_marker.cycle();
+            app.flash(format!("focus marker → {}", app.focus_marker.label()));
         }
     }
 }
@@ -297,6 +319,9 @@ pub(crate) enum CycleAction {
     SteeringMode,
     FollowUpMode,
     Model,
+    /// V3.i.2 · how focused transcript cards render. Cycles
+    /// Both → BorderOnly → MarkerOnly → Both.
+    FocusMarker,
 }
 
 pub(crate) fn build_settings_rows(app: &App) -> Vec<SettingsRow> {
@@ -403,6 +428,12 @@ pub(crate) fn build_settings_rows(app: &App) -> Vec<SettingsRow> {
         label: "show raw markers".into(),
         value: app.show_raw_markers,
         action: ToggleAction::ShowRawMarkers,
+    });
+    // V3.i.2 · focused-card visual cue.
+    rows.push(R::Cycle {
+        label: "focus marker".into(),
+        display: app.focus_marker.label().into(),
+        action: CycleAction::FocusMarker,
     });
 
     rows.push(R::Header("Live state"));

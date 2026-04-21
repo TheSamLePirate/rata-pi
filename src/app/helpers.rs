@@ -85,3 +85,15 @@ pub(super) fn args_preview(args: &serde_json::Value) -> String {
 pub(super) fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
 }
+
+/// V3.i.1 · named replacement for `let _ = fallible_call.await`. Drops
+/// the value, but when the caller passes a `reason` we log it at
+/// `tracing::debug!` so an intentional-discard is auditable from a
+/// trace without peppering the call sites with explicit `match`
+/// blocks. Use when a fire-and-forget RPC's failure doesn't need to
+/// reach the user (pi surfaces command errors via a distinct event).
+pub(super) fn ignore<T, E: std::fmt::Debug>(r: Result<T, E>, reason: &'static str) {
+    if let Err(e) = r {
+        tracing::debug!(error = ?e, reason, "ignored");
+    }
+}

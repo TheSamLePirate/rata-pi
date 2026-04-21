@@ -122,7 +122,12 @@ pub(super) fn draw(f: &mut ratatui::Frame, app: &App, mm: &mut MouseMap) {
         draw_widgets(f, r, &above_widgets);
     }
     if let Some(r) = plan_rect {
-        plan_card(&app.plan, &app.theme).render(f, r, &app.theme, false);
+        plan_card(&app.plan, &app.theme).render(
+            f,
+            r,
+            &app.theme,
+            crate::ui::cards::FocusMode::None,
+        );
     }
     draw_editor(f, editor_area, app);
     if let Some(r) = below_rect {
@@ -324,10 +329,18 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &App) {
     ])
     .split(tp_col);
     f.render_widget(Paragraph::new(Line::from(vec![tp_label])), tp_inner[0]);
+    // V3.i.1 · sparkline tint tracks live state. During error the whole
+    // status widget's border already goes red; matching the sparkline
+    // makes the "something's broken" cue unmistakable.
+    let tp_color = match app.live {
+        LiveState::Error => t.error,
+        LiveState::Retrying { .. } => t.warning,
+        _ => t.accent,
+    };
     f.render_widget(
         Sparkline::default()
             .data(&throughput_data)
-            .style(Style::default().fg(t.accent)),
+            .style(Style::default().fg(tp_color)),
         tp_inner[1],
     );
     f.render_widget(Paragraph::new(Line::from(vec![tp_rate_span])), tp_inner[2]);
@@ -352,10 +365,15 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &App) {
         )])),
         cost_inner[0],
     );
+    let cost_color = match app.live {
+        LiveState::Error => t.error,
+        LiveState::Retrying { .. } => t.warning,
+        _ => t.success,
+    };
     f.render_widget(
         Sparkline::default()
             .data(&cost_data)
-            .style(Style::default().fg(t.success)),
+            .style(Style::default().fg(cost_color)),
         cost_inner[1],
     );
     f.render_widget(
@@ -836,8 +854,10 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
     // Right-aligned chip. When a flash message is active, it replaces
     // the hint chip; otherwise the stable `? help · /settings · /shortcuts`
     // pointer stays put. Flashes expire naturally after 15 ticks.
-    // V3.e.3 · color chosen per FlashKind so success/warn/error/info
-    // read at a glance rather than all being yellow.
+    // V3.e.3 · color per FlashKind.
+    // V3.i.1 · glyph prefix per kind (info ℹ · success ✓ · warn ⚠ ·
+    // error ✗). Under 60 cols the glyph collapses to a plain bullet to
+    // avoid burning too much hint width on narrow terminals.
     let hint_spans: Vec<Span<'static>> = if let Some((msg, _, kind)) = &app.flash {
         let color = match kind {
             super::FlashKind::Success => t.success,
@@ -845,10 +865,20 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
             super::FlashKind::Error => t.error,
             super::FlashKind::Info => t.accent,
         };
+        let glyph = if area.width < 60 {
+            "• "
+        } else {
+            match kind {
+                super::FlashKind::Success => "✓ ",
+                super::FlashKind::Warn => "⚠ ",
+                super::FlashKind::Error => "✗ ",
+                super::FlashKind::Info => "ℹ ",
+            }
+        };
         vec![
             Span::raw(" "),
             Span::styled(
-                "• ",
+                glyph.to_string(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
