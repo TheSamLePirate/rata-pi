@@ -389,6 +389,10 @@ pub(super) struct App {
     /// Continue-prompt staged for automatic follow-up dispatch after
     /// `agent_end` fires during plan-mode auto-run.
     pending_auto_prompt: Option<String>,
+    /// V3.f · plan proposed by the agent but not yet accepted. Always
+    /// read-only from the perspective of `wrap_with_plan` / auto-run;
+    /// only `app.plan` (the accepted plan) participates in those paths.
+    proposed_plan: Option<crate::plan::ProposedPlan>,
 
     // ── V2.11: notifications ───────────────────────────────────────────
     /// Tick count when the current turn started (on `agent_start`). Used
@@ -422,6 +426,29 @@ struct AppCaps {
     state_dir: String,
     package_version: &'static str,
     platform: String,
+}
+
+/// V3.f · flatten every assistant Text block across an `agent_end.messages`
+/// payload into a single string, concatenated with newlines. This is the
+/// authoritative source of what the agent emitted on its final turn —
+/// preferred over the transcript tail because the transcript is a
+/// render-time derived view that can drift from the payload.
+fn collect_assistant_text(messages: &[AgentMessage]) -> String {
+    use crate::rpc::types::AssistantBlock;
+    let mut out = String::new();
+    for m in messages {
+        if let AgentMessage::Assistant { content, .. } = m {
+            for block in content {
+                if let AssistantBlock::Text { text } = block {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// V3.e.3 · kind of toast shown in the footer. Drives the text color so
@@ -494,6 +521,7 @@ impl App {
             vim_enabled: false,
             plan: crate::plan::Plan::default(),
             pending_auto_prompt: None,
+            proposed_plan: None,
             agent_start_tick: None,
             tool_calls_this_turn: 0,
             notify_enabled: true,
@@ -545,30 +573,38 @@ impl App {
         sum / self.throughput.len() as u32
     }
 
-    /// Scan the most-recent assistant message for plan markers and apply
-    /// them. Stages an automatic continue prompt into `pending_auto_prompt`
-    /// when the plan is still running — the main loop dispatches it as a
-    /// follow-up RPC right after handling the event.
-    fn apply_plan_markers_on_agent_end(&mut self) {
-        let Some(text) = self
-            .transcript
-            .entries()
-            .iter()
-            .rev()
-            .find_map(|e| match e {
-                Entry::Assistant(s) => Some(s.clone()),
-                _ => None,
-            })
-        else {
-            return;
-        };
+    /// V3.f · scan the agent_end payload for plan + interview markers.
+    /// PLAN_SET now creates a **proposal** (requires user accept) — it
+    /// no longer activates the plan directly. STEP_DONE / STEP_FAILED /
+    /// PLAN_ADD only affect an **already-accepted** active plan;
+    /// PLAN_ADD against an active plan opens the review modal as an
+    /// amendment. Parsing prefers `messages` (the authoritative
+    /// `agent_end` payload) and falls back to the transcript tail.
+    fn apply_plan_markers_on_agent_end(&mut self, messages: &[AgentMessage]) {
+        // Concatenate assistant text blocks across agent_end.messages —
+        // this is the authoritative source of what the agent emitted.
+        let mut text = collect_assistant_text(messages);
+        if text.is_empty() {
+            // Compat fallback for shape drift and legacy flows.
+            if let Some(tail) = self
+                .transcript
+                .entries()
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    Entry::Assistant(s) => Some(s.clone()),
+                    _ => None,
+                })
+            {
+                text = tail;
+            } else {
+                return;
+            }
+        }
 
-        // V2.12.g · detect an interview (marker → fenced block → bare
-        // JSON, in that order) and open the modal. Strip the detected
-        // range from the visible assistant card so the user doesn't see
-        // the raw JSON, and push an Info row for a clear audit trail.
-        // Skipped when we're already in a modal (pre-existing interview
-        // or other blocker).
+        // V2.12.g · interview detection still runs first since the
+        // interview modal consumes the raw JSON fence and the plan
+        // parsing below only cares about the top-level markers.
         if self.modal.is_none()
             && let Some((iv, ranges)) = crate::interview::detect_interview(&text)
         {
@@ -586,30 +622,42 @@ impl App {
         }
 
         let mut advanced = false;
-        let mut created_plan = false;
         for m in crate::plan::parse_markers(&text) {
             match m {
                 crate::plan::Marker::PlanSet(items) => {
-                    self.plan.set_all(items);
-                    created_plan = true;
-                    self.transcript.push(Entry::Info(format!(
-                        "plan set by agent: {} steps",
-                        self.plan.total()
-                    )));
+                    // V3.f · agent proposes, user disposes.
+                    self.propose_plan_from_agent(items);
                 }
-                crate::plan::Marker::PlanAdd(text) => {
-                    self.plan.add(text.clone());
-                    self.transcript.push(Entry::Info(format!("plan + {text}")));
+                crate::plan::Marker::PlanAdd(add_text) => {
+                    if self.plan.is_active() {
+                        // V3.f · amendment to an active plan needs user
+                        // approval. Build a preview of the amended list.
+                        let mut preview: Vec<String> =
+                            self.plan.items.iter().map(|it| it.text.clone()).collect();
+                        preview.push(add_text.clone());
+                        self.propose_amendment(preview);
+                        self.transcript.push(Entry::Info(format!(
+                            "agent proposed amendment: + {add_text}"
+                        )));
+                    } else {
+                        // No active plan? Treat as a single-step proposal.
+                        self.propose_plan_from_agent(vec![add_text]);
+                    }
                 }
                 crate::plan::Marker::Done => {
-                    if let Some(done_text) = self.plan.mark_done() {
+                    // V3.f · only applies to an accepted active plan.
+                    if self.plan.is_active()
+                        && let Some(done_text) = self.plan.mark_done()
+                    {
                         self.transcript
                             .push(Entry::Info(format!("✓ step done: {done_text}")));
                         advanced = true;
                     }
                 }
                 crate::plan::Marker::Failed(reason) => {
-                    if let Some(text) = self.plan.mark_fail(reason.clone()) {
+                    if self.plan.is_active()
+                        && let Some(text) = self.plan.mark_fail(reason.clone())
+                    {
                         self.transcript
                             .push(Entry::Warn(format!("✗ step failed: {text} — {reason}")));
                     }
@@ -617,7 +665,8 @@ impl App {
             }
         }
 
-        // Queue a continue follow-up if the plan is still running.
+        // Queue a continue follow-up ONLY for an accepted active plan.
+        // Fresh proposals never auto-run before the user accepts.
         if self.plan.is_active() && self.plan.auto_run {
             if let Some(cur) = self.plan.current() {
                 let attempts = cur.attempts;
@@ -628,7 +677,7 @@ impl App {
                     self.transcript.push(Entry::Warn(format!(
                         "step {n} stuck after {attempts} attempts — halting auto-run"
                     )));
-                } else if advanced || created_plan || attempts == 0 {
+                } else if advanced || attempts == 0 {
                     // Advance OR first attempt of a fresh step — kick pi off.
                     self.pending_auto_prompt = Some(format!("Proceed with step {n}: {step_text}"));
                     self.plan.bump_attempt();
@@ -644,6 +693,89 @@ impl App {
             self.transcript
                 .push(Entry::Info("plan complete ✓".to_string()));
         }
+    }
+
+    /// V3.f · store an agent-proposed plan and open the review modal.
+    /// Auto-run defaults ON per V3 answer #3 — acceptance is consent.
+    pub(super) fn propose_plan_from_agent(&mut self, items: Vec<String>) {
+        use crate::ui::modal::{PlanReviewMode, PlanReviewPurpose, PlanReviewState};
+        let count = items.len();
+        self.proposed_plan = Some(crate::plan::ProposedPlan {
+            items: items.clone(),
+            origin: crate::plan::PlanOrigin::Agent,
+            suggested_auto_run: true,
+            created_at_tick: self.ticks,
+        });
+        self.modal = Some(Modal::PlanReview(Box::new(PlanReviewState {
+            items,
+            selected: 0,
+            scroll: 0,
+            mode: PlanReviewMode::Review,
+            auto_run_pref: true,
+            purpose: PlanReviewPurpose::NewPlan,
+        })));
+        self.transcript.push(Entry::Info(format!(
+            "agent proposed a plan: {count} step{}",
+            if count == 1 { "" } else { "s" }
+        )));
+        self.flash_info("review proposed plan");
+    }
+
+    /// V3.f · open the review modal for an amendment (PLAN_ADD on an
+    /// already-active plan). `preview` is the amended-list — i.e. the
+    /// existing items plus the proposed new one.
+    pub(super) fn propose_amendment(&mut self, preview: Vec<String>) {
+        use crate::ui::modal::{PlanReviewMode, PlanReviewPurpose, PlanReviewState};
+        self.proposed_plan = Some(crate::plan::ProposedPlan {
+            items: preview.clone(),
+            origin: crate::plan::PlanOrigin::Agent,
+            suggested_auto_run: self.plan.auto_run,
+            created_at_tick: self.ticks,
+        });
+        self.modal = Some(Modal::PlanReview(Box::new(PlanReviewState {
+            items: preview,
+            selected: 0,
+            scroll: 0,
+            mode: PlanReviewMode::Review,
+            auto_run_pref: self.plan.auto_run,
+            purpose: PlanReviewPurpose::Amendment,
+        })));
+        self.flash_info("review plan amendment");
+    }
+
+    /// V3.f · accept the current proposal. Moves items into `self.plan`,
+    /// clears the proposal, and (per V3 answer #3) kicks off auto-run
+    /// immediately when the user left that toggle on — YOLO mode.
+    pub(super) fn accept_proposed_plan(&mut self) {
+        let Some(proposal) = self.proposed_plan.take() else {
+            return;
+        };
+        let count = proposal.items.len();
+        self.plan.set_all(proposal.items);
+        // set_all forces auto_run = true; respect the user's toggle from
+        // the review modal (they may have flipped it off).
+        self.plan.auto_run = proposal.suggested_auto_run;
+        self.transcript
+            .push(Entry::Info(format!("plan accepted: {count} steps")));
+        self.flash_success("plan accepted");
+        // YOLO kick-off: stage the first-step prompt so the ui_loop
+        // fires it on the next tick.
+        if self.plan.auto_run
+            && let Some(cur) = self.plan.current()
+        {
+            let n = self.plan.current_idx().unwrap_or(0) + 1;
+            self.pending_auto_prompt = Some(format!("Proceed with step {n}: {}", cur.text));
+            self.plan.bump_attempt();
+        }
+    }
+
+    /// V3.f · reject the current proposal. Discards the draft without
+    /// touching the active plan.
+    pub(super) fn deny_proposed_plan(&mut self) {
+        self.proposed_plan = None;
+        self.transcript
+            .push(Entry::Info("plan proposal rejected".into()));
+        self.flash_info("plan rejected");
     }
 
     fn heartbeat_color(&self) -> Color {
@@ -1678,6 +1810,52 @@ async fn handle_modal_key(
                         .await;
                 }
             }
+            _ => {}
+        },
+        // V3.f · Plan Review modal. Review-mode only (Edit lands in V3.f.2).
+        // Keys: a = accept · d = deny · t = toggle auto-run ·
+        // Enter = activate focused action · Esc = deny (same as d).
+        // Navigation keys (↑↓/j/k/PgUp/PgDn/g/G/Home/End) scroll the
+        // step list for long proposals.
+        Modal::PlanReview(state) => match code {
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                app.modal = None;
+                app.accept_proposed_plan();
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
+                app.modal = None;
+                app.deny_proposed_plan();
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                state.auto_run_pref = !state.auto_run_pref;
+                if let Some(p) = app.proposed_plan.as_mut() {
+                    p.suggested_auto_run = state.auto_run_pref;
+                }
+            }
+            KeyCode::Enter => {
+                // Focused chip: 0 Accept · 1 Edit (not yet) · 2 Deny.
+                let sel = state.selected;
+                app.modal = None;
+                match sel {
+                    0 => app.accept_proposed_plan(),
+                    2 => app.deny_proposed_plan(),
+                    // 1 (Edit) lands in V3.f.2 — fall back to Accept for
+                    // now so Enter is never a no-op.
+                    _ => app.accept_proposed_plan(),
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                state.selected = state.selected.saturating_sub(1);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                state.selected = (state.selected + 1).min(2);
+            }
+            KeyCode::PageDown => state.scroll = state.scroll.saturating_add(10),
+            KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(10),
+            KeyCode::Home | KeyCode::Char('g') => state.scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => state.scroll = u16::MAX,
+            KeyCode::Down | KeyCode::Char('j') => state.scroll = state.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => state.scroll = state.scroll.saturating_sub(1),
             _ => {}
         },
     }
@@ -3420,6 +3598,20 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             110,
             32,
         ),
+        Modal::PlanReview(state) => {
+            use crate::ui::modal::PlanReviewPurpose;
+            let title = match state.purpose {
+                PlanReviewPurpose::NewPlan => " ▤  agent proposed a plan ".to_string(),
+                PlanReviewPurpose::Amendment => " ▤  plan amendment ".to_string(),
+            };
+            (
+                title,
+                Text::from(plan_review_body(state, theme)),
+                "a accept · d deny · t toggle auto-run · Esc cancel".to_string(),
+                90,
+                24,
+            )
+        }
         Modal::ExtSelect {
             title,
             options,
@@ -4198,6 +4390,92 @@ fn git_log_body(state: &crate::ui::modal::GitLogState, t: &Theme) -> Vec<Line<'s
             Span::styled(c.subject.clone(), subject_style),
         ]));
     }
+    out
+}
+
+/// V3.f · body of the Plan Review modal. Lists the proposed steps, the
+/// auto-run toggle, and the three action chips (Accept / Edit / Deny).
+/// Edit mode wires in during V3.f.2 — for now the Edit chip falls back
+/// to Accept.
+fn plan_review_body(state: &crate::ui::modal::PlanReviewState, t: &Theme) -> Vec<Line<'static>> {
+    use crate::ui::modal::PlanReviewPurpose;
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    let intro = match state.purpose {
+        PlanReviewPurpose::NewPlan => format!(
+            "The agent proposed a {}-step plan. Review before execution.",
+            state.items.len()
+        ),
+        PlanReviewPurpose::Amendment => format!(
+            "The agent wants to amend the current plan ({} steps after amendment).",
+            state.items.len()
+        ),
+    };
+    out.push(Line::default());
+    out.push(Line::from(Span::styled(
+        format!("  {intro}"),
+        Style::default().fg(t.muted),
+    )));
+    out.push(Line::default());
+
+    for (i, step) in state.items.iter().enumerate() {
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("[ ] {:>2}. ", i + 1),
+                Style::default().fg(t.dim).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(step.clone(), Style::default().fg(t.text)),
+        ]));
+    }
+
+    out.push(Line::default());
+    out.push(Line::from(vec![
+        Span::raw("  auto-run after accept: "),
+        Span::styled(
+            if state.auto_run_pref { "ON" } else { "OFF" },
+            Style::default()
+                .fg(if state.auto_run_pref {
+                    t.success
+                } else {
+                    t.dim
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("    (press ", Style::default().fg(t.dim)),
+        kb("t", t),
+        Span::styled(" to toggle)", Style::default().fg(t.dim)),
+    ]));
+    out.push(Line::default());
+
+    // Action chips. Selected chip is inverted for contrast.
+    let chip = |label: &str, idx: usize, color: Color| -> Span<'static> {
+        let focused = state.selected == idx;
+        let style = if focused {
+            Style::default()
+                .fg(Color::Rgb(0, 0, 0))
+                .bg(color)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        };
+        Span::styled(format!("  {label}  "), style)
+    };
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        chip("Accept", 0, t.success),
+        Span::raw("  "),
+        chip("Edit", 1, t.accent),
+        Span::raw("  "),
+        chip("Deny", 2, t.error),
+    ]));
+
+    out.push(Line::default());
+    out.push(Line::from(Span::styled(
+        "  Shortcuts: a Accept · e Edit · d Deny · t toggle auto-run · Esc / d to cancel",
+        Style::default().fg(t.dim),
+    )));
+
     out
 }
 
@@ -6055,6 +6333,136 @@ I'll take it from here.",
             !text.contains("/export-html"),
             "stale 10-command cheat sheet came back"
         );
+    }
+
+    // ── V3.f · plan approval flow ──────────────────────────────────────
+
+    fn assistant_end(text: &str) -> Incoming {
+        use crate::rpc::types::AssistantBlock;
+        Incoming::AgentEnd {
+            messages: vec![AgentMessage::Assistant {
+                content: vec![AssistantBlock::Text { text: text.into() }],
+                api: None,
+                provider: None,
+                model: None,
+                usage: None,
+                stop_reason: None,
+                error_message: None,
+                timestamp: 0,
+                entry_id: None,
+            }],
+        }
+    }
+
+    /// V3.f · PLAN_SET from the agent must NOT activate the plan. It
+    /// creates a proposal, opens the review modal, and leaves auto-run
+    /// off until the user accepts.
+    #[test]
+    fn plan_set_from_agent_creates_proposal_not_active_plan() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end(
+            "sure: [[PLAN_SET: step a | step b | step c]]",
+        ));
+        // Proposal stored.
+        assert!(a.proposed_plan.is_some());
+        let p = a.proposed_plan.as_ref().unwrap();
+        assert_eq!(p.items.len(), 3);
+        assert_eq!(p.origin, crate::plan::PlanOrigin::Agent);
+        // Active plan untouched.
+        assert!(!a.plan.is_active());
+        assert_eq!(a.plan.total(), 0);
+        // Review modal open.
+        assert!(matches!(a.modal, Some(Modal::PlanReview(_))));
+        // No auto-prompt staged.
+        assert!(a.pending_auto_prompt.is_none());
+    }
+
+    /// V3.f · accepting the proposal activates the plan. Because V3
+    /// answer #3 is YOLO, auto-run stays ON and the first-step prompt
+    /// is staged immediately.
+    #[test]
+    fn accept_proposed_plan_activates_and_stages_first_step() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("[[PLAN_SET: step a | step b]]"));
+        a.accept_proposed_plan();
+        assert!(a.proposed_plan.is_none(), "proposal cleared after accept");
+        assert_eq!(a.plan.total(), 2);
+        assert!(a.plan.is_active());
+        assert!(a.plan.auto_run, "YOLO: auto-run stays on after accept");
+        let p = a.pending_auto_prompt.as_deref().unwrap_or("");
+        assert!(
+            p.contains("Proceed with step 1") && p.contains("step a"),
+            "first-step prompt not staged: {p:?}"
+        );
+    }
+
+    /// V3.f · denying discards the proposal and leaves the active plan
+    /// unchanged.
+    #[test]
+    fn deny_proposed_plan_clears_it() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("[[PLAN_SET: x | y]]"));
+        assert!(a.proposed_plan.is_some());
+        a.deny_proposed_plan();
+        assert!(a.proposed_plan.is_none());
+        assert!(!a.plan.is_active());
+        // A transcript row records the rejection.
+        assert!(
+            a.transcript
+                .entries()
+                .iter()
+                .any(|e| matches!(e, Entry::Info(s) if s.contains("rejected"))),
+            "no rejection transcript row"
+        );
+    }
+
+    /// V3.f · STEP_DONE is a no-op when only a proposal exists (no
+    /// accepted active plan).
+    #[test]
+    fn step_done_ignored_without_accepted_plan() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("[[PLAN_SET: a | b]]\n[[STEP_DONE]]"));
+        // Proposal still exists, active plan untouched.
+        assert!(a.proposed_plan.is_some());
+        assert_eq!(a.plan.total(), 0);
+    }
+
+    /// V3.f · once a plan is accepted, STEP_DONE on a subsequent
+    /// agent_end advances it normally.
+    #[test]
+    fn step_done_advances_accepted_plan() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("[[PLAN_SET: a | b]]"));
+        a.accept_proposed_plan();
+        assert!(a.plan.is_active());
+        // Clear staged prompt + start a new turn so STEP_DONE hits the
+        // live active plan rather than the proposal path.
+        a.pending_auto_prompt = None;
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("done with a. [[STEP_DONE]]"));
+        assert_eq!(a.plan.count_done(), 1);
+        let second = &a.plan.items[1];
+        assert_eq!(second.status, crate::plan::Status::Active);
+    }
+
+    /// V3.f · parsing pulls from agent_end.messages, not the transcript
+    /// tail. Seed the transcript with a different assistant message and
+    /// prove the payload wins.
+    #[test]
+    fn plan_set_parses_from_agent_end_messages_not_transcript_tail() {
+        let mut a = app();
+        // Seed transcript with an unrelated assistant entry.
+        a.transcript
+            .push(Entry::Assistant("no markers here".into()));
+        a.on_event(Incoming::AgentStart);
+        // Payload contains the PLAN_SET; transcript tail doesn't.
+        a.on_event(assistant_end("[[PLAN_SET: x | y]]"));
+        assert!(a.proposed_plan.is_some(), "payload should have won");
     }
 
     // ── V2.13.a · /shortcuts modal ──────────────────────────────────────

@@ -72,10 +72,11 @@ pub(super) fn on_event(app: &mut App, ev: Incoming) {
             } else {
                 app.set_live(LiveState::Idle);
             }
-            // Plan-mode marker handling: scan the last assistant text
-            // for [[STEP_DONE]] / [[STEP_FAILED]] / [[PLAN_SET]] /
-            // [[PLAN_ADD]] and apply.
-            app.apply_plan_markers_on_agent_end();
+            // Plan-mode marker handling: V3.f · parse from the
+            // authoritative agent_end.messages payload first
+            // (transcript tail is a fallback for bootstrap-time or
+            // shape-drift cases).
+            app.apply_plan_markers_on_agent_end(&messages);
             if app.notify_enabled && !had_error {
                 let dur = app
                     .agent_start_tick

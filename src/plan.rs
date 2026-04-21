@@ -210,6 +210,34 @@ impl Plan {
     }
 }
 
+/// V3.f · who authored a plan or amendment proposal. Drives the UX:
+/// Agent proposals go through the Plan Review modal (accept/deny/edit);
+/// User-authored `/plan set …` activates immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanOrigin {
+    Agent,
+    #[allow(dead_code)] // surfaced in V3.f.x if we ever reuse the review flow for user proposals
+    User,
+}
+
+/// V3.f · a plan proposed by the agent but not yet accepted by the user.
+/// Lives alongside the real `Plan` so `wrap_with_plan()` can ignore it —
+/// only accepted plans participate in prompt wrapping or auto-run.
+#[derive(Debug, Clone)]
+pub struct ProposedPlan {
+    pub items: Vec<String>,
+    /// V3.f.2 reads this to branch on the Edit-mode semantics.
+    #[allow(dead_code)]
+    pub origin: PlanOrigin,
+    /// Agent-suggested auto-run hint. The user may override in the review
+    /// modal before accepting. Per V3 answer #3 we keep the answer YOLO:
+    /// acceptance defaults to ON unless the user flips it.
+    pub suggested_auto_run: bool,
+    /// Tick at which the proposal arrived. Useful for staleness / debug.
+    #[allow(dead_code)]
+    pub created_at_tick: u64,
+}
+
 /// Result of scanning assistant text for the plan markers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Marker {

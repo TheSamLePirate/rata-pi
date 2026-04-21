@@ -124,6 +124,12 @@ pub enum Modal {
     /// Plan view: full list of plan items with status.
     PlanView,
 
+    /// V3.f · plan review: the agent proposed (or amended) a plan and the
+    /// user must Accept / Edit / Deny before anything runs. State is
+    /// boxed because the draft list + edit buffer are the largest modal
+    /// payload after Interview.
+    PlanReview(Box<PlanReviewState>),
+
     /// V2.11 · readiness modal. One row per check.
     Doctor(Vec<DoctorCheck>),
     /// V2.11 · MCP servers (if pi exposes any).
@@ -188,6 +194,44 @@ pub struct SettingsState {
     /// True when the user moved the viewport manually (PgUp/PgDn/etc.).
     /// Paused auto-scroll-to-selection until the selection moves again.
     pub user_scrolled: bool,
+}
+
+/// V3.f · state for the plan-review modal. Drives Accept / Edit / Deny
+/// + (in V3.f.2) the edit-mode flow.
+#[derive(Debug)]
+pub struct PlanReviewState {
+    /// Editable draft of the proposed steps. Starts as a copy of whatever
+    /// `ProposedPlan` the agent offered; Edit mode mutates this list.
+    pub items: Vec<String>,
+    /// Focused action chip (0 = Accept, 1 = Edit, 2 = Deny) OR, while
+    /// in Edit mode, the focused step index.
+    pub selected: usize,
+    pub scroll: u16,
+    /// V3.f.2 (next sub-commit) uses this to gate Edit-mode key handling;
+    /// for now Review is the only variant.
+    #[allow(dead_code)]
+    pub mode: PlanReviewMode,
+    /// Will auto-run kick off after Accept? Starts from the proposal's
+    /// suggested flag; user may toggle with `t` in either mode.
+    pub auto_run_pref: bool,
+    /// Why this review modal is open: fresh agent plan OR an amendment
+    /// to an existing active plan.
+    pub purpose: PlanReviewPurpose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanReviewMode {
+    Review,
+    // V3.f.2 will add Edit variant.
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanReviewPurpose {
+    /// Brand-new plan proposed via `[[PLAN_SET: …]]`.
+    NewPlan,
+    /// `[[PLAN_ADD: …]]` against an existing active plan — the user sees
+    /// "amend your plan with step X?" with the full amended list.
+    Amendment,
 }
 
 #[derive(Debug)]
