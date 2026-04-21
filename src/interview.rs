@@ -321,10 +321,13 @@ pub struct InterviewState {
     /// Index into `fields` of the currently focused entry. Navigation
     /// skips non-interactive kinds.
     pub focus: usize,
-    /// Vertical scroll offset for tall forms. Not wired into the draw
-    /// path yet — the modal frame's natural clip handles typical forms.
-    #[allow(dead_code)]
+    /// Vertical scroll offset. When `user_scrolled` is true, this value
+    /// is used verbatim; otherwise the draw path auto-scrolls to keep
+    /// the focused field visible.
     pub scroll: u16,
+    /// True when the user moved the viewport manually (PgUp/PgDn/etc.);
+    /// auto-scroll-on-focus is paused until focus moves again.
+    pub user_scrolled: bool,
     /// When set, `submit` was attempted but a required field was empty.
     pub validation_error: Option<String>,
 }
@@ -445,6 +448,7 @@ impl InterviewState {
             fields,
             focus,
             scroll: 0,
+            user_scrolled: false,
             validation_error: None,
         }
     }
@@ -474,6 +478,8 @@ impl InterviewState {
             let cand = (self.focus + i) % total;
             if cand == n || self.fields[cand].is_interactive() {
                 self.focus = cand;
+                // Any focus move re-enables auto-scroll.
+                self.user_scrolled = false;
                 return;
             }
         }
@@ -490,6 +496,7 @@ impl InterviewState {
             let cand = (self.focus + total - i) % total;
             if cand == n || self.fields[cand].is_interactive() {
                 self.focus = cand;
+                self.user_scrolled = false;
                 return;
             }
         }

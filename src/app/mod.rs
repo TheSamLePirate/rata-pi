@@ -2545,6 +2545,29 @@ fn interview_key(
         (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
             return try_submit_interview(state);
         }
+        // Explicit scroll: PgUp/PgDn move the viewport by ~10 rows.
+        // Ctrl+Home/Ctrl+End jump to top/bottom. Marks `user_scrolled`
+        // so focus-follow pauses until the user Tabs again.
+        (KeyCode::PageDown, _) => {
+            state.scroll = state.scroll.saturating_add(10);
+            state.user_scrolled = true;
+            return false;
+        }
+        (KeyCode::PageUp, _) => {
+            state.scroll = state.scroll.saturating_sub(10);
+            state.user_scrolled = true;
+            return false;
+        }
+        (KeyCode::Home, m) if m.contains(KeyModifiers::CONTROL) => {
+            state.scroll = 0;
+            state.user_scrolled = true;
+            return false;
+        }
+        (KeyCode::End, m) if m.contains(KeyModifiers::CONTROL) => {
+            state.scroll = u16::MAX;
+            state.user_scrolled = true;
+            return false;
+        }
         _ => {}
     }
 
@@ -4470,7 +4493,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::Interview(state) => (
             format!(" ✍ interview · {} ", state.title),
             Text::from(interview_body(state, theme)),
-            "Tab/↓ next · Shift+Tab/↑ prev · Space toggle · Enter send (on Submit) · Ctrl+S submit · Esc cancel".to_string(),
+            "Tab/↓ next · Shift+Tab/↑ prev · PgUp/PgDn scroll · Space toggle · Enter send (on Submit) · Ctrl+S submit · Esc cancel".to_string(),
             110,
             32,
         ),
@@ -4578,6 +4601,13 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::Files(ff) => Some(2 + ff.selected as u16),
         Modal::GitLog(s) => Some(2 + s.selected as u16),
         Modal::ExtSelect { selected, .. } => Some(*selected as u16),
+        // Interview: focus-follow auto-scroll. When the user manually
+        // scrolled (PgUp/PgDn), their offset wins — we'll read it below
+        // via the `state.user_scrolled` gate.
+        Modal::Interview(state) if !state.user_scrolled => {
+            let (_, focus_rows) = interview_body_and_focus_rows(state, theme);
+            focus_rows.get(state.focus).copied()
+        }
         // Diff modal uses raw line-scroll (no selection), handled below.
         _ => None,
     };
@@ -4593,6 +4623,9 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     let scroll_y = match modal {
         // Diff: free-form scroll, no selection. Clamp to end-of-content.
         Modal::Diff(d) => d.scroll.min(max_scroll),
+        // Interview: honor the user's explicit scroll when they moved
+        // the viewport manually; otherwise auto-track focus.
+        Modal::Interview(state) if state.user_scrolled => state.scroll.min(max_scroll),
         _ => match selected_line {
             Some(line) if total_lines > viewport => {
                 let half = viewport / 2;
@@ -5032,9 +5065,23 @@ fn mcp_body(rows: &[crate::ui::modal::McpRow], t: &Theme) -> Vec<Line<'static>> 
 /// then one block per field. Focused interactive field gets a `▶`
 /// marker + accent color; required-but-empty fields get a red chip.
 fn interview_body(state: &crate::interview::InterviewState, t: &Theme) -> Vec<Line<'static>> {
+    interview_body_and_focus_rows(state, t).0
+}
+
+/// Build the modal body AND a parallel vector mapping each focus slot
+/// (0..=fields.len()) to its starting source-line index. The draw path
+/// uses that mapping to compute scroll offsets that keep the focused
+/// field visible. Position `fields.len()` is the submit button.
+fn interview_body_and_focus_rows(
+    state: &crate::interview::InterviewState,
+    t: &Theme,
+) -> (Vec<Line<'static>>, Vec<u16>) {
     use crate::interview::FieldValue;
 
     let mut out: Vec<Line<'static>> = Vec::new();
+    // focus_rows[i] = source-line index where field i starts.
+    // focus_rows[fields.len()] = source-line of the submit button.
+    let mut focus_rows: Vec<u16> = vec![0; state.fields.len() + 1];
 
     // Top-matter: description + validation error.
     if let Some(desc) = &state.description {
@@ -5057,6 +5104,7 @@ fn interview_body(state: &crate::interview::InterviewState, t: &Theme) -> Vec<Li
 
     // Fields.
     for (i, f) in state.fields.iter().enumerate() {
+        focus_rows[i] = out.len() as u16;
         let focused = i == state.focus && f.is_interactive();
         let marker = if focused { "▶" } else { " " };
         let marker_style = if focused {
@@ -5301,6 +5349,9 @@ fn interview_body(state: &crate::interview::InterviewState, t: &Theme) -> Vec<Li
     // Submit button row — focusable via Tab. When focused, show the
     // ▶ cursor marker + invert the button label so the user sees it
     // is the current target.
+    // Record its source-line position for the focus-tracker.
+    focus_rows[state.fields.len()] = out.len() as u16 + 1; // +1 for the blank line pushed just below
+
     let can_submit = state.first_missing_required().is_none();
     let submit_focused = state.focus_on_submit();
     let submit_bg = if can_submit { t.success } else { t.dim };
@@ -5347,7 +5398,7 @@ fn interview_body(state: &crate::interview::InterviewState, t: &Theme) -> Vec<Li
         ),
     ]));
 
-    out
+    (out, focus_rows)
 }
 
 fn interview_label_line(
@@ -7103,6 +7154,43 @@ I'll take it from here.",
         assert!(!state.focus_on_submit());
         let submit = interview_key(&mut state, KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert!(submit, "Ctrl+S should submit from any focus");
+    }
+
+    #[test]
+    fn interview_pgdown_scrolls_and_marks_user_scroll() {
+        let src = r#"[[ASK_TEXT: a | A]]"#;
+        let (iv, _) = crate::interview::parse_ask_markers(src).unwrap();
+        let mut state = crate::interview::InterviewState::from_interview(iv);
+        assert_eq!(state.scroll, 0);
+        assert!(!state.user_scrolled);
+        let _ = interview_key(&mut state, KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(state.scroll, 10);
+        assert!(state.user_scrolled);
+    }
+
+    #[test]
+    fn interview_tab_resets_user_scrolled_for_autofocus() {
+        let src = r#"[[ASK_TEXT: a | A]] [[ASK_TEXT: b | B]]"#;
+        let (iv, _) = crate::interview::parse_ask_markers(src).unwrap();
+        let mut state = crate::interview::InterviewState::from_interview(iv);
+        // Simulate the user scrolling manually.
+        state.scroll = 20;
+        state.user_scrolled = true;
+        let _ = interview_key(&mut state, KeyCode::Tab, KeyModifiers::NONE);
+        // Tab moves focus; user_scrolled clears so auto-follow kicks in.
+        assert!(!state.user_scrolled);
+    }
+
+    #[test]
+    fn interview_ctrl_home_and_end_scroll_to_bounds() {
+        let src = r#"[[ASK_TEXT: a | A]]"#;
+        let (iv, _) = crate::interview::parse_ask_markers(src).unwrap();
+        let mut state = crate::interview::InterviewState::from_interview(iv);
+        let _ = interview_key(&mut state, KeyCode::End, KeyModifiers::CONTROL);
+        assert_eq!(state.scroll, u16::MAX);
+        assert!(state.user_scrolled);
+        let _ = interview_key(&mut state, KeyCode::Home, KeyModifiers::CONTROL);
+        assert_eq!(state.scroll, 0);
     }
 
     #[test]
