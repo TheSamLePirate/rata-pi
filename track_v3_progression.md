@@ -56,7 +56,7 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 - [x] `build-release` job — `cargo build --locked --release` smoke on Ubuntu
 - [x] Local parity: all three commands pass locally (test matrix will confirm on push)
 
-**Shipped as** `<tbd>`
+**Shipped as** `be61ab1`
 
 ---
 
