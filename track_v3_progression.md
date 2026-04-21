@@ -213,7 +213,7 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
   - [x] `wheel_scroll_routes_to_open_modal` — scroll goes to modal, not transcript
   - [x] `wheel_scroll_without_modal_is_a_noop`
 
-**Shipped as** `<tbd>`
+**Shipped as** `203d5b0`
 
 ---
 
