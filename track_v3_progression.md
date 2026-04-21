@@ -96,7 +96,7 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
   - [x] `settings_toggle_offline_flashes_for_rpc_backed_flags` (updated to assert FlashKind::Warn)
   - [x] `picker_surfaces_rows_via_alias_hints`
 
-**Shipped as** `<tbd>`
+**Shipped as** `b6808f0`
 
 ---
 
