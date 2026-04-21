@@ -133,6 +133,16 @@ pub enum Modal {
     /// Boxed because `InterviewState` is the largest modal payload.
     Interview(Box<crate::interview::InterviewState>),
 
+    /// V2.13.a · read-only keybinding reference.
+    /// Holds only a scroll offset; content is generated fresh on each
+    /// draw so theme changes take effect immediately.
+    Shortcuts {
+        scroll: u16,
+    },
+
+    /// V2.13.b · every tunable setting + observable state.
+    Settings(SettingsState),
+
     Help,
 
     /// Extension UI dialog: select from a list of strings.
@@ -163,6 +173,21 @@ pub enum Modal {
         title: String,
         value: String,
     },
+}
+
+/// V2.13.b · live state for the `/settings` modal. Rows themselves are
+/// built fresh from `&App` on each draw, so this struct only has to
+/// carry the cursor + scroll.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SettingsState {
+    /// Index into the rebuilt Vec<SettingsRow>; points at an interactive
+    /// (non-Header) row.
+    pub selected: usize,
+    /// Vertical scroll offset into the rendered body.
+    pub scroll: u16,
+    /// True when the user moved the viewport manually (PgUp/PgDn/etc.).
+    /// Paused auto-scroll-to-selection until the selection moves again.
+    pub user_scrolled: bool,
 }
 
 #[derive(Debug)]

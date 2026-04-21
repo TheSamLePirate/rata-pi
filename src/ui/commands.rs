@@ -346,6 +346,21 @@ pub fn builtins() -> Vec<MenuItem> {
             "/commit wire it up"
         ),
         b!(Git, "stash", "git stash push", "", "/stash"),
+        // ── session · settings/shortcuts (V2.13) ─────────────────────────
+        b!(
+            Session,
+            "settings",
+            "every tunable setting + live state in one panel",
+            "",
+            "/settings"
+        ),
+        b!(
+            Session,
+            "shortcuts",
+            "read-only keybinding reference for every modal and context",
+            "",
+            "/shortcuts"
+        ),
         // ── debug ────────────────────────────────────────────────────────
         b!(
             Debug,

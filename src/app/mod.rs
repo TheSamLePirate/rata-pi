@@ -1909,6 +1909,36 @@ async fn handle_modal_key(
             }
             _ => {}
         },
+        // V2.13.a · read-only shortcut reference. Scroll-only.
+        Modal::Shortcuts { scroll } => match code {
+            KeyCode::Esc | KeyCode::Char('q') => app.modal = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                *scroll = scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                *scroll = scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                *scroll = scroll.saturating_add(10);
+            }
+            KeyCode::PageUp => {
+                *scroll = scroll.saturating_sub(10);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                *scroll = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                *scroll = u16::MAX;
+            }
+            _ => {}
+        },
+        // V2.13.b stub — full settings key handling lands in V2.13.b.
+        // For now just Esc closes.
+        Modal::Settings(_) => {
+            if code == KeyCode::Esc {
+                app.modal = None;
+            }
+        }
         Modal::GitLog(state) => {
             let n = state.commits.len();
             match code {
@@ -3267,6 +3297,14 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
             app.modal = Some(Modal::Mcp(mcp_rows(app)));
             true
         }
+        "shortcuts" | "keys" | "hotkeys" => {
+            app.modal = Some(Modal::Shortcuts { scroll: 0 });
+            true
+        }
+        "settings" | "prefs" | "preferences" => {
+            app.modal = Some(Modal::Settings(crate::ui::modal::SettingsState::default()));
+            true
+        }
         "notify" => {
             app.notify_enabled = !app.notify_enabled;
             let state = if app.notify_enabled { "on" } else { "off" };
@@ -4497,6 +4535,21 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             110,
             32,
         ),
+        Modal::Shortcuts { .. } => (
+            " ⌨  shortcuts ".to_string(),
+            Text::from(shortcuts_body(theme)),
+            "↑↓/j/k scroll · PgUp/PgDn ±10 · g/G top/bot · Esc close".to_string(),
+            100,
+            32,
+        ),
+        Modal::Settings(state) => (
+            " ⚙  settings ".to_string(),
+            Text::from(settings_body(app, state, theme)),
+            "↑↓ nav · Enter/Space toggle · ←/→ cycle · PgUp/PgDn ±5 · Esc close"
+                .to_string(),
+            110,
+            32,
+        ),
         Modal::ExtSelect {
             title,
             options,
@@ -4608,7 +4661,13 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             let (_, focus_rows) = interview_body_and_focus_rows(state, theme);
             focus_rows.get(state.focus).copied()
         }
-        // Diff modal uses raw line-scroll (no selection), handled below.
+        // Settings: same focus-follow-on-select as list modals. When the
+        // user PgUp/PgDn'd manually, their offset wins.
+        Modal::Settings(state) if !state.user_scrolled => {
+            let rows = build_settings_rows(app);
+            settings_row_source_line(&rows, state.selected)
+        }
+        // Diff / Shortcuts modals use raw line-scroll (no selection).
         _ => None,
     };
 
@@ -4623,9 +4682,13 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     let scroll_y = match modal {
         // Diff: free-form scroll, no selection. Clamp to end-of-content.
         Modal::Diff(d) => d.scroll.min(max_scroll),
+        // Shortcuts: free-form scroll, no selection.
+        Modal::Shortcuts { scroll } => (*scroll).min(max_scroll),
         // Interview: honor the user's explicit scroll when they moved
         // the viewport manually; otherwise auto-track focus.
         Modal::Interview(state) if state.user_scrolled => state.scroll.min(max_scroll),
+        // Settings: same pattern as Interview.
+        Modal::Settings(state) if state.user_scrolled => state.scroll.min(max_scroll),
         _ => match selected_line {
             Some(line) if total_lines > viewport => {
                 let half = viewport / 2;
@@ -5064,6 +5127,181 @@ fn mcp_body(rows: &[crate::ui::modal::McpRow], t: &Theme) -> Vec<Line<'static>> 
 /// Render the Interview modal body: header with title / description,
 /// then one block per field. Focused interactive field gets a `▶`
 /// marker + accent color; required-but-empty fields get a red chip.
+/// V2.13.a · read-only keybinding reference. One entry per key; grouped
+/// into sections that match the app's input surfaces.
+fn shortcuts_body(t: &Theme) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    let section = |out: &mut Vec<Line<'static>>, title: &str| {
+        out.push(Line::default());
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("  {title}  "),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("─".repeat(60), Style::default().fg(t.dim)),
+        ]));
+    };
+    let row = |out: &mut Vec<Line<'static>>, keys: &str, action: &str| {
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<22}  ", keys),
+                Style::default()
+                    .fg(t.accent_strong)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(action.to_string(), Style::default().fg(t.text)),
+        ]));
+    };
+
+    out.push(Line::from(Span::styled(
+        "  Every keyboard action rata-pi responds to.",
+        Style::default().fg(t.muted),
+    )));
+
+    section(&mut out, "Global");
+    row(&mut out, "Ctrl+C", "quit");
+    row(&mut out, "Ctrl+D", "quit");
+
+    section(&mut out, "Editor (idle — no modal)");
+    row(&mut out, "Enter", "submit prompt");
+    row(&mut out, "Shift+Enter / Ctrl+J", "insert newline");
+    row(&mut out, "Esc (streaming)", "abort current run");
+    row(&mut out, "Esc (empty composer)", "quit");
+    row(&mut out, "Esc (composer has text)", "clear composer");
+    row(&mut out, "Ctrl+F", "enter focus mode");
+    row(&mut out, "Ctrl+T", "toggle thinking visibility");
+    row(&mut out, "Alt+T / Ctrl+Shift+T / F12", "cycle theme");
+    row(&mut out, "Ctrl+E", "toggle expand on last tool card");
+    row(&mut out, "Ctrl+P", "fuzzy file finder");
+    row(&mut out, "Ctrl+Y", "copy last assistant message");
+    row(&mut out, "Ctrl+R", "prompt-history picker");
+    row(&mut out, "Ctrl+S", "export transcript to markdown");
+    row(&mut out, "Ctrl+Space (streaming)", "cycle composer intent");
+    row(&mut out, "F1 / /", "commands modal");
+    row(&mut out, "F5", "model picker");
+    row(&mut out, "F6", "thinking-level picker");
+    row(&mut out, "F7", "stats modal");
+    row(&mut out, "F8", "compact context now");
+    row(&mut out, "F9", "toggle auto-compaction");
+    row(&mut out, "F10", "toggle auto-retry");
+    row(&mut out, "?", "help modal");
+    row(&mut out, "↑ / ↓", "prompt history prev / next");
+    row(&mut out, "PgUp / PgDn", "scroll transcript ±5");
+    row(&mut out, "End (empty composer)", "re-pin live tail");
+
+    section(&mut out, "Composer editing");
+    row(&mut out, "← / →", "cursor left / right");
+    row(&mut out, "Alt+← / Alt+→", "word left / word right");
+    row(&mut out, "Home / Ctrl+A", "start of line");
+    row(&mut out, "End", "end of line (composer non-empty)");
+    row(&mut out, "Backspace", "delete char before cursor");
+    row(&mut out, "Delete", "delete char under cursor");
+    row(&mut out, "Ctrl+U", "kill to start of line");
+    row(&mut out, "Ctrl+K", "kill to end of line");
+    row(&mut out, "Ctrl+W", "kill word back");
+
+    section(&mut out, "Focus mode (Ctrl+F)");
+    row(&mut out, "j / ↓", "next card");
+    row(&mut out, "k / ↑", "previous card");
+    row(&mut out, "g / Home", "first card");
+    row(&mut out, "G / End", "last card");
+    row(&mut out, "PgUp / PgDn", "±5 cards");
+    row(&mut out, "Enter / Space", "toggle expand on tool card");
+    row(&mut out, "y / c / Ctrl+Y", "copy focused card to clipboard");
+    row(&mut out, "Esc / q", "exit focus mode");
+
+    section(&mut out, "Modal — any");
+    row(&mut out, "↑ / ↓", "move selection");
+    row(&mut out, "PgUp / PgDn", "page ±5");
+    row(&mut out, "Home / End", "first / last");
+    row(&mut out, "Enter", "apply selection");
+    row(&mut out, "Esc", "close modal");
+    row(&mut out, "(printable key)", "append to filter query");
+    row(&mut out, "Backspace", "delete from filter query");
+
+    section(&mut out, "Vim mode (opt-in via /vim)");
+    row(&mut out, "Esc", "Normal mode");
+    row(
+        &mut out,
+        "i / a / I / A",
+        "Insert at cursor / after / start / end",
+    );
+    row(&mut out, "o / O", "new line below / above + Insert");
+    row(&mut out, "h j k l", "left / down / up / right");
+    row(&mut out, "w / b", "word right / left");
+    row(&mut out, "0 / $", "start / end of line");
+    row(&mut out, "x", "delete char under cursor");
+    row(&mut out, "dd", "delete line");
+    row(&mut out, "gg / G", "top / bottom");
+
+    section(&mut out, "Interview modal");
+    row(&mut out, "Tab / ↓", "next field (incl. Submit button)");
+    row(&mut out, "Shift+Tab / ↑", "previous field");
+    row(&mut out, "← / →", "cycle select / move multiselect cursor");
+    row(&mut out, "Alt+← / Alt+→", "word motion in text / number");
+    row(&mut out, "Space", "toggle boolean / multiselect option");
+    row(&mut out, "1..9", "on select, pick Nth option");
+    row(&mut out, "Shift+Enter", "newline (multiline text only)");
+    row(&mut out, "Enter (text / select)", "advance focus");
+    row(&mut out, "Enter (Submit button)", "submit the form");
+    row(&mut out, "Ctrl+S / Ctrl+Enter", "submit from anywhere");
+    row(&mut out, "PgUp / PgDn", "scroll viewport ±10");
+    row(&mut out, "Ctrl+Home / Ctrl+End", "scroll to top / bottom");
+    row(&mut out, "Esc", "cancel interview");
+
+    section(&mut out, "Mouse");
+    row(&mut out, "wheel up / down", "scroll transcript");
+    row(&mut out, "left click on card", "focus card");
+    row(&mut out, "double-click tool card", "toggle expand");
+    row(&mut out, "click ⬇ live-tail chip", "re-pin live tail");
+
+    out.push(Line::default());
+    out.push(Line::from(Span::styled(
+        "  See /settings for runtime flags and state. See /help for a quick summary.",
+        Style::default().fg(t.dim),
+    )));
+
+    out
+}
+
+// ───────────────────────────────────────── settings modal (V2.13.b stub) ──
+//
+// The full /settings implementation lands in V2.13.b. For now these are
+// minimal stubs so V2.13.a (shortcuts) builds and runs. The stubs render
+// a placeholder; V2.13.b replaces them.
+
+fn build_settings_rows(_app: &App) -> Vec<()> {
+    Vec::new()
+}
+
+fn settings_row_source_line(_rows: &[()], _selected: usize) -> Option<u16> {
+    None
+}
+
+fn settings_body(
+    _app: &App,
+    _state: &crate::ui::modal::SettingsState,
+    t: &Theme,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::default(),
+        Line::from(Span::styled(
+            "  /settings is under construction (V2.13.b). Everything you'd set or observe",
+            Style::default().fg(t.muted),
+        )),
+        Line::from(Span::styled(
+            "  is coming here — themes, auto-retry, notifications, live state, capabilities.",
+            Style::default().fg(t.muted),
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            "  For now, use: /theme  /notify  /vim  F6 (thinking)  F9 (auto-compact)  F10 (auto-retry)",
+            Style::default().fg(t.dim),
+        )),
+    ]
+}
+
 fn interview_body(state: &crate::interview::InterviewState, t: &Theme) -> Vec<Line<'static>> {
     interview_body_and_focus_rows(state, t).0
 }
@@ -7154,6 +7392,35 @@ I'll take it from here.",
         assert!(!state.focus_on_submit());
         let submit = interview_key(&mut state, KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert!(submit, "Ctrl+S should submit from any focus");
+    }
+
+    // ── V2.13.a · /shortcuts modal ──────────────────────────────────────
+
+    #[test]
+    fn shortcuts_body_has_every_section() {
+        let t = crate::theme::default_theme();
+        let lines = shortcuts_body(t);
+        let text = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<String>();
+        // Every section header must be present so the user doesn't hunt.
+        for header in [
+            "Global",
+            "Editor (idle — no modal)",
+            "Composer editing",
+            "Focus mode (Ctrl+F)",
+            "Modal — any",
+            "Vim mode (opt-in via /vim)",
+            "Interview modal",
+            "Mouse",
+        ] {
+            assert!(text.contains(header), "missing section: {header}");
+        }
+        // Sanity: a few representative keybindings too.
+        for key in ["Ctrl+C", "Ctrl+F", "F7", "PgUp / PgDn", "Esc", "Tab"] {
+            assert!(text.contains(key), "missing key: {key}");
+        }
     }
 
     #[test]
