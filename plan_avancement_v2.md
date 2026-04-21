@@ -477,6 +477,74 @@ Plan-mode work shipped in V2.9. TODO widget + `/diagnostics` deferred to V2.11+.
 
 ---
 
+## V2.12 — app.rs module split + reducer tests ✅ (partial, staged)
+
+Closes the P2 audit item (#9, #10, #11) for the high-value chunks: reducer-style state tests, directory layout, visuals cache extraction, and main-screen drawing extraction. The remaining modal-draw / input / slash / runtime / events extractions are tracked for V2.13+ — they're mechanical and each would be its own commit.
+
+### V2.12.a · reducer tests for `App::on_event` (commit `fe4f216`)
+- [x] **18 tests** driving the full state machine through scripted `Incoming` events. `App::on_event` is already pure (`(&mut self, Event) -> State`), so we construct a fresh App, feed events, and assert against public state.
+- [x] Coverage: Agent lifecycle (start/end, tool counters), Turn bookkeeping (counter + divider + cost), Message deltas (text/thinking/error), Tool lifecycle (counters, LLM↔Tool flips), Auto-retry (state transitions, success vs exhausted), Compaction (state transitions), Queue updates, Extension errors, Liveness probe (`last_event_tick`), End-to-end full-turn transcript shape.
+- [x] `app()` helper disables notifications so OSC 777 doesn't leak into test output.
+
+### V2.12.b · directory layout (commit `cf045c4`)
+- [x] `src/app.rs` → `src/app/mod.rs`. File move only, no code changes. Unlocks incremental submodule extraction.
+
+### V2.12.c · extract visuals cache (commit `6783ed5`)
+- [x] `src/app/visuals.rs` (350 lines). Contains:
+  - `Visual` enum + `height` / `render` / `render_clipped`
+  - `render_card_clipped` (partial-card renderer for clipped scrolling)
+  - `fingerprint_entry` (cache-key function hashing mutable bits)
+  - `CachedVisual` + `VisualsCache` + `update_visuals_cache`
+- [x] `build_one_visual` and the body-builder helpers (tool_card, bash_card, build_*_body, …) **stay** in mod.rs — too tangled with mod.rs helpers (`truncate_preview`, `args_preview`, `markdown::render`, syntect) to move cleanly in one pass. Follow-up extraction will tease them apart.
+- [x] `pub(super)` on the items consumed by mod.rs (`Visual`, `VisualsCache`, `update_visuals_cache`, `CachedVisual` fields). Child module sees parent's private `App` / `LiveState` / `Entry` for free (Rust descendant-privacy rule).
+- [x] `fingerprint_entry` re-imported under `#[cfg(test)]` only so clippy doesn't warn about an "unused import" in non-test builds.
+
+### V2.12.d · extract main-screen drawing (commit `40d5045`)
+- [x] `src/app/draw.rs` (890 lines). Contains:
+  - `draw` (the top-level frame entry), `draw_widgets`, `draw_toasts`
+  - `draw_status` + `fmt_elapsed`
+  - `draw_header`
+  - `draw_body` (reads the visuals cache — zero markdown/syntect work in this hot path)
+  - `render_cutoff_hint`, `draw_scrollbar`
+  - `draw_editor`, `draw_footer`
+  - `kb` (themed keybinding chip)
+  - `SPINNER` constant
+- [x] Modal drawing (`draw_modal` + ~20 per-modal body builders) **stays** in mod.rs for now — another ~1500-line chunk that gets its own future extraction.
+- [x] Three `pub(super)` markers on exports: `draw` (called from `ui_loop`), `draw_scrollbar` + `kb` (called from modal body builders still in mod.rs).
+- [x] `draw.rs` imports `NotifyKind` (used by `draw_toasts`); mod.rs sheds the now-unused `Constraint`/`Layout`/`BorderType`/`Gauge`/`Sparkline`/`NotifyKind` imports.
+
+### Metrics
+| | V2.11.3 | V2.12 |
+|---|---|---|
+| `src/app.rs` (or mod.rs) | 6 267 lines | **5 815 lines** |
+| Tests | 114 | **132** |
+| `src/app/` files | 1 | **3** (mod, visuals, draw) |
+| Reducer-test coverage | 0 state transitions | **18** state transitions |
+
+### Gates
+- **132 tests pass** (V2.11.3 was 114; +18 reducer tests).
+- `cargo clippy --all-targets -- -D warnings` clean across all four commits.
+- `cargo fmt --check` clean.
+- Each commit builds green in isolation (bisectable).
+
+### Not done — deferred to V2.13+ (mechanical, each its own commit)
+- [ ] **V2.13.a** — extract modal drawing (`draw_modal` + all `*_text` / `*_body` helpers + `filtered_*` iterators). ~1500 lines → `src/app/draw_modal.rs`.
+- [ ] **V2.13.b** — extract body-builder helpers (`build_one_visual`, `tool_card`, `bash_card`, `build_*_body`, `ToolFamily`, `tool_family`, `primary_arg_chip`, `plain_paragraph`, `thinking_body`, `compaction_lines`, `retry_lines`, `strip_line_numbers`, `add_output_body`, `body_or_ellipsis`, `diff_body_line`). ~700 lines → `src/app/builders.rs` or fold into `visuals.rs`.
+- [ ] **V2.13.c** — extract input (`handle_crossterm`, `handle_modal_key`, `handle_focus_key`, `on_mouse_click`, `handle_list_keys`, `handle_vim_normal`). ~800 lines → `src/app/input.rs`.
+- [ ] **V2.13.d** — extract slash (`try_local_slash`, `try_pi_slash`, `handle_plan_slash`, `submit`, `insert_file_ref`, `do_copy`). ~600 lines → `src/app/slash.rs`.
+- [ ] **V2.13.e** — extract runtime (`run`, `run_inner`, `ui_loop`, `bootstrap`, `refresh_stats`, `spawn_git_refresh`, `spawn_file_walk`, `prepare_frame_caches`, `ensure_file_preview`, `build_preview_lines`, `offline_events`). ~250 lines → `src/app/runtime.rs`.
+- [ ] **V2.13.f** — extract events (`handle_incoming`, `handle_ext_request`, `import_messages`, `user_content_text`, `parse_bash_result`). ~300 lines → `src/app/events.rs`.
+
+After all V2.13 extractions `mod.rs` should land around 2000 lines — holding just the `App` struct, `SessionState`, enum `LiveState` / `ComposerMode`, `MouseMap`, `install_panic_hook` + `write_crash_dump` + `which_pi`, the impl blocks on App, and the top-level `pub async fn run(args)`.
+
+### Notes
+- Reducer tests were the highest-ROI item of the whole V2.12 block — they make future state-machine changes safe. The module split is incremental maintainability.
+- The parent → child privacy rule (descendants see ancestor privates) made extraction cheap: only *exports* from child to parent need `pub(super)`.
+- `#[cfg(test)] use visuals::fingerprint_entry;` pattern is how we avoid clippy "unused import" on items used only from a test module — worth remembering for the remaining V2.13 extractions.
+- Each V2.13 subcommit should mirror V2.12.c / V2.12.d: verify build + tests between steps, stay bisectable, fix imports as a second pass.
+
+---
+
 ## V2.11.3 — Cleanup sweep: RefCell kill, themed kb, state_dir, small fixes ✅
 
 Closes the P3 + P4 items from the audit plus several smaller items (#8, #15, #16, #19, #23).
