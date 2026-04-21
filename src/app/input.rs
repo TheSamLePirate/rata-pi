@@ -29,6 +29,17 @@ use super::{
     rect_contains, submit,
 };
 
+/// V3.j.1 · persist the composer text to `draft.txt` if the user has
+/// anything typed. No-op when the composer is empty. Called on
+/// Ctrl+C / Ctrl+D quit since that's the path where the user likely
+/// still has unsent input.
+fn save_composer_draft_if_any(app: &App) {
+    let text = app.composer.text();
+    if !text.trim().is_empty() {
+        crate::config::save_draft(&text);
+    }
+}
+
 pub(super) fn handle_focus_key(code: KeyCode, _mods: KeyModifiers, app: &mut App) {
     let n = app.transcript.entries().len();
     if n == 0 {
@@ -120,6 +131,9 @@ pub(super) async fn handle_key(
 ) {
     // Ctrl+C / Ctrl+D always quit, even in focus mode.
     if let (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) = (code, mods) {
+        // V3.j.1 · save composer draft on quit so next launch can
+        // restore it. No-op when composer is empty.
+        save_composer_draft_if_any(app);
         app.quit = true;
         return;
     }
@@ -337,13 +351,20 @@ pub(super) async fn handle_key(
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.composer.kill_line_back(),
         (KeyCode::Char('k'), KeyModifiers::CONTROL) => app.composer.kill_line_forward(),
         (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
-            // Kill word back.
-            let before = app.composer.col;
-            app.composer.word_left();
-            let start = app.composer.col;
-            let row = app.composer.row;
-            let line = &mut app.composer.lines[row];
-            line.drain(start..before);
+            app.composer.kill_word_back();
+        }
+        // V3.j.2 · Ctrl+Z undo, Ctrl+Shift+Z redo.
+        (KeyCode::Char('z'), m)
+            if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+        {
+            if !app.composer.redo() {
+                app.flash_warn("nothing to redo");
+            }
+        }
+        (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
+            if !app.composer.undo() {
+                app.flash_warn("nothing to undo");
+            }
         }
         (KeyCode::Backspace, _) => app.composer.backspace(),
         (KeyCode::Delete, _) => app.composer.delete_char_forward(),

@@ -147,6 +147,7 @@ pub(crate) async fn dispatch_settings_action(
     match action {
         SettingsAction::Toggle(ToggleAction::ShowThinking) => {
             app.show_thinking = !app.show_thinking;
+            app.persist_config();
         }
         SettingsAction::Toggle(ToggleAction::Notify) => {
             app.notify_enabled = !app.notify_enabled;
@@ -154,6 +155,7 @@ pub(crate) async fn dispatch_settings_action(
                 "notifications {}",
                 if app.notify_enabled { "on" } else { "off" }
             ));
+            app.persist_config();
         }
         SettingsAction::Toggle(ToggleAction::Vim) => {
             app.vim_enabled = !app.vim_enabled;
@@ -162,6 +164,7 @@ pub(crate) async fn dispatch_settings_action(
                 "vim mode {}",
                 if app.vim_enabled { "on" } else { "off" }
             ));
+            app.persist_config();
         }
         SettingsAction::Toggle(ToggleAction::AutoCompact) => {
             let next = !app.session.auto_compaction.unwrap_or(true);
@@ -215,6 +218,7 @@ pub(crate) async fn dispatch_settings_action(
                     "hidden"
                 }
             ));
+            app.persist_config();
         }
 
         SettingsAction::Cycle(CycleAction::Theme, _) => {
@@ -268,6 +272,7 @@ pub(crate) async fn dispatch_settings_action(
         SettingsAction::Cycle(CycleAction::FocusMarker, _) => {
             app.focus_marker = app.focus_marker.cycle();
             app.flash(format!("focus marker → {}", app.focus_marker.label()));
+            app.persist_config();
         }
     }
 }

@@ -30,6 +30,21 @@ impl Mode {
     }
 }
 
+/// V3.j.2 · immutable snapshot of the composer buffer used by the
+/// undo/redo ring. Holds only the state that text-mutating ops need
+/// to roll back (lines, cursor). Mode + pending_op are transient UI
+/// state, not content, so they're not stored.
+#[derive(Debug, Clone)]
+struct Snapshot {
+    lines: Vec<String>,
+    row: usize,
+    col: usize,
+}
+
+/// Ring-buffer capacity. Plan says "≥ 32"; 64 gives headroom for
+/// fast typists without noticeable memory cost.
+const UNDO_CAPACITY: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct Composer {
     pub lines: Vec<String>,
@@ -40,6 +55,12 @@ pub struct Composer {
     pub mode: Mode,
     /// Pending operator for vim-style `dd` / `yy` etc.
     pub pending_op: Option<char>,
+    /// V3.j.2 · undo stack: snapshots pushed before every
+    /// text-mutating operation. Oldest entries drop when full.
+    undo: std::collections::VecDeque<Snapshot>,
+    /// Redo stack: snapshots popped off `undo` during `undo()`
+    /// land here so a matching `redo()` restores them.
+    redo: Vec<Snapshot>,
 }
 
 impl Default for Composer {
@@ -50,6 +71,8 @@ impl Default for Composer {
             col: 0,
             mode: Mode::Insert,
             pending_op: None,
+            undo: std::collections::VecDeque::with_capacity(UNDO_CAPACITY),
+            redo: Vec::new(),
         }
     }
 }
@@ -73,15 +96,78 @@ impl Composer {
     }
 
     pub fn clear(&mut self) {
+        self.snapshot_before_edit();
         self.lines = vec![String::new()];
         self.row = 0;
         self.col = 0;
         self.pending_op = None;
     }
 
+    // ── V3.j.2 · undo / redo ─────────────────────────────────────────────
+
+    fn current_snapshot(&self) -> Snapshot {
+        Snapshot {
+            lines: self.lines.clone(),
+            row: self.row,
+            col: self.col,
+        }
+    }
+
+    fn apply_snapshot(&mut self, s: Snapshot) {
+        self.lines = s.lines;
+        self.row = s.row;
+        self.col = s.col;
+    }
+
+    /// Push the current buffer onto the undo ring. Called at the start
+    /// of every text-mutating op. Redo is cleared because a fresh edit
+    /// invalidates any previously-undone states. Duplicate snapshots
+    /// (same content as the top of the stack) are coalesced so a quick
+    /// Esc-clear-Esc-clear doesn't burn ring slots.
+    fn snapshot_before_edit(&mut self) {
+        let snap = self.current_snapshot();
+        if matches!(self.undo.back(), Some(prev) if prev.lines == snap.lines) {
+            // Same content → still redo-worthy (cursor changes) but
+            // don't bloat the ring with identical text entries.
+            return;
+        }
+        if self.undo.len() == UNDO_CAPACITY {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(snap);
+        self.redo.clear();
+    }
+
+    /// Step backward one snapshot. Returns true when the undo was
+    /// applied (caller can flash accordingly).
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo.pop_back() else {
+            return false;
+        };
+        let cur = self.current_snapshot();
+        self.redo.push(cur);
+        self.apply_snapshot(prev);
+        true
+    }
+
+    /// Step forward one snapshot. Returns true on success.
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo.pop() else {
+            return false;
+        };
+        let cur = self.current_snapshot();
+        if self.undo.len() == UNDO_CAPACITY {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(cur);
+        self.apply_snapshot(next);
+        true
+    }
+
     // ── mutate (insert-mode primitives) ──────────────────────────────────
 
     pub fn insert_char(&mut self, c: char) {
+        self.snapshot_before_edit();
         let line = &mut self.lines[self.row];
         line.insert(self.col, c);
         self.col += c.len_utf8();
@@ -98,6 +184,7 @@ impl Composer {
     }
 
     pub fn insert_newline(&mut self) {
+        self.snapshot_before_edit();
         let line = &mut self.lines[self.row];
         let rest = line[self.col..].to_string();
         line.truncate(self.col);
@@ -107,6 +194,7 @@ impl Composer {
     }
 
     pub fn backspace(&mut self) {
+        self.snapshot_before_edit();
         if self.col > 0 {
             // Remove preceding char.
             let line = &mut self.lines[self.row];
@@ -123,6 +211,7 @@ impl Composer {
     }
 
     pub fn delete_char_forward(&mut self) {
+        self.snapshot_before_edit();
         let line_len = self.lines[self.row].len();
         if self.col < line_len {
             let line = &mut self.lines[self.row];
@@ -255,18 +344,33 @@ impl Composer {
     }
 
     pub fn kill_line_forward(&mut self) {
+        self.snapshot_before_edit();
         let line = &mut self.lines[self.row];
         line.truncate(self.col);
     }
 
     pub fn kill_line_back(&mut self) {
+        self.snapshot_before_edit();
         let line = &mut self.lines[self.row];
         line.drain(..self.col);
         self.col = 0;
     }
 
     /// Delete the current row. If it's the only row, leave an empty row.
+    /// V3.j.2 · kill the word before the cursor (Ctrl+W on the composer).
+    /// Shares the undo machinery with the other edit primitives.
+    pub fn kill_word_back(&mut self) {
+        self.snapshot_before_edit();
+        let before = self.col;
+        self.word_left();
+        let start = self.col;
+        let row = self.row;
+        let line = &mut self.lines[row];
+        line.drain(start..before);
+    }
+
     pub fn delete_line(&mut self) {
+        self.snapshot_before_edit();
         if self.lines.len() > 1 {
             self.lines.remove(self.row);
             if self.row >= self.lines.len() {
@@ -371,6 +475,64 @@ fn clamp_to_char_boundary(s: &str, i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// V3.j.2 · `undo` rolls back the most recent edit; `redo`
+    /// reinstates it. Each edit pushes one snapshot onto the ring.
+    #[test]
+    fn undo_and_redo_roundtrip() {
+        let mut c = Composer::default();
+        for ch in "abc".chars() {
+            c.insert_char(ch);
+        }
+        assert_eq!(c.text(), "abc");
+        assert!(c.undo());
+        assert_eq!(c.text(), "ab");
+        assert!(c.undo());
+        assert_eq!(c.text(), "a");
+        assert!(c.undo());
+        assert_eq!(c.text(), "");
+        // Beyond the oldest edit → no-op.
+        assert!(!c.undo());
+        // Redo walks forward.
+        assert!(c.redo());
+        assert_eq!(c.text(), "a");
+        assert!(c.redo());
+        assert_eq!(c.text(), "ab");
+        assert!(c.redo());
+        assert_eq!(c.text(), "abc");
+        assert!(!c.redo());
+    }
+
+    /// V3.j.2 · a fresh edit after `undo` invalidates the redo stack
+    /// (standard editor behavior; no branching history).
+    #[test]
+    fn new_edit_clears_redo_stack() {
+        let mut c = Composer::default();
+        c.insert_char('a');
+        c.insert_char('b');
+        c.undo(); // → "a"
+        assert_eq!(c.text(), "a");
+        c.insert_char('c'); // → "ac"; "ab" now unreachable via redo.
+        assert_eq!(c.text(), "ac");
+        assert!(!c.redo());
+    }
+
+    /// V3.j.2 · capacity cap drops the oldest snapshot silently. This
+    /// is the test that pins the UNDO_CAPACITY constant.
+    #[test]
+    fn undo_ring_caps_at_capacity() {
+        let mut c = Composer::default();
+        for i in 0..(UNDO_CAPACITY + 10) {
+            c.insert_char(char::from_digit((i % 10) as u32, 10).unwrap_or('x'));
+        }
+        // Undo as many times as possible — should succeed exactly
+        // UNDO_CAPACITY times, then return false.
+        let mut steps = 0;
+        while c.undo() {
+            steps += 1;
+        }
+        assert_eq!(steps, UNDO_CAPACITY);
+    }
 
     #[test]
     fn insert_and_backspace() {

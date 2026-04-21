@@ -544,14 +544,34 @@ fn probe_app_caps() -> AppCaps {
 
 impl App {
     fn new(spawn_error: Option<String>) -> Self {
+        // V3.j.1 · apply persisted user config on top of hard-coded
+        // defaults. Any missing / malformed key silently falls back.
+        let cfg = crate::config::load();
+        let theme = cfg
+            .theme
+            .as_deref()
+            .and_then(crate::theme::find)
+            .copied()
+            .unwrap_or(*crate::theme::default_theme());
+        let focus_marker = match cfg.focus_marker.as_deref() {
+            Some("border-only") => FocusMarkerStyle::BorderOnly,
+            Some("marker-only") => FocusMarkerStyle::MarkerOnly,
+            _ => FocusMarkerStyle::Both,
+        };
+        let mut composer = crate::composer::Composer::default();
+        // V3.j.1 · restore a saved draft if one exists. Takes ownership
+        // of the file so it's consumed exactly once.
+        if let Some(draft) = crate::config::take_draft() {
+            composer.set_text(&draft);
+        }
         Self {
             transcript: Transcript::default(),
-            composer: crate::composer::Composer::default(),
+            composer,
             is_streaming: false,
             ticks: 0,
             quit: false,
             scroll: None,
-            show_thinking: false,
+            show_thinking: cfg.show_thinking.unwrap_or(false),
             spawn_error,
             composer_mode: ComposerMode::Prompt,
             session: SessionState {
@@ -562,7 +582,7 @@ impl App {
             flash: None,
             ext_ui: ExtUiState::default(),
             history: History::load(),
-            theme: *theme::default_theme(),
+            theme,
             focus_idx: None,
             mouse_map: MouseMap::default(),
             live: LiveState::Idle,
@@ -579,15 +599,15 @@ impl App {
             git_status: None,
             git_refresh_inflight: false,
             file_walk_tx: None,
-            vim_enabled: false,
+            vim_enabled: cfg.vim.unwrap_or(false),
             plan: crate::plan::Plan::default(),
             pending_auto_prompt: None,
             proposed_plan: None,
-            show_raw_markers: false,
-            focus_marker: FocusMarkerStyle::Both,
+            show_raw_markers: cfg.show_raw_markers.unwrap_or(false),
+            focus_marker,
             agent_start_tick: None,
             tool_calls_this_turn: 0,
-            notify_enabled: true,
+            notify_enabled: cfg.notify.unwrap_or(true),
             visuals_cache: VisualsCache::default(),
             caps: probe_app_caps(),
         }
@@ -894,14 +914,39 @@ impl App {
         let i = theme::index_of(&self.theme);
         let next = (i + 1) % all.len();
         self.theme = all[next];
+        self.persist_config();
     }
 
     fn set_theme_by_name(&mut self, name: &str) -> bool {
         if let Some(t) = theme::find(name) {
             self.theme = *t;
+            self.persist_config();
             return true;
         }
         false
+    }
+
+    /// V3.j.1 · snapshot the persistable fields and write them to
+    /// the user's config file. Called after every mutation that
+    /// touches a persistable slot (theme / notify / vim /
+    /// show_thinking / show_raw_markers / focus_marker). Errors are
+    /// swallowed inside `config::save` — a bad disk should never
+    /// crash the app.
+    fn persist_config(&self) {
+        let focus_marker = match self.focus_marker {
+            FocusMarkerStyle::Both => "both",
+            FocusMarkerStyle::BorderOnly => "border-only",
+            FocusMarkerStyle::MarkerOnly => "marker-only",
+        };
+        let cfg = crate::config::UserConfig {
+            theme: Some(self.theme.name.to_string()),
+            notify: Some(self.notify_enabled),
+            vim: Some(self.vim_enabled),
+            show_thinking: Some(self.show_thinking),
+            show_raw_markers: Some(self.show_raw_markers),
+            focus_marker: Some(focus_marker.to_string()),
+        };
+        crate::config::save(&cfg);
     }
 
     /// Show a neutral info flash. Equivalent to `flash_info`.
