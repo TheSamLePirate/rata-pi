@@ -181,7 +181,7 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
   - [x] `different_themes_produce_different_palettes` — per-theme syntect palette selection
   - [x] `unknown_palette_falls_back_gracefully` — missing palette doesn't crash
 
-**Shipped as** `<tbd>`
+**Shipped as** `71c2c92`
 
 ---
 
