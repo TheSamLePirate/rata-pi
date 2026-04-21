@@ -377,7 +377,7 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &App) {
     );
 }
 
-fn fmt_elapsed(d: Duration) -> String {
+pub(super) fn fmt_elapsed(d: Duration) -> String {
     let s = d.as_secs();
     let h = s / 3600;
     let m = (s % 3600) / 60;

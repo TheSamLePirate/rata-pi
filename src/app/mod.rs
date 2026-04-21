@@ -28,7 +28,7 @@ use visuals::fingerprint_entry;
 // The draw entry point is called from the ui_loop. `kb` and
 // `draw_scrollbar` are also pulled up because the modal-body builders
 // (help_text, commands_text, etc.) still live in this module.
-use draw::{draw, draw_scrollbar, kb};
+use draw::{draw, draw_scrollbar, fmt_elapsed, kb};
 
 use std::collections::VecDeque;
 use std::io::{Stdout, stdout};
@@ -1932,11 +1932,15 @@ async fn handle_modal_key(
             }
             _ => {}
         },
-        // V2.13.b stub — full settings key handling lands in V2.13.b.
-        // For now just Esc closes.
+        // V2.13.b · settings modal. Navigate with ↑↓/j/k (skipping
+        // Headers). Enter / Space toggles booleans or advances cycles.
+        // ← / → steps cycle rows. PgUp/PgDn scroll the viewport.
         Modal::Settings(_) => {
-            if code == KeyCode::Esc {
+            let (maybe_action, should_close) = settings_modal_key(code, mods, app);
+            if should_close {
                 app.modal = None;
+            } else if let Some(action) = maybe_action {
+                dispatch_settings_action(app, client, action).await;
             }
         }
         Modal::GitLog(state) => {
@@ -5265,41 +5269,600 @@ fn shortcuts_body(t: &Theme) -> Vec<Line<'static>> {
     out
 }
 
-// ───────────────────────────────────────── settings modal (V2.13.b stub) ──
-//
-// The full /settings implementation lands in V2.13.b. For now these are
-// minimal stubs so V2.13.a (shortcuts) builds and runs. The stubs render
-// a placeholder; V2.13.b replaces them.
+// ───────────────────────────────────────── settings modal (V2.13.b) ──
 
-fn build_settings_rows(_app: &App) -> Vec<()> {
-    Vec::new()
+/// One key applied to the Settings modal. Returns `(Some(action), _)`
+/// when the user pressed Enter/Space/←/→ on an interactive row — the
+/// caller dispatches it. `(_, true)` means close the modal (Esc).
+fn settings_modal_key(
+    code: KeyCode,
+    _mods: KeyModifiers,
+    app: &mut App,
+) -> (Option<SettingsAction>, bool) {
+    // Build the row list against an immutable view of app first, then
+    // pull the mutable Settings state borrow. The row contents aren't
+    // needed to live past the mutation step — we just read indices.
+    let rows = build_settings_rows(app);
+    let Some(Modal::Settings(state)) = app.modal.as_mut() else {
+        return (None, false);
+    };
+
+    // Clamp initial selection onto a selectable row (the first one is
+    // usually a Header so the default selected=0 needs correcting).
+    if !rows
+        .get(state.selected)
+        .map(|r| r.is_selectable())
+        .unwrap_or(false)
+        && let Some(first) = rows.iter().position(|r| r.is_selectable())
+    {
+        state.selected = first;
+    }
+
+    let n = rows.len();
+    let step_by = |state: &mut crate::ui::modal::SettingsState, delta: i32| {
+        if n == 0 {
+            return;
+        }
+        let mut i = state.selected as i32;
+        let step = if delta >= 0 { 1 } else { -1 };
+        for _ in 0..n {
+            i += step;
+            if i < 0 {
+                i = n as i32 - 1;
+            } else if i >= n as i32 {
+                i = 0;
+            }
+            if rows[i as usize].is_selectable() {
+                state.selected = i as usize;
+                state.user_scrolled = false;
+                return;
+            }
+        }
+    };
+
+    match code {
+        KeyCode::Esc => return (None, true),
+        KeyCode::Char('j') | KeyCode::Down => step_by(state, 1),
+        KeyCode::Char('k') | KeyCode::Up => step_by(state, -1),
+        KeyCode::Home | KeyCode::Char('g') => {
+            if let Some(first) = rows.iter().position(|r| r.is_selectable()) {
+                state.selected = first;
+                state.user_scrolled = false;
+            }
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            if let Some(last) = rows.iter().rposition(|r| r.is_selectable()) {
+                state.selected = last;
+                state.user_scrolled = false;
+            }
+        }
+        KeyCode::PageUp => {
+            for _ in 0..5 {
+                step_by(state, -1);
+            }
+            state.user_scrolled = true;
+        }
+        KeyCode::PageDown => {
+            for _ in 0..5 {
+                step_by(state, 1);
+            }
+            state.user_scrolled = true;
+        }
+        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
+            if let Some(row) = rows.get(state.selected) {
+                return (row_to_action(row, CycleDir::Forward), false);
+            }
+        }
+        KeyCode::Left => {
+            if let Some(row) = rows.get(state.selected) {
+                return (row_to_action(row, CycleDir::Backward), false);
+            }
+        }
+        _ => {}
+    }
+    (None, false)
 }
 
-fn settings_row_source_line(_rows: &[()], _selected: usize) -> Option<u16> {
+#[derive(Debug, Clone, Copy)]
+enum CycleDir {
+    Forward,
+    Backward,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SettingsAction {
+    Toggle(ToggleAction),
+    // The direction field is carried for API symmetry; currently all
+    // cycle actions advance forward regardless (pi's RPC surface has
+    // no `previous_model` / `previous_thinking_level` endpoints).
+    Cycle(CycleAction, #[allow(dead_code)] CycleDir),
+}
+
+fn row_to_action(row: &SettingsRow, dir: CycleDir) -> Option<SettingsAction> {
+    match row {
+        SettingsRow::Toggle { action, .. } => Some(SettingsAction::Toggle(*action)),
+        SettingsRow::Cycle { action, .. } => Some(SettingsAction::Cycle(*action, dir)),
+        _ => None,
+    }
+}
+
+/// Apply the action: mutate App state locally and, when needed, fire
+/// the RPC that reflects it to pi.
+async fn dispatch_settings_action(
+    app: &mut App,
+    client: Option<&RpcClient>,
+    action: SettingsAction,
+) {
+    match action {
+        SettingsAction::Toggle(ToggleAction::ShowThinking) => {
+            app.show_thinking = !app.show_thinking;
+        }
+        SettingsAction::Toggle(ToggleAction::Notify) => {
+            app.notify_enabled = !app.notify_enabled;
+            app.flash(format!(
+                "notifications {}",
+                if app.notify_enabled { "on" } else { "off" }
+            ));
+        }
+        SettingsAction::Toggle(ToggleAction::Vim) => {
+            app.vim_enabled = !app.vim_enabled;
+            app.composer.mode = crate::composer::Mode::Insert;
+            app.flash(format!(
+                "vim mode {}",
+                if app.vim_enabled { "on" } else { "off" }
+            ));
+        }
+        SettingsAction::Toggle(ToggleAction::AutoCompact) => {
+            let next = !app.session.auto_compaction.unwrap_or(true);
+            app.session.auto_compaction = Some(next);
+            if let Some(c) = client {
+                let _ = c
+                    .fire(RpcCommand::SetAutoCompaction { enabled: next })
+                    .await;
+            }
+            app.flash(format!("auto-compact {}", on_off(next)));
+        }
+        SettingsAction::Toggle(ToggleAction::AutoRetry) => {
+            let next = !app.session.auto_retry.unwrap_or(true);
+            app.session.auto_retry = Some(next);
+            if let Some(c) = client {
+                let _ = c.fire(RpcCommand::SetAutoRetry { enabled: next }).await;
+            }
+            app.flash(format!("auto-retry {}", on_off(next)));
+        }
+        SettingsAction::Toggle(ToggleAction::PlanAutoRun) => {
+            app.plan.auto_run = !app.plan.auto_run;
+            app.flash(format!(
+                "plan auto-run {}",
+                if app.plan.auto_run { "on" } else { "off" }
+            ));
+        }
+
+        SettingsAction::Cycle(CycleAction::Theme, _) => {
+            app.cycle_theme();
+            app.flash(format!("theme → {}", app.theme.name));
+        }
+        SettingsAction::Cycle(CycleAction::ThinkingLevel, _) => {
+            if let Some(c) = client {
+                let _ = c.fire(RpcCommand::CycleThinkingLevel).await;
+            }
+        }
+        SettingsAction::Cycle(CycleAction::Model, _) => {
+            if let Some(c) = client {
+                let _ = c.fire(RpcCommand::CycleModel).await;
+            }
+        }
+        SettingsAction::Cycle(CycleAction::SteeringMode, _) => {
+            let cur = app.session.steering_mode.unwrap_or(SteeringMode::All);
+            let next = match cur {
+                SteeringMode::All => SteeringMode::OneAtATime,
+                SteeringMode::OneAtATime => SteeringMode::All,
+            };
+            app.session.steering_mode = Some(next);
+            if let Some(c) = client {
+                let _ = c.fire(RpcCommand::SetSteeringMode { mode: next }).await;
+            }
+        }
+        SettingsAction::Cycle(CycleAction::FollowUpMode, _) => {
+            let cur = app.session.follow_up_mode.unwrap_or(FollowUpMode::All);
+            let next = match cur {
+                FollowUpMode::All => FollowUpMode::OneAtATime,
+                FollowUpMode::OneAtATime => FollowUpMode::All,
+            };
+            app.session.follow_up_mode = Some(next);
+            if let Some(c) = client {
+                let _ = c.fire(RpcCommand::SetFollowUpMode { mode: next }).await;
+            }
+        }
+    }
+}
+
+/// A single row in the `/settings` modal. Rebuilt fresh from `&App` on
+/// every draw so the live values stay accurate.
+#[derive(Debug, Clone)]
+enum SettingsRow {
+    Header(&'static str),
+    Info {
+        label: String,
+        value: String,
+    },
+    Toggle {
+        label: String,
+        value: bool,
+        action: ToggleAction,
+    },
+    Cycle {
+        label: String,
+        display: String,
+        action: CycleAction,
+    },
+}
+
+impl SettingsRow {
+    fn is_selectable(&self) -> bool {
+        matches!(self, SettingsRow::Toggle { .. } | SettingsRow::Cycle { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ToggleAction {
+    ShowThinking,
+    Notify,
+    Vim,
+    AutoCompact,
+    AutoRetry,
+    PlanAutoRun,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CycleAction {
+    Theme,
+    ThinkingLevel,
+    SteeringMode,
+    FollowUpMode,
+    Model,
+}
+
+fn build_settings_rows(app: &App) -> Vec<SettingsRow> {
+    use SettingsRow as R;
+    let mut rows = Vec::with_capacity(64);
+
+    rows.push(R::Header("Session"));
+    rows.push(R::Info {
+        label: "name".into(),
+        value: app
+            .session
+            .session_name
+            .clone()
+            .unwrap_or_else(|| "(unset · /rename to set)".into()),
+    });
+    rows.push(R::Info {
+        label: "connection".into(),
+        value: if app.spawn_error.is_some() {
+            format!(
+                "offline · {}",
+                app.spawn_error.as_deref().unwrap_or("pi not available")
+            )
+        } else {
+            "connected".into()
+        },
+    });
+    rows.push(R::Info {
+        label: "pi binary".into(),
+        value: which_pi().unwrap_or_else(|| "not on PATH".into()),
+    });
+
+    rows.push(R::Header("Model"));
+    rows.push(R::Cycle {
+        label: "active model".into(),
+        display: app.session.model_label.clone(),
+        action: CycleAction::Model,
+    });
+    rows.push(R::Cycle {
+        label: "thinking level".into(),
+        display: app
+            .session
+            .thinking
+            .map(|t| format!("{t:?}").to_ascii_lowercase())
+            .unwrap_or_else(|| "unknown".into()),
+        action: CycleAction::ThinkingLevel,
+    });
+    rows.push(R::Cycle {
+        label: "steering mode".into(),
+        display: mode_display(app.session.steering_mode.map(|m| format!("{m:?}"))),
+        action: CycleAction::SteeringMode,
+    });
+    rows.push(R::Cycle {
+        label: "follow-up mode".into(),
+        display: mode_display(app.session.follow_up_mode.map(|m| format!("{m:?}"))),
+        action: CycleAction::FollowUpMode,
+    });
+
+    rows.push(R::Header("Behavior"));
+    rows.push(R::Toggle {
+        label: "show thinking".into(),
+        value: app.show_thinking,
+        action: ToggleAction::ShowThinking,
+    });
+    rows.push(R::Toggle {
+        label: "notifications".into(),
+        value: app.notify_enabled,
+        action: ToggleAction::Notify,
+    });
+    rows.push(R::Toggle {
+        label: "auto-compaction".into(),
+        value: app.session.auto_compaction.unwrap_or(true),
+        action: ToggleAction::AutoCompact,
+    });
+    rows.push(R::Toggle {
+        label: "auto-retry".into(),
+        value: app.session.auto_retry.unwrap_or(true),
+        action: ToggleAction::AutoRetry,
+    });
+    rows.push(R::Toggle {
+        label: "plan auto-run".into(),
+        value: app.plan.auto_run,
+        action: ToggleAction::PlanAutoRun,
+    });
+
+    rows.push(R::Header("Appearance"));
+    rows.push(R::Cycle {
+        label: "theme".into(),
+        display: app.theme.name.to_string(),
+        action: CycleAction::Theme,
+    });
+    rows.push(R::Toggle {
+        label: "vim mode".into(),
+        value: app.vim_enabled,
+        action: ToggleAction::Vim,
+    });
+
+    rows.push(R::Header("Live state"));
+    let elapsed = fmt_elapsed(app.elapsed_since_live());
+    rows.push(R::Info {
+        label: "live".into(),
+        value: format!("{} · {elapsed}", app.live.label()),
+    });
+    rows.push(R::Info {
+        label: "turn".into(),
+        value: format!("{}", app.turn_count),
+    });
+    rows.push(R::Info {
+        label: "tools".into(),
+        value: format!("{} running · {} done", app.tool_running, app.tool_done),
+    });
+    rows.push(R::Info {
+        label: "queue".into(),
+        value: format!(
+            "steer {} · follow-up {}",
+            app.session.queue_steering.len(),
+            app.session.queue_follow_up.len()
+        ),
+    });
+    if let Some(stats) = &app.session.stats {
+        let ctx = stats
+            .context_usage
+            .as_ref()
+            .map(|c| {
+                let pct = c.percent.unwrap_or(0.0);
+                let tokens = c.tokens.unwrap_or(0);
+                format!(
+                    "{:.0}% · {}k / {}k tok",
+                    pct,
+                    tokens / 1000,
+                    c.context_window / 1000
+                )
+            })
+            .unwrap_or_else(|| "—".into());
+        rows.push(R::Info {
+            label: "context".into(),
+            value: ctx,
+        });
+        rows.push(R::Info {
+            label: "session cost".into(),
+            value: format!("${:.4}", stats.cost),
+        });
+    }
+
+    rows.push(R::Header("Capabilities"));
+    let caps = crate::term_caps::detect();
+    rows.push(R::Info {
+        label: "terminal".into(),
+        value: format!("{:?}", caps.kind),
+    });
+    rows.push(R::Info {
+        label: "kitty keyboard".into(),
+        value: if caps.kitty_keyboard {
+            "advertised".into()
+        } else {
+            "not advertised (Alt+T / F12 fallback)".into()
+        },
+    });
+    rows.push(R::Info {
+        label: "graphics".into(),
+        value: if caps.graphics {
+            "supported".into()
+        } else {
+            "no image protocol detected".into()
+        },
+    });
+    rows.push(R::Info {
+        label: "clipboard".into(),
+        value: if arboard::Clipboard::new().is_ok() {
+            "arboard (native)".into()
+        } else {
+            "OSC 52 fallback".into()
+        },
+    });
+    rows.push(R::Info {
+        label: "notify-rust feature".into(),
+        value: if cfg!(feature = "notify") {
+            "compiled in".into()
+        } else {
+            "off (OSC 777 only)".into()
+        },
+    });
+
+    rows.push(R::Header("Paths"));
+    let hist = crate::history::History::load();
+    rows.push(R::Info {
+        label: "history file".into(),
+        value: hist
+            .path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(no history path)".into()),
+    });
+    let state_dir = directories::BaseDirs::new()
+        .map(|d| {
+            d.state_dir()
+                .unwrap_or_else(|| d.data_local_dir())
+                .join("rata-pi")
+                .display()
+                .to_string()
+        })
+        .unwrap_or_else(|| "(unknown)".into());
+    rows.push(R::Info {
+        label: "crash dumps".into(),
+        value: state_dir,
+    });
+
+    rows.push(R::Header("Build"));
+    rows.push(R::Info {
+        label: "rata-pi".into(),
+        value: env!("CARGO_PKG_VERSION").into(),
+    });
+    rows.push(R::Info {
+        label: "platform".into(),
+        value: format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH),
+    });
+
+    rows
+}
+
+fn mode_display(m: Option<String>) -> String {
+    m.unwrap_or_else(|| "default".into())
+        .to_ascii_lowercase()
+        .replace('_', "-")
+}
+
+fn settings_row_source_line(rows: &[SettingsRow], selected: usize) -> Option<u16> {
+    let mut line_idx = 1u16; // leading blank
+    for (i, r) in rows.iter().enumerate() {
+        if i == selected {
+            return Some(line_idx);
+        }
+        // Header = blank spacer + heading line = 2 rows.
+        if matches!(r, SettingsRow::Header(_)) {
+            line_idx = line_idx.saturating_add(2);
+        } else {
+            line_idx = line_idx.saturating_add(1);
+        }
+    }
     None
 }
 
 fn settings_body(
-    _app: &App,
-    _state: &crate::ui::modal::SettingsState,
+    app: &App,
+    state: &crate::ui::modal::SettingsState,
     t: &Theme,
 ) -> Vec<Line<'static>> {
-    vec![
-        Line::default(),
-        Line::from(Span::styled(
-            "  /settings is under construction (V2.13.b). Everything you'd set or observe",
-            Style::default().fg(t.muted),
-        )),
-        Line::from(Span::styled(
-            "  is coming here — themes, auto-retry, notifications, live state, capabilities.",
-            Style::default().fg(t.muted),
-        )),
-        Line::default(),
-        Line::from(Span::styled(
-            "  For now, use: /theme  /notify  /vim  F6 (thinking)  F9 (auto-compact)  F10 (auto-retry)",
-            Style::default().fg(t.dim),
-        )),
-    ]
+    let rows = build_settings_rows(app);
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(rows.len() * 2 + 4);
+    out.push(Line::default());
+
+    for (i, r) in rows.iter().enumerate() {
+        let focused = i == state.selected && r.is_selectable();
+        let marker = if focused { "▶" } else { " " };
+        let marker_style = if focused {
+            Style::default()
+                .fg(t.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.dim)
+        };
+        match r {
+            SettingsRow::Header(title) => {
+                out.push(Line::default());
+                out.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {title}  "),
+                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("─".repeat(70), Style::default().fg(t.dim)),
+                ]));
+            }
+            SettingsRow::Info { label, value } => {
+                out.push(Line::from(vec![
+                    Span::styled(format!("  {marker} "), marker_style),
+                    Span::styled(format!("{:<22}", label), Style::default().fg(t.muted)),
+                    Span::styled(value.clone(), Style::default().fg(t.text)),
+                ]));
+            }
+            SettingsRow::Toggle { label, value, .. } => {
+                let glyph = if *value { "[x]" } else { "[ ]" };
+                let glyph_color = if *value {
+                    if focused { t.accent_strong } else { t.success }
+                } else if focused {
+                    t.accent
+                } else {
+                    t.dim
+                };
+                let yn = if *value { "yes" } else { "no" };
+                let label_style = if focused {
+                    Style::default().fg(t.text).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(t.muted)
+                };
+                out.push(Line::from(vec![
+                    Span::styled(format!("  {marker} "), marker_style),
+                    Span::styled(format!("{:<22}", label), label_style),
+                    Span::styled(
+                        format!("{glyph} "),
+                        Style::default()
+                            .fg(glyph_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(yn.to_string(), Style::default().fg(t.text)),
+                ]));
+            }
+            SettingsRow::Cycle { label, display, .. } => {
+                let arrow_color = if focused { t.accent_strong } else { t.dim };
+                let label_style = if focused {
+                    Style::default().fg(t.text).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(t.muted)
+                };
+                out.push(Line::from(vec![
+                    Span::styled(format!("  {marker} "), marker_style),
+                    Span::styled(format!("{:<22}", label), label_style),
+                    Span::styled(
+                        "◂ ",
+                        Style::default()
+                            .fg(arrow_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        display.clone(),
+                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        " ▸",
+                        Style::default()
+                            .fg(arrow_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+        }
+    }
+
+    out.push(Line::default());
+    out.push(Line::from(Span::styled(
+        "  Enter/Space — toggle or cycle · ←/→ — cycle step · PgUp/PgDn — scroll · Esc — close",
+        Style::default().fg(t.dim),
+    )));
+
+    out
 }
 
 fn interview_body(state: &crate::interview::InterviewState, t: &Theme) -> Vec<Line<'static>> {
@@ -7392,6 +7955,112 @@ I'll take it from here.",
         assert!(!state.focus_on_submit());
         let submit = interview_key(&mut state, KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert!(submit, "Ctrl+S should submit from any focus");
+    }
+
+    // ── V2.13.b · /settings modal ──────────────────────────────────────
+
+    #[test]
+    fn settings_rows_cover_every_section() {
+        let a = app();
+        let rows = build_settings_rows(&a);
+        let titles: Vec<&'static str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                SettingsRow::Header(t) => Some(*t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Session",
+                "Model",
+                "Behavior",
+                "Appearance",
+                "Live state",
+                "Capabilities",
+                "Paths",
+                "Build",
+            ]
+        );
+    }
+
+    #[test]
+    fn settings_rows_expose_every_toggle_action() {
+        let a = app();
+        let rows = build_settings_rows(&a);
+        let mut seen: std::collections::HashSet<ToggleAction> = std::collections::HashSet::new();
+        for r in &rows {
+            if let SettingsRow::Toggle { action, .. } = r {
+                seen.insert(*action);
+            }
+        }
+        for expected in [
+            ToggleAction::ShowThinking,
+            ToggleAction::Notify,
+            ToggleAction::Vim,
+            ToggleAction::AutoCompact,
+            ToggleAction::AutoRetry,
+            ToggleAction::PlanAutoRun,
+        ] {
+            assert!(seen.contains(&expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn settings_rows_expose_every_cycle_action() {
+        let a = app();
+        let rows = build_settings_rows(&a);
+        let mut seen: std::collections::HashSet<CycleAction> = std::collections::HashSet::new();
+        for r in &rows {
+            if let SettingsRow::Cycle { action, .. } = r {
+                seen.insert(*action);
+            }
+        }
+        for expected in [
+            CycleAction::Theme,
+            CycleAction::ThinkingLevel,
+            CycleAction::SteeringMode,
+            CycleAction::FollowUpMode,
+            CycleAction::Model,
+        ] {
+            assert!(seen.contains(&expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn settings_enter_on_toggle_dispatches_action() {
+        let mut a = app();
+        a.modal = Some(Modal::Settings(crate::ui::modal::SettingsState::default()));
+        // Find the ShowThinking toggle row and park the selection on it.
+        let rows = build_settings_rows(&a);
+        let target = rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    SettingsRow::Toggle { action, .. }
+                        if *action == ToggleAction::ShowThinking
+                )
+            })
+            .unwrap();
+        if let Some(Modal::Settings(s)) = a.modal.as_mut() {
+            s.selected = target;
+        }
+        let (action, close) = settings_modal_key(KeyCode::Enter, KeyModifiers::NONE, &mut a);
+        assert!(!close);
+        assert!(matches!(
+            action,
+            Some(SettingsAction::Toggle(ToggleAction::ShowThinking))
+        ));
+    }
+
+    #[test]
+    fn settings_esc_closes() {
+        let mut a = app();
+        a.modal = Some(Modal::Settings(crate::ui::modal::SettingsState::default()));
+        let (_, close) = settings_modal_key(KeyCode::Esc, KeyModifiers::NONE, &mut a);
+        assert!(close);
     }
 
     // ── V2.13.a · /shortcuts modal ──────────────────────────────────────
