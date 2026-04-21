@@ -449,30 +449,46 @@ impl InterviewState {
         }
     }
 
-    /// Advance focus to the next interactive field. Wraps to the first.
+    /// Index of the virtual "submit button" focus slot. One past the last
+    /// field. Navigation cycles through interactive fields AND this slot,
+    /// so the user can Tab through to an explicit Submit position and
+    /// press Enter to send.
+    pub fn submit_slot(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// True when focus is currently on the submit slot (not on a field).
+    pub fn focus_on_submit(&self) -> bool {
+        self.focus == self.submit_slot()
+    }
+
+    /// Advance focus to the next interactive field OR the submit slot.
+    /// Wraps around to the first interactive field.
     pub fn focus_next(&mut self) {
         let n = self.fields.len();
         if n == 0 {
             return;
         }
-        for i in 1..=n {
-            let cand = (self.focus + i) % n;
-            if self.fields[cand].is_interactive() {
+        let total = n + 1; // +1 for the submit slot
+        for i in 1..=total {
+            let cand = (self.focus + i) % total;
+            if cand == n || self.fields[cand].is_interactive() {
                 self.focus = cand;
                 return;
             }
         }
     }
 
-    /// Move focus to the previous interactive field. Wraps to the last.
+    /// Move focus to the previous interactive field or the submit slot.
     pub fn focus_prev(&mut self) {
         let n = self.fields.len();
         if n == 0 {
             return;
         }
-        for i in 1..=n {
-            let cand = (self.focus + n - i) % n;
-            if self.fields[cand].is_interactive() {
+        let total = n + 1;
+        for i in 1..=total {
+            let cand = (self.focus + total - i) % total;
+            if cand == n || self.fields[cand].is_interactive() {
                 self.focus = cand;
                 return;
             }
@@ -1495,6 +1511,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!(num, "5173");
+    }
+
+    #[test]
+    fn focus_cycles_through_submit_slot() {
+        // Interactive field → submit slot → back to first interactive.
+        let mut s = InterviewState::from_interview(fixture());
+        assert!(!s.focus_on_submit());
+        // Walk forward N+1 times where N = interactive field count; we
+        // should hit the submit slot exactly once per cycle.
+        let interactive = s.fields.iter().filter(|f| f.is_interactive()).count();
+        let mut hit_submit = 0;
+        for _ in 0..(interactive + 1) {
+            s.focus_next();
+            if s.focus_on_submit() {
+                hit_submit += 1;
+            }
+        }
+        assert_eq!(hit_submit, 1);
+    }
+
+    #[test]
+    fn focus_prev_wraps_through_submit_slot() {
+        let mut s = InterviewState::from_interview(fixture());
+        // From the first interactive field, going back should land on
+        // the submit slot.
+        s.focus_prev();
+        assert!(s.focus_on_submit());
     }
 
     #[test]

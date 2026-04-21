@@ -2253,10 +2253,20 @@ async fn handle_modal_key(
         },
         // V2.12.g · interview modal — see `interview_key` below.
         Modal::Interview(state) => {
+            // Esc always cancels. We intercept it here so it never
+            // reaches the per-field key handler (a text field would
+            // otherwise swallow it silently).
+            if code == KeyCode::Esc {
+                app.modal = None;
+                app.transcript
+                    .push(Entry::Info("interview cancelled by user".to_string()));
+                app.flash("interview cancelled");
+                return;
+            }
             let submit = interview_key(state.as_mut(), code, mods);
             if submit {
-                // User pressed Ctrl+Enter on a valid form: serialise the
-                // response, close the modal, dispatch to pi.
+                // Valid form + submit trigger: serialise the response,
+                // close the modal, dispatch to pi.
                 let response = state.as_response();
                 let summary = state.human_summary();
                 app.modal = None;
@@ -2507,7 +2517,8 @@ fn interview_key(
 ) -> bool {
     use crate::interview::FieldValue;
 
-    // Global: Tab / Shift+Tab navigate between interactive fields.
+    // Global: Tab / Shift+Tab navigate between interactive fields AND
+    // the virtual Submit slot.
     match (code, mods) {
         (KeyCode::Tab, _) => {
             state.focus_next();
@@ -2518,26 +2529,16 @@ fn interview_key(
             return false;
         }
         (KeyCode::Down, m) if !m.contains(KeyModifiers::ALT) => {
-            // Alt+Down could be reserved for moving selection inside a
-            // multiselect; we'll handle ↓ ↑ inside the field-specific
-            // arms below. Otherwise: move to the next interactive field.
-            match &state.fields[state.focus] {
-                FieldValue::Text {
-                    multiline: true, ..
-                } => {
-                    // In a multiline textarea ↓ may mean "next line";
-                    // but our composer is a single String with `\n`
-                    // chars — we keep text fields simple: ↓ = next field.
-                    state.focus_next();
-                }
-                _ => state.focus_next(),
-            }
+            state.focus_next();
             return false;
         }
         (KeyCode::Up, m) if !m.contains(KeyModifiers::ALT) => {
             state.focus_prev();
             return false;
         }
+        // Ctrl+Enter / Ctrl+S are kept as power-user shortcuts. They
+        // work reliably on kitty-protocol terminals; on others the user
+        // should Tab to the Submit button and press Enter.
         (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
             return try_submit_interview(state);
         }
@@ -2547,7 +2548,18 @@ fn interview_key(
         _ => {}
     }
 
-    // Field-specific dispatch on the focused field.
+    // Focus on the submit slot (past the last field): the only key we
+    // handle is plain Enter / Space → submit. Everything else is a no-op.
+    if state.focus_on_submit() {
+        return matches!(code, KeyCode::Enter | KeyCode::Char(' ')) && try_submit_interview(state);
+    }
+
+    // Field-specific dispatch on the focused field. Some field handlers
+    // want to advance focus after editing (e.g. plain Enter on a
+    // single-line text/number/select acts like Tab), but we can't touch
+    // `state` while holding the mutable borrow on `state.fields[…]`. So
+    // we set a flag inside the match and act on it after it drops.
+    let mut advance_focus_after = false;
     match &mut state.fields[state.focus] {
         FieldValue::Section { .. } | FieldValue::Info { .. } => {
             // Non-interactive shouldn't be focused; guard anyway.
@@ -2578,6 +2590,11 @@ fn interview_key(
                 if idx >= 1 && idx <= options.len() {
                     *selected = idx - 1;
                 }
+            }
+            // Plain Enter on a select advances focus — consistent with
+            // text fields and helps users who haven't discovered Tab.
+            KeyCode::Enter => {
+                advance_focus_after = true;
             }
             _ => {}
         },
@@ -2610,7 +2627,18 @@ fn interview_key(
             multiline,
             ..
         } => {
-            text_field_key(value, cursor, *multiline, code, mods);
+            // Plain Enter on a single-line text field advances to the
+            // next focus (HTML-form convention). In multiline fields
+            // Enter is still needed to insert a newline, so skip that.
+            if matches!(code, KeyCode::Enter)
+                && !mods.contains(KeyModifiers::SHIFT)
+                && !mods.contains(KeyModifiers::CONTROL)
+                && !*multiline
+            {
+                advance_focus_after = true;
+            } else {
+                text_field_key(value, cursor, *multiline, code, mods);
+            }
         }
         FieldValue::Number {
             value,
@@ -2619,39 +2647,51 @@ fn interview_key(
             max,
             ..
         } => {
-            // Gate non-numeric chars so the user can only type digits /
-            // sign / decimal point.
-            if let KeyCode::Char(ch) = code {
-                let allowed = ch.is_ascii_digit()
-                    || ch == '.'
-                    || ch == '-'
-                    || ch == 'e'
-                    || ch == 'E'
-                    || ch == '+';
-                if !allowed {
-                    return false;
+            // Plain Enter advances focus.
+            if matches!(code, KeyCode::Enter) && mods == KeyModifiers::NONE {
+                advance_focus_after = true;
+                // Fall through to the match's end so we don't also
+                // edit the buffer.
+                // (We don't short-circuit via return so the advance
+                // happens in the post-match block below.)
+            } else {
+                // Gate non-numeric chars so the user can only type digits /
+                // sign / decimal point.
+                if let KeyCode::Char(ch) = code {
+                    let allowed = ch.is_ascii_digit()
+                        || ch == '.'
+                        || ch == '-'
+                        || ch == 'e'
+                        || ch == 'E'
+                        || ch == '+';
+                    if !allowed {
+                        return false;
+                    }
                 }
-            }
-            text_field_key(value, cursor, false, code, mods);
-            // Clamp on every edit so the user can't exceed bounds.
-            if let (Ok(n), _) = (value.parse::<f64>(), ()) {
-                let mut fixed = n;
-                if let Some(lo) = min {
-                    fixed = fixed.max(*lo);
-                }
-                if let Some(hi) = max {
-                    fixed = fixed.min(*hi);
-                }
-                if (fixed - n).abs() > f64::EPSILON {
-                    *value = if fixed.fract() == 0.0 {
-                        format!("{:.0}", fixed)
-                    } else {
-                        format!("{fixed}")
-                    };
-                    *cursor = value.len();
+                text_field_key(value, cursor, false, code, mods);
+                // Clamp on every edit so the user can't exceed bounds.
+                if let (Ok(n), _) = (value.parse::<f64>(), ()) {
+                    let mut fixed = n;
+                    if let Some(lo) = min {
+                        fixed = fixed.max(*lo);
+                    }
+                    if let Some(hi) = max {
+                        fixed = fixed.min(*hi);
+                    }
+                    if (fixed - n).abs() > f64::EPSILON {
+                        *value = if fixed.fract() == 0.0 {
+                            format!("{:.0}", fixed)
+                        } else {
+                            format!("{fixed}")
+                        };
+                        *cursor = value.len();
+                    }
                 }
             }
         }
+    }
+    if advance_focus_after {
+        state.focus_next();
     }
     false
 }
@@ -4430,7 +4470,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::Interview(state) => (
             format!(" ✍ interview · {} ", state.title),
             Text::from(interview_body(state, theme)),
-            "Tab next · Shift+Tab prev · Space toggle · Ctrl+Enter submit · Esc cancel".to_string(),
+            "Tab/↓ next · Shift+Tab/↑ prev · Space toggle · Enter send (on Submit) · Ctrl+S submit · Esc cancel".to_string(),
             110,
             32,
         ),
@@ -5258,25 +5298,49 @@ fn interview_body(state: &crate::interview::InterviewState, t: &Theme) -> Vec<Li
         }
     }
 
-    // Submit button row.
+    // Submit button row — focusable via Tab. When focused, show the
+    // ▶ cursor marker + invert the button label so the user sees it
+    // is the current target.
     let can_submit = state.first_missing_required().is_none();
-    let submit_color = if can_submit { t.success } else { t.dim };
+    let submit_focused = state.focus_on_submit();
+    let submit_bg = if can_submit { t.success } else { t.dim };
+    let marker = if submit_focused { "▶" } else { " " };
+    let marker_style = if submit_focused {
+        Style::default()
+            .fg(t.accent_strong)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(t.dim)
+    };
+    let button_style = if submit_focused {
+        // Focused: full reverse-video button with bright border feel.
+        Style::default()
+            .fg(Color::Rgb(0, 0, 0))
+            .bg(submit_bg)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default()
+            .fg(Color::Rgb(0, 0, 0))
+            .bg(submit_bg)
+            .add_modifier(Modifier::BOLD)
+    };
+    let button_label = if submit_focused {
+        format!(" ▶ {} ◀ ", state.submit_label)
+    } else {
+        format!("   {}   ", state.submit_label)
+    };
     out.push(Line::default());
     out.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            format!(" ▶ {} ", state.submit_label),
-            Style::default()
-                .fg(Color::Rgb(0, 0, 0))
-                .bg(submit_color)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!("  {marker} "), marker_style),
+        Span::styled(button_label, button_style),
         Span::raw("   "),
         Span::styled(
-            if can_submit {
-                "Ctrl+Enter to submit"
+            if !can_submit {
+                "fill required fields, then Enter"
+            } else if submit_focused {
+                "press Enter to send · Esc to cancel"
             } else {
-                "fill required fields, then Ctrl+Enter"
+                "Tab here · Ctrl+S / Ctrl+Enter anywhere · Esc to cancel"
             }
             .to_string(),
             Style::default().fg(t.muted),
@@ -7011,6 +7075,47 @@ I'll take it from here.",
             |e| matches!(e, Entry::Info(s) if s.contains("interview") && s.contains("Settings")),
         );
         assert!(has_info, "expected info row about the interview");
+    }
+
+    #[test]
+    fn interview_submit_button_via_tab_then_enter() {
+        // Build a minimal form, navigate focus to the submit slot via
+        // focus_next(), then drive Enter through interview_key and
+        // verify it reports "submit".
+        let src = r#"[[ASK_TEXT: n | Name | x]]"#;
+        let (iv, _) = crate::interview::parse_ask_markers(src).unwrap();
+        let mut state = crate::interview::InterviewState::from_interview(iv);
+        assert!(!state.focus_on_submit());
+        // Tab: Name → Submit slot.
+        let _ = interview_key(&mut state, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(state.focus_on_submit());
+        // Enter on the submit slot → submit.
+        let submit = interview_key(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(submit, "Enter on the Submit slot should submit");
+    }
+
+    #[test]
+    fn interview_submit_ctrl_s_anywhere() {
+        let src = r#"[[ASK_TEXT: n | Name | x]]"#;
+        let (iv, _) = crate::interview::parse_ask_markers(src).unwrap();
+        let mut state = crate::interview::InterviewState::from_interview(iv);
+        // Focus on the Name field (not submit slot).
+        assert!(!state.focus_on_submit());
+        let submit = interview_key(&mut state, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(submit, "Ctrl+S should submit from any focus");
+    }
+
+    #[test]
+    fn interview_submit_blocked_when_required_empty() {
+        let src = r#"[[ASK_TEXT!: n | Name]]"#; // required, no default
+        let (iv, _) = crate::interview::parse_ask_markers(src).unwrap();
+        let mut state = crate::interview::InterviewState::from_interview(iv);
+        state.focus = state.submit_slot();
+        let submit = interview_key(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!submit, "required-but-empty should refuse submit");
+        assert!(state.validation_error.is_some());
+        // Focus should have jumped to the offending field.
+        assert!(!state.focus_on_submit());
     }
 
     #[test]
