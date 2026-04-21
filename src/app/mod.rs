@@ -10,6 +10,18 @@
 //! - Queue state from `queue_update` appears as a header chip; `Ctrl+Space`
 //!   cycles the composer between steer / follow-up intent during streaming
 //! - F8 = compact now, F9 = toggle auto-compaction, F10 = toggle auto-retry
+//!
+//! Submodules:
+//! - `visuals` · per-entry rendering cache (Visual, VisualsCache, fingerprint_entry)
+
+mod visuals;
+
+// `Visual`, `VisualsCache`, `update_visuals_cache` are used by prepare_frame_caches
+// and by draw_body.
+use visuals::{Visual, VisualsCache, update_visuals_cache};
+// `fingerprint_entry` is referenced only from the cache tests below.
+#[cfg(test)]
+use visuals::fingerprint_entry;
 
 use std::collections::VecDeque;
 use std::io::{Stdout, stdout};
@@ -3569,179 +3581,13 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
 // ───────────────────────────────────────── transcript visuals (V2.2) ──
 //
 // Each `Entry` in the transcript turns into exactly one `Visual`: either a
-// bordered `Card` (user / thinking / assistant / bash / tool) or an `InlineRow`
-// (info / warn / error / compaction / retry). The `Visual` knows how to
-// compute its own height at a given width and how to render itself into a
-// `Rect`, which lets `draw_body` virtualize scroll without a scene graph.
-
-enum Visual {
-    Card(Card),
-    Inline(InlineRow),
-}
-
-impl Visual {
-    fn height(&self, outer_w: u16) -> u16 {
-        match self {
-            Self::Card(c) => c.height(outer_w),
-            Self::Inline(r) => r.height(outer_w),
-        }
-    }
-
-    fn render(&self, f: &mut ratatui::Frame, area: Rect, idx: usize, app: &App) {
-        match self {
-            Self::Card(c) => {
-                // V2.11.2 · focus is an out-of-band lookup (no more clone
-                // of the Card just to flip a flag). The renderer swaps to
-                // BorderType::Double + prepends a ▶ marker when focused.
-                let focused = app.focus_idx == Some(idx);
-                c.render(f, area, &app.theme, focused);
-            }
-            Self::Inline(r) => r.render(f, area),
-        }
-    }
-
-    /// Render a visual into `target` when part of it is scrolled off the
-    /// top (`skip > 0`) and/or the bottom extends below the viewport.
-    ///
-    /// Allocation-free: we use `Block::borders` to opt in/out of each
-    /// border edge (top border is omitted when clipped from above, bottom
-    /// when clipped from below) and `Paragraph::scroll` on the body to
-    /// shift it by the appropriate wrapped-row count. This is what makes
-    /// long streaming assistant cards cheap to render — no per-frame
-    /// scratch `Buffer` sized to the full card height.
-    fn render_clipped(
-        &self,
-        f: &mut ratatui::Frame,
-        target: Rect,
-        idx: usize,
-        app: &App,
-        skip: u16,
-        full_h: u16,
-    ) {
-        match self {
-            Self::Card(c) => render_card_clipped(f, target, c, app, idx, skip, full_h),
-            Self::Inline(r) => {
-                use ratatui::widgets::{Paragraph, Wrap};
-                f.render_widget(
-                    Paragraph::new(r.lines.clone())
-                        .wrap(Wrap { trim: false })
-                        .scroll((skip, 0)),
-                    target,
-                );
-            }
-        }
-    }
-}
-
-/// Partial-card renderer: selectively omits the top / bottom border edges
-/// when the card is clipped and uses `Paragraph::scroll` to skip body rows.
-/// Avoids allocating a scratch buffer sized to the full card.
-fn render_card_clipped(
-    f: &mut ratatui::Frame,
-    target: Rect,
-    card: &crate::ui::cards::Card,
-    app: &App,
-    idx: usize,
-    skip: u16,
-    full_h: u16,
-) {
-    let focused = app.focus_idx == Some(idx);
-    let show_top = skip == 0;
-    let show_bottom = skip.saturating_add(target.height) >= full_h;
-
-    let mut borders = Borders::LEFT | Borders::RIGHT;
-    if show_top {
-        borders |= Borders::TOP;
-    }
-    if show_bottom {
-        borders |= Borders::BOTTOM;
-    }
-
-    let btype = if focused {
-        BorderType::Double
-    } else {
-        BorderType::Rounded
-    };
-    let border_style = Style::default().fg(card.border_color);
-
-    let focus_mark = if focused && show_top {
-        vec![
-            Span::styled(
-                " ▶",
-                Style::default()
-                    .fg(card.border_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-        ]
-    } else if show_top {
-        vec![Span::raw(" ")]
-    } else {
-        // No top border, no title room.
-        Vec::new()
-    };
-
-    let mut block = Block::default()
-        .borders(borders)
-        .border_type(btype)
-        .border_style(border_style);
-    if show_top {
-        let mut title_spans = focus_mark;
-        title_spans.extend([
-            Span::styled(
-                card.icon.to_string(),
-                Style::default()
-                    .fg(card.icon_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                card.title.clone(),
-                Style::default()
-                    .fg(card.title_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-        ]);
-        block = block.title(Line::from(title_spans));
-        if let Some(r) = &card.right_title {
-            block = block.title_top(
-                Line::from(vec![Span::styled(
-                    format!(" {r} "),
-                    Style::default().fg(card.border_color),
-                )])
-                .right_aligned(),
-            );
-        }
-    }
-
-    let inner = block.inner(target);
-    f.render_widget(block, target);
-
-    // How many wrapped body rows to skip. If we drew a top border, body
-    // starts at `inner.y` (row 1 of the card). If we didn't, `inner.y`
-    // corresponds to body row `skip - (was there a top border? 0 : ?)`.
-    //
-    // Layout of a full card: row 0 = top border, rows 1..=body_h = body,
-    // row body_h+1 = bottom border. skip rows are removed from the top of
-    // the card. If show_top, skip == 0 so body_skip = 0. If !show_top,
-    // we already ate the top border's 1 row in skip, so body rows to skip
-    // = skip - 1.
-    let body_skip = if show_top { 0 } else { skip.saturating_sub(1) };
-
-    let pad = Rect::new(
-        inner.x.saturating_add(1),
-        inner.y,
-        inner.width.saturating_sub(2),
-        inner.height,
-    );
-    f.render_widget(
-        Paragraph::new(card.body.clone())
-            .wrap(Wrap { trim: false })
-            .scroll((body_skip, 0)),
-        pad,
-    );
-}
+// bordered `Card` (user / thinking / assistant / bash / tool) or an
+// `InlineRow` (info / warn / error / compaction / retry). The rendering
+// primitives (`Visual`, `Card`-clipping, `fingerprint_entry`, the
+// `VisualsCache`) live in the `visuals` submodule; `build_one_visual`
+// still lives in this module because the per-entry renderer depends on
+// many local helper fns (tool_card, markdown::render, syntect) that
+// aren't worth moving just yet.
 
 /// V2.11.2 · render one Entry to its `Visual`. Factored out of the old
 /// `build_visuals` so the visuals cache can rebuild individual slots
@@ -3862,171 +3708,6 @@ fn build_one_visual(entry: &Entry, app: &App, is_live_tail: bool) -> Visual {
                 ]),
             ],
         }),
-    }
-}
-
-/// Fingerprint the mutable bits of an Entry. Two entries with equal
-/// fingerprints produce equal `Visual`s under the same theme + show_thinking
-/// setting, so cached slots can be reused.
-///
-/// For append-only text (User/Thinking/Assistant/Info/Warn/Error), the
-/// `len()` is a strict monotonic proxy for content identity in our model:
-/// these entries either grow at the tail or don't change. For structured
-/// entries (ToolCall, BashExec, Compaction, Retry) we hash the specific
-/// fields that can mutate after creation.
-fn fingerprint_entry(entry: &Entry, show_thinking: bool) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    std::mem::discriminant(entry).hash(&mut h);
-    match entry {
-        Entry::User(s) => s.len().hash(&mut h),
-        Entry::Thinking(s) => {
-            s.len().hash(&mut h);
-            show_thinking.hash(&mut h);
-        }
-        Entry::Assistant(s) => s.len().hash(&mut h),
-        Entry::ToolCall(tc) => {
-            tc.name.len().hash(&mut h);
-            tc.output.len().hash(&mut h);
-            (tc.status as u8).hash(&mut h);
-            tc.is_error.hash(&mut h);
-            tc.expanded.hash(&mut h);
-        }
-        Entry::BashExec(bx) => {
-            bx.command.len().hash(&mut h);
-            bx.output.len().hash(&mut h);
-            bx.exit_code.hash(&mut h);
-            bx.cancelled.hash(&mut h);
-            bx.truncated.hash(&mut h);
-        }
-        Entry::Info(s) | Entry::Warn(s) | Entry::Error(s) => s.len().hash(&mut h),
-        Entry::Compaction(c) => {
-            c.reason.len().hash(&mut h);
-            match &c.state {
-                CompactionState::Running => 0u8.hash(&mut h),
-                CompactionState::Done { summary } => {
-                    1u8.hash(&mut h);
-                    summary.as_deref().map(str::len).unwrap_or(0).hash(&mut h);
-                }
-                CompactionState::Aborted => 2u8.hash(&mut h),
-                CompactionState::Failed(e) => {
-                    3u8.hash(&mut h);
-                    e.len().hash(&mut h);
-                }
-            }
-        }
-        Entry::Retry(r) => {
-            r.attempt.hash(&mut h);
-            r.max_attempts.hash(&mut h);
-            match &r.state {
-                RetryState::Waiting { delay_ms, error } => {
-                    0u8.hash(&mut h);
-                    delay_ms.hash(&mut h);
-                    error.len().hash(&mut h);
-                }
-                RetryState::Succeeded => 1u8.hash(&mut h),
-                RetryState::Exhausted(e) => {
-                    2u8.hash(&mut h);
-                    e.len().hash(&mut h);
-                }
-            }
-        }
-        Entry::TurnMarker { number } => number.hash(&mut h),
-    }
-    h.finish()
-}
-
-/// Per-entry cache slot.
-struct CachedVisual {
-    fingerprint: u64,
-    visual: Visual,
-    /// Width at which `height` was last computed. A width change is the
-    /// only reason we recompute `height` without also rebuilding `visual`.
-    width: u16,
-    height: u16,
-}
-
-/// Transcript rendering cache. Keys rebuilds on theme change and on each
-/// entry's fingerprint.
-#[derive(Default)]
-struct VisualsCache {
-    theme_key: String,
-    entries: Vec<CachedVisual>,
-}
-
-/// Rebuild stale cache slots against the current transcript, and refresh
-/// heights if `content_w` has changed. Idempotent when nothing changed.
-///
-/// The live-streaming tail (last Assistant entry while streaming) is
-/// forced to rebuild every frame so the cursor blink + "pi · streaming"
-/// title stay live without a dedicated invalidation channel.
-fn update_visuals_cache(app: &mut App, content_w: u16) {
-    // Theme change → wipe everything.
-    if app.visuals_cache.theme_key != app.theme.name {
-        app.visuals_cache.theme_key = app.theme.name.to_string();
-        app.visuals_cache.entries.clear();
-    }
-
-    let entries_len = app.transcript.entries().len();
-    // Shrinkage (e.g. /clear, /switch session).
-    if app.visuals_cache.entries.len() > entries_len {
-        app.visuals_cache.entries.truncate(entries_len);
-    }
-
-    // Which entry (if any) is the live-streaming tail this frame.
-    let live_tail_idx: Option<usize> = if app.is_streaming
-        && matches!(app.live, LiveState::Streaming | LiveState::Llm)
-        && matches!(app.transcript.entries().last(), Some(Entry::Assistant(_)))
-    {
-        Some(entries_len - 1)
-    } else {
-        None
-    };
-
-    // Walk entries. Snapshot the raw list length; we'll index into it and
-    // into the cache in lock-step but build_one_visual needs a &App, so we
-    // don't hold a borrow on app.transcript through the inner block.
-    for i in 0..entries_len {
-        let is_live = live_tail_idx == Some(i);
-        let entry_fp = {
-            let entry = &app.transcript.entries()[i];
-            fingerprint_entry(entry, app.show_thinking)
-        };
-        // Live-tail's fingerprint is ignored — we always rebuild it.
-        let target_fp = if is_live { u64::MAX } else { entry_fp };
-
-        let must_rebuild = match app.visuals_cache.entries.get(i) {
-            None => true,
-            Some(c) if is_live => true,
-            Some(c) => c.fingerprint != target_fp,
-        };
-
-        if must_rebuild {
-            // Snapshot Entry by index; the visual build is &App-read-only
-            // but we can't borrow app.transcript and &app together. Clone
-            // the entry — cheap for small variants, moderate for strings.
-            let entry = app.transcript.entries()[i].clone();
-            let visual = build_one_visual(&entry, app, is_live);
-            let height = visual.height(content_w);
-            let slot = CachedVisual {
-                fingerprint: target_fp,
-                visual,
-                width: content_w,
-                height,
-            };
-            if i < app.visuals_cache.entries.len() {
-                app.visuals_cache.entries[i] = slot;
-            } else {
-                app.visuals_cache.entries.push(slot);
-            }
-        } else if let Some(c) = app.visuals_cache.entries.get_mut(i)
-            && c.width != content_w
-        {
-            // Width changed but content didn't — recompute height only.
-            c.height = c.visual.height(content_w);
-            c.width = content_w;
-        }
     }
 }
 
