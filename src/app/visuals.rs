@@ -275,20 +275,40 @@ pub(super) struct CachedVisual {
 pub(super) struct VisualsCache {
     pub(super) theme_key: String,
     pub(super) entries: Vec<CachedVisual>,
+    /// V3.b · last transcript mutation epoch observed. When the current
+    /// `Transcript::mutation_epoch` matches this, the cache is known to
+    /// be in sync with the transcript and the fingerprint walk can be
+    /// skipped entirely. The live-tail path still forces a rebuild of
+    /// the streaming Assistant entry.
+    pub(super) last_seen_epoch: u64,
+    /// V3.b · content-width captured on the last walk. A mismatch means
+    /// heights need to be refreshed (but visuals can be reused).
+    pub(super) last_seen_width: u16,
 }
 
 /// Rebuild stale cache slots against the current transcript, and refresh
 /// heights if `content_w` has changed. Idempotent when nothing changed.
 ///
+/// V3.b · the walk is now incremental: when `Transcript::mutation_epoch`
+/// matches the epoch we saw on the previous frame AND the theme + width
+/// haven't changed AND no live streaming tail is present, we return
+/// early. Previously every frame paid an O(n) hash over every entry
+/// just to discover nothing changed.
+///
 /// The live-streaming tail (last Assistant entry while streaming) is
-/// forced to rebuild every frame so the cursor blink + "pi · streaming"
-/// title stay live without a dedicated invalidation channel.
+/// still forced to rebuild every frame so the cursor blink + "pi ·
+/// streaming" title stay live without a dedicated invalidation channel.
 pub(super) fn update_visuals_cache(app: &mut App, content_w: u16) {
-    // Theme change → wipe everything.
-    if app.visuals_cache.theme_key != app.theme.name {
+    let current_epoch = app.transcript.mutation_epoch();
+
+    // Theme change → wipe everything and force a full walk.
+    let theme_changed = app.visuals_cache.theme_key != app.theme.name;
+    if theme_changed {
         app.visuals_cache.theme_key = app.theme.name.to_string();
         app.visuals_cache.entries.clear();
     }
+
+    let width_changed = app.visuals_cache.last_seen_width != content_w;
 
     let entries_len = app.transcript.entries().len();
     // Shrinkage (e.g. /clear, /switch session).
@@ -305,6 +325,20 @@ pub(super) fn update_visuals_cache(app: &mut App, content_w: u16) {
     } else {
         None
     };
+
+    let epoch_stale = current_epoch != app.visuals_cache.last_seen_epoch;
+
+    // Fast path: no mutations, no theme change, no width change, no live
+    // tail. Skip the fingerprint loop — everything in the cache is already
+    // correct for this frame.
+    if !theme_changed
+        && !width_changed
+        && !epoch_stale
+        && live_tail_idx.is_none()
+        && app.visuals_cache.entries.len() == entries_len
+    {
+        return;
+    }
 
     for i in 0..entries_len {
         let is_live = live_tail_idx == Some(i);
@@ -347,4 +381,7 @@ pub(super) fn update_visuals_cache(app: &mut App, content_w: u16) {
             c.width = content_w;
         }
     }
+
+    app.visuals_cache.last_seen_epoch = current_epoch;
+    app.visuals_cache.last_seen_width = content_w;
 }

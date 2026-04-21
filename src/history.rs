@@ -148,6 +148,14 @@ impl History {
     pub fn path(&self) -> Option<&PathBuf> {
         self.path.as_ref()
     }
+
+    /// V3.b · cheap static accessor: returns the resolved history-file path
+    /// without reading the JSONL from disk. Use this from /doctor and
+    /// /settings where we want the path display only — `History::load()`
+    /// would do a full parse we don't need per frame.
+    pub fn default_path() -> Option<PathBuf> {
+        resolve_path()
+    }
 }
 
 fn append_file(path: Option<&std::path::Path>, entry: &HistoryEntry) -> std::io::Result<()> {

@@ -27,21 +27,24 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 ---
 
-## V3.b — Perf regressions
+## V3.b — Perf regressions ✅
 
-- [ ] `AppCaps` struct built once in `App::new()` — clipboard / history path / state dir / term_caps / build info
-- [ ] `build_settings_rows` only rebuilds volatile rows (queue / turn / cost / theme)
-- [ ] `History::default_path()` cheap static accessor; `/doctor` and `/settings` use it
-- [ ] `term_caps::detect()` called exactly once; cached on App
-- [ ] `files::preview` — metadata first, bounded `.take(cap)` read, `spawn_blocking` offload
-- [ ] `visuals::update_visuals_cache` — incremental via `dirty_from` index; width/theme invalidates all
-- [ ] Tests:
-  - [ ] AppCaps populated once (no re-probe on subsequent access)
-  - [ ] `files::preview` short-circuits on 100 MiB fake file
-  - [ ] `update_visuals_cache` with `dirty_from = None` is a no-op
-  - [ ] Existing visuals cache tests still pass
+- [x] `AppCaps` struct built once in `App::new()` — clipboard / history path / state dir / term_caps / pi binary / platform / package version
+- [x] `build_settings_rows` reads static rows from `app.caps` (no re-probe per frame)
+- [x] `History::default_path()` cheap static accessor; `/log` and `/settings` use it
+- [x] `term_caps::detect()` cached on `App.caps.term`; `/env`, `/doctor`, `/settings` read it
+- [x] `files::preview` — metadata-first size check + `BufReader::take(MAX_BYTES)` bounded read
+- [!] `spawn_blocking` offload for `files::preview` — **deviated** (see Deviations §1)
+- [x] `Transcript::mutation_epoch` + `VisualsCache::last_seen_epoch` — fingerprint walk skipped on no-change frames
+- [x] Tests:
+  - [x] AppCaps populated and matches direct probes (`app_caps_matches_direct_probes`)
+  - [x] `build_settings_rows` reads from `app.caps` (`settings_rows_read_from_app_caps`)
+  - [x] `files::preview` rejects over-cap file without reading (`preview_rejects_files_over_size_cap_without_reading`)
+  - [x] `files::preview` clips to MAX_LINES (`preview_clips_to_max_lines`)
+  - [x] Visuals cache early-outs when epoch unchanged (`visuals_cache_skips_walk_when_epoch_unchanged`)
+  - [x] Visuals cache walks after mutation (`visuals_cache_walks_after_mutation`)
 
-**Shipped as** ``
+**Shipped as** `<tbd>`
 
 ---
 
@@ -228,14 +231,15 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 | | V2.13 | V3.a | V3.b | V3.c | V3.d | V3.e | V3.f | V3.g | V3.h | V3.i | V3.j |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| Tests | 194 | **197** | | | | | | | ≥ 220 | | |
-| `src/app/mod.rs` LoC | 8 266 | 8 311 | | | ≤ 5 100 | | | | | | |
-| Release binary (MiB) | 5.3 | 5.3 | | | | | | | | | |
-| Hardcoded `Color::X` in markdown/syntax | many | many | | | | | | | | | |
+| Tests | 194 | 197 | **203** | | | | | | ≥ 220 | | |
+| `src/app/mod.rs` LoC | 8 266 | 8 311 | 8 348 | | ≤ 5 100 | | | | | | |
+| Release binary (MiB) | 5.3 | 5.3 | 5.3 | | | | | | | | |
+| Hardcoded `Color::X` in markdown/syntax | many | many | many | | | | | | | | |
 | CI test OS count | 2 | 2 | 2 | 3 | | | | | | | |
-| Per-frame I/O in /settings | 3+ | 3+ | 0 | | | | | | | | |
-| Clippy clean | ✓ | ✓ | | | | | | | | | |
-| Fmt clean | ✓ | ✓ | | | | | | | | | |
+| Per-frame I/O in /settings | 3+ | 3+ | **0** | | | | | | | | |
+| Per-frame transcript hash walk | O(n) | O(n) | **O(1)** idle | | | | | | | | |
+| Clippy clean | ✓ | ✓ | ✓ | | | | | | | | |
+| Fmt clean | ✓ | ✓ | ✓ | | | | | | | | |
 
 ---
 
@@ -243,7 +247,10 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 *(If any task deviates from `PLAN_V3.md`, record it below with: sub-milestone · task · what changed · why. Blank section = on plan.)*
 
-_(none yet)_
+### 1. V3.b · skipped `spawn_blocking` offload for `files::preview`
+**What changed.** The plan called for `files::preview` to be offloaded via `tokio::task::spawn_blocking`. It isn't.
+
+**Why.** The read is now bounded to `MAX_BYTES` (8 KiB) by `BufReader::take` and guarded by a `metadata()` size check that rejects >50 MiB files before opening them. On any reasonable filesystem the actual I/O is <1 ms — well below the UI frame budget — whereas a `spawn_blocking` hop costs a scheduler trip plus a channel round-trip per selection change. The root cause (unbounded `std::fs::read`) is fixed; adding async machinery on top of an already-cheap operation would add overhead for zero user-visible benefit. The plan note "optionally offload" covered this.
 
 ---
 

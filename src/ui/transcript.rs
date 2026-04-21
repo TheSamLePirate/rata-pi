@@ -97,16 +97,33 @@ impl fmt::Display for ToolStatus {
 #[derive(Debug, Default)]
 pub struct Transcript {
     entries: Vec<Entry>,
+    /// V3.b · monotonic counter bumped by every mutator. The visuals cache
+    /// reads this per frame; when it's unchanged (and neither theme nor
+    /// width changed, and no live streaming tail is present) the whole
+    /// fingerprint walk can be skipped.
+    mutation_epoch: u64,
 }
 
 impl Transcript {
+    fn bump(&mut self) {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+    }
+
+    /// V3.b · read by the visuals cache to decide whether anything needs
+    /// re-fingerprinting this frame.
+    pub fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch
+    }
+
     pub fn push(&mut self, e: Entry) {
+        self.bump();
         self.entries.push(e);
     }
 
     /// Append a text delta to the last assistant entry, starting one if the
     /// tail isn't already an Assistant.
     pub fn append_assistant(&mut self, delta: &str) {
+        self.bump();
         match self.entries.last_mut() {
             Some(Entry::Assistant(s)) => s.push_str(delta),
             _ => self.entries.push(Entry::Assistant(delta.to_string())),
@@ -123,6 +140,7 @@ impl Transcript {
             .iter()
             .rposition(|e| matches!(e, Entry::Assistant(_)))
         {
+            self.bump();
             if new_text.trim().is_empty() {
                 self.entries.remove(i);
             } else if let Entry::Assistant(s) = &mut self.entries[i] {
@@ -134,6 +152,7 @@ impl Transcript {
     /// Append a thinking delta. Thinking arrives before assistant text in a
     /// turn; if the tail is already a Thinking entry we extend it.
     pub fn append_thinking(&mut self, delta: &str) {
+        self.bump();
         match self.entries.last_mut() {
             Some(Entry::Thinking(s)) => s.push_str(delta),
             _ => self.entries.push(Entry::Thinking(delta.to_string())),
@@ -141,6 +160,7 @@ impl Transcript {
     }
 
     pub fn start_tool(&mut self, id: String, name: String, args: serde_json::Value) {
+        self.bump();
         self.entries.push(Entry::ToolCall(ToolCall {
             id,
             name,
@@ -155,6 +175,7 @@ impl Transcript {
     pub fn update_tool_output(&mut self, id: &str, payload: &ToolResultPayload) {
         if let Some(tc) = self.find_tool_mut(id) {
             tc.output = text_of_payload(payload);
+            self.bump();
         }
     }
 
@@ -167,12 +188,14 @@ impl Transcript {
             } else {
                 ToolStatus::Ok
             };
+            self.bump();
         }
     }
 
     pub fn toggle_tool_expanded(&mut self, id: &str) {
         if let Some(tc) = self.find_tool_mut(id) {
             tc.expanded = !tc.expanded;
+            self.bump();
         }
     }
 
@@ -184,6 +207,7 @@ impl Transcript {
     }
 
     pub fn push_compaction_start(&mut self, reason: String) {
+        self.bump();
         self.entries.push(Entry::Compaction(Compaction {
             reason,
             state: CompactionState::Running,
@@ -191,6 +215,7 @@ impl Transcript {
     }
 
     pub fn finish_compaction(&mut self, reason: String, state: CompactionState) {
+        self.bump();
         // Update the most recent matching Running entry; otherwise push new.
         for e in self.entries.iter_mut().rev() {
             if let Entry::Compaction(c) = e
@@ -212,6 +237,7 @@ impl Transcript {
         delay_ms: u64,
         error: String,
     ) {
+        self.bump();
         self.entries.push(Entry::Retry(Retry {
             attempt,
             max_attempts,
@@ -226,6 +252,7 @@ impl Transcript {
                 && matches!(r.state, RetryState::Waiting { .. })
             {
                 r.state = state;
+                self.bump();
                 return;
             }
         }

@@ -376,6 +376,47 @@ struct App {
     /// toggles. Notifications still go through OSC 777 only unless the
     /// `notify` feature is compiled in.
     notify_enabled: bool,
+
+    // ── V3.b: cached static capabilities ───────────────────────────────
+    /// Probed once at startup. `/settings`, `/doctor`, `/env`, and `/log`
+    /// read these instead of re-invoking `term_caps::detect`, opening a
+    /// clipboard handle, or loading the history JSONL per frame.
+    caps: AppCaps,
+}
+
+/// Static host / environment capabilities probed exactly once in
+/// [`App::new`]. Re-opening a clipboard handle or reloading the history
+/// JSONL per frame while the Settings modal was open was the V2.13
+/// perf regression this struct eliminates.
+#[derive(Debug, Clone)]
+struct AppCaps {
+    term: crate::term_caps::Caps,
+    clipboard_native: bool,
+    pi_binary: Option<String>,
+    history_path: Option<String>,
+    state_dir: String,
+    package_version: &'static str,
+    platform: String,
+}
+
+fn probe_app_caps() -> AppCaps {
+    AppCaps {
+        term: crate::term_caps::detect(),
+        clipboard_native: arboard::Clipboard::new().is_ok(),
+        pi_binary: which_pi(),
+        history_path: crate::history::History::default_path().map(|p| p.display().to_string()),
+        state_dir: directories::BaseDirs::new()
+            .map(|d| {
+                d.state_dir()
+                    .unwrap_or_else(|| d.data_local_dir())
+                    .join("rata-pi")
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "(unknown)".into()),
+        package_version: env!("CARGO_PKG_VERSION"),
+        platform: format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH),
+    }
 }
 
 impl App {
@@ -422,6 +463,7 @@ impl App {
             tool_calls_this_turn: 0,
             notify_enabled: true,
             visuals_cache: VisualsCache::default(),
+            caps: probe_app_caps(),
         }
     }
 
@@ -3186,10 +3228,11 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
             true
         }
         "log" => {
-            let path = crate::history::History::load()
-                .path()
-                .cloned()
-                .map(|p| p.display().to_string())
+            // V3.b · read cached history path; no JSONL parse for a display.
+            let path = app
+                .caps
+                .history_path
+                .clone()
                 .unwrap_or_else(|| "(no log path)".into());
             app.flash(format!("log dir → see tracing file near: {path}"));
             true
@@ -3197,7 +3240,8 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
         "env" => {
             let term = std::env::var("TERM").unwrap_or_default();
             let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-            let caps = crate::term_caps::detect();
+            // V3.b · terminal caps cached once at startup.
+            let caps = app.caps.term;
             app.flash(format!(
                 "TERM={term} TERM_PROGRAM={term_program} kind={:?} kb={} gfx={}",
                 caps.kind, caps.kitty_keyboard, caps.graphics
@@ -4933,19 +4977,25 @@ fn git_status_body(s: &crate::git::GitStatus, t: &Theme) -> Vec<Line<'static>> {
 /// Build the readiness-check rows for the /doctor modal.
 fn doctor_checks(app: &App) -> Vec<crate::ui::modal::DoctorCheck> {
     use crate::ui::modal::{DoctorCheck, DoctorStatus};
-    let caps = crate::term_caps::detect();
+    // V3.b · read cached values from AppCaps instead of re-probing each
+    // time /doctor opens (clipboard handle creation in particular was
+    // needlessly expensive on some platforms).
+    let caps = app.caps.term;
     let mut rows = Vec::new();
 
     // pi on PATH
-    let pi_path = which_pi();
     rows.push(DoctorCheck {
         label: "pi binary",
-        status: if pi_path.is_some() {
+        status: if app.caps.pi_binary.is_some() {
             DoctorStatus::Pass
         } else {
             DoctorStatus::Fail
         },
-        detail: pi_path.unwrap_or_else(|| "not found on PATH".into()),
+        detail: app
+            .caps
+            .pi_binary
+            .clone()
+            .unwrap_or_else(|| "not found on PATH".into()),
     });
 
     // pi connection live
@@ -4995,16 +5045,15 @@ fn doctor_checks(app: &App) -> Vec<crate::ui::modal::DoctorCheck> {
         },
     });
 
-    // clipboard
-    let cb_ok = arboard::Clipboard::new().is_ok();
+    // clipboard (cached in AppCaps — no re-probe per /doctor open)
     rows.push(DoctorCheck {
         label: "clipboard",
-        status: if cb_ok {
+        status: if app.caps.clipboard_native {
             DoctorStatus::Pass
         } else {
             DoctorStatus::Warn
         },
-        detail: if cb_ok {
+        detail: if app.caps.clipboard_native {
             "arboard (native)".into()
         } else {
             "OSC 52 fallback".into()
@@ -5579,7 +5628,11 @@ fn build_settings_rows(app: &App) -> Vec<SettingsRow> {
     });
     rows.push(R::Info {
         label: "pi binary".into(),
-        value: which_pi().unwrap_or_else(|| "not on PATH".into()),
+        value: app
+            .caps
+            .pi_binary
+            .clone()
+            .unwrap_or_else(|| "not on PATH".into()),
     });
 
     rows.push(R::Header("Model"));
@@ -5695,14 +5748,13 @@ fn build_settings_rows(app: &App) -> Vec<SettingsRow> {
     }
 
     rows.push(R::Header("Capabilities"));
-    let caps = crate::term_caps::detect();
     rows.push(R::Info {
         label: "terminal".into(),
-        value: format!("{:?}", caps.kind),
+        value: format!("{:?}", app.caps.term.kind),
     });
     rows.push(R::Info {
         label: "kitty keyboard".into(),
-        value: if caps.kitty_keyboard {
+        value: if app.caps.term.kitty_keyboard {
             "advertised".into()
         } else {
             "not advertised (Alt+T / F12 fallback)".into()
@@ -5710,7 +5762,7 @@ fn build_settings_rows(app: &App) -> Vec<SettingsRow> {
     });
     rows.push(R::Info {
         label: "graphics".into(),
-        value: if caps.graphics {
+        value: if app.caps.term.graphics {
             "supported".into()
         } else {
             "no image protocol detected".into()
@@ -5718,7 +5770,7 @@ fn build_settings_rows(app: &App) -> Vec<SettingsRow> {
     });
     rows.push(R::Info {
         label: "clipboard".into(),
-        value: if arboard::Clipboard::new().is_ok() {
+        value: if app.caps.clipboard_native {
             "arboard (native)".into()
         } else {
             "OSC 52 fallback".into()
@@ -5734,36 +5786,27 @@ fn build_settings_rows(app: &App) -> Vec<SettingsRow> {
     });
 
     rows.push(R::Header("Paths"));
-    let hist = crate::history::History::load();
     rows.push(R::Info {
         label: "history file".into(),
-        value: hist
-            .path()
-            .map(|p| p.display().to_string())
+        value: app
+            .caps
+            .history_path
+            .clone()
             .unwrap_or_else(|| "(no history path)".into()),
     });
-    let state_dir = directories::BaseDirs::new()
-        .map(|d| {
-            d.state_dir()
-                .unwrap_or_else(|| d.data_local_dir())
-                .join("rata-pi")
-                .display()
-                .to_string()
-        })
-        .unwrap_or_else(|| "(unknown)".into());
     rows.push(R::Info {
         label: "crash dumps".into(),
-        value: state_dir,
+        value: app.caps.state_dir.clone(),
     });
 
     rows.push(R::Header("Build"));
     rows.push(R::Info {
         label: "rata-pi".into(),
-        value: env!("CARGO_PKG_VERSION").into(),
+        value: app.caps.package_version.into(),
     });
     rows.push(R::Info {
         label: "platform".into(),
-        value: format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH),
+        value: app.caps.platform.clone(),
     });
 
     rows
@@ -7242,6 +7285,53 @@ mod visuals_cache_tests {
         assert_eq!(a, b);
     }
 
+    /// V3.b · when nothing has mutated since the last walk, update_visuals_cache
+    /// must NOT recompute the cache — it should early-out based on the
+    /// mutation_epoch match. This guards the perf optimisation against
+    /// silent regressions.
+    #[test]
+    fn visuals_cache_skips_walk_when_epoch_unchanged() {
+        let mut a = App::new(None);
+        a.transcript.push(Entry::User("hi".into()));
+        a.transcript.push(Entry::Assistant("hello".into()));
+        // First walk — populates the cache.
+        update_visuals_cache(&mut a, 80);
+        assert_eq!(a.visuals_cache.entries.len(), 2);
+        let epoch_after_first = a.visuals_cache.last_seen_epoch;
+        assert_eq!(epoch_after_first, a.transcript.mutation_epoch());
+        // Corrupt a cache slot — if we DO walk, it'll be overwritten back.
+        // If we EARLY-OUT correctly, the corruption survives.
+        let sentinel_fp: u64 = 0xDEAD_BEEF;
+        a.visuals_cache.entries[0].fingerprint = sentinel_fp;
+        // Second walk with no mutations — should early-out.
+        update_visuals_cache(&mut a, 80);
+        assert_eq!(
+            a.visuals_cache.entries[0].fingerprint, sentinel_fp,
+            "epoch was unchanged; fingerprint walk must have been skipped"
+        );
+    }
+
+    /// V3.b · a transcript mutation bumps the epoch, which must cause the
+    /// next walk to re-fingerprint and restore the cache.
+    #[test]
+    fn visuals_cache_walks_after_mutation() {
+        let mut a = App::new(None);
+        a.transcript.push(Entry::User("hi".into()));
+        update_visuals_cache(&mut a, 80);
+        let fp_before = a.visuals_cache.entries[0].fingerprint;
+        // Corrupt, then mutate (push). The push bumps the epoch so the
+        // walk runs and rewrites slot 0 with a correct fingerprint again
+        // for the existing entry.
+        a.visuals_cache.entries[0].fingerprint = 0;
+        a.transcript.push(Entry::Assistant("hey".into()));
+        update_visuals_cache(&mut a, 80);
+        assert_eq!(a.visuals_cache.entries.len(), 2);
+        assert_eq!(
+            a.visuals_cache.entries[0].fingerprint, fp_before,
+            "walk must restore the correct fingerprint after mutation"
+        );
+    }
+
     #[test]
     fn fingerprint_differs_on_appended_text() {
         // Assistant text grows; the fingerprint must change so the cache
@@ -8091,6 +8181,51 @@ I'll take it from here.",
         a.modal = Some(Modal::Settings(crate::ui::modal::SettingsState::default()));
         let (_, close) = settings_modal_key(KeyCode::Esc, KeyModifiers::NONE, &mut a);
         assert!(close);
+    }
+
+    /// V3.b · AppCaps is built exactly once in App::new and shared across
+    /// every frame. build_settings_rows MUST read from app.caps — not
+    /// re-probe the clipboard or reload the history JSONL. This test
+    /// asserts the cached values are what the /settings modal displays.
+    #[test]
+    fn settings_rows_read_from_app_caps() {
+        let a = app();
+        let rows = build_settings_rows(&a);
+        let find = |needle: &str| -> Option<String> {
+            rows.iter().find_map(|r| match r {
+                SettingsRow::Info { label, value } if label == needle => Some(value.clone()),
+                _ => None,
+            })
+        };
+        // "pi binary" row exactly echoes the cached value.
+        let pi_binary_row = find("pi binary").expect("missing pi binary row");
+        let expected_pi = a
+            .caps
+            .pi_binary
+            .clone()
+            .unwrap_or_else(|| "not on PATH".into());
+        assert_eq!(pi_binary_row, expected_pi);
+        // "crash dumps" row matches cached state_dir exactly (no per-call probe).
+        assert_eq!(
+            find("crash dumps").as_deref(),
+            Some(a.caps.state_dir.as_str())
+        );
+        // "platform" row matches cached platform.
+        assert_eq!(find("platform").as_deref(), Some(a.caps.platform.as_str()));
+    }
+
+    /// V3.b · AppCaps matches a direct probe: confirms probe_app_caps is
+    /// consistent with the underlying sources. If this drifts we've diverged
+    /// the cache from reality.
+    #[test]
+    fn app_caps_matches_direct_probes() {
+        let a = app();
+        assert_eq!(a.caps.pi_binary, which_pi());
+        assert_eq!(a.caps.term.kind, crate::term_caps::detect().kind);
+        assert_eq!(
+            a.caps.history_path,
+            crate::history::History::default_path().map(|p| p.display().to_string())
+        );
     }
 
     /// V3.a · AutoCompact / AutoRetry toggles flip the local state even when

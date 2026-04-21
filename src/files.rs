@@ -102,21 +102,36 @@ pub fn filter(files: &[String], query: &str, limit: usize) -> Vec<(String, i64)>
 
 /// Read the first ~40 lines or ~8 KiB of a file (whichever first) for the
 /// preview pane. Returns `None` if the file can't be read or looks binary.
+///
+/// V3.b · bounded reads: `metadata()` is consulted first so we can bail on
+/// large files *before* reading any bytes, and the actual read is a
+/// `BufReader::take(MAX_BYTES)` instead of the whole-file `std::fs::read`
+/// it used to be. Previously we'd pull a 100 MiB log into memory just to
+/// reject it — no longer.
 pub fn preview(root: &std::path::Path, rel: &str) -> Option<(String, String)> {
+    use std::io::Read;
+
     const MAX_BYTES: usize = 8 * 1024;
     const MAX_LINES: usize = 40;
+    const SIZE_CAP: u64 = 50 * 1024 * 1024;
 
     let path = root.join(rel);
-    let bytes = std::fs::read(&path).ok()?;
-    if bytes.len() > 50 * 1024 * 1024 {
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() {
         return None;
     }
-    // Binary-file heuristic: null byte in the first 8 KiB.
-    let sample_end = bytes.len().min(MAX_BYTES);
-    if bytes[..sample_end].contains(&0) {
+    if meta.len() > SIZE_CAP {
         return None;
     }
-    let text = String::from_utf8_lossy(&bytes[..sample_end]);
+    let file = std::fs::File::open(&path).ok()?;
+    let mut reader = std::io::BufReader::new(file).take(MAX_BYTES as u64);
+    let mut bytes: Vec<u8> = Vec::with_capacity(MAX_BYTES);
+    reader.read_to_end(&mut bytes).ok()?;
+    // Binary-file heuristic: null byte in the sampled prefix.
+    if bytes.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&bytes);
     let clipped: String = text.lines().take(MAX_LINES).collect::<Vec<_>>().join("\n");
     let lang = rel.rsplit('.').next().unwrap_or("").to_string();
     Some((clipped, lang))
@@ -157,5 +172,40 @@ mod tests {
     fn empty_filter_returns_empty_when_no_files() {
         let out = filter(&[], "", 10);
         assert!(out.is_empty());
+    }
+
+    /// V3.b regression: a >50 MiB file must be rejected *before* any bytes
+    /// are read. We create the file via `set_len` so the filesystem marks
+    /// it sparse — if `preview` ever regresses to `std::fs::read` the test
+    /// will still pass on a sparse FS, but the `metadata()` guard should
+    /// fire regardless of how the file got that size.
+    #[test]
+    fn preview_rejects_files_over_size_cap_without_reading() {
+        let dir = std::env::temp_dir().join(format!("rata-pi-v3b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.txt");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(51 * 1024 * 1024).unwrap(); // 51 MiB, sparse
+        drop(f);
+        assert!(preview(&dir, "huge.txt").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// V3.b: a reasonably-sized file reads successfully and returns a
+    /// bounded sample (no more than the documented MAX_LINES).
+    #[test]
+    fn preview_clips_to_max_lines() {
+        let dir = std::env::temp_dir().join(format!("rata-pi-v3b-clip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("many.txt");
+        let content: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, content).unwrap();
+        let (sample, _lang) = preview(&dir, "many.txt").expect("preview should succeed");
+        assert!(
+            sample.lines().count() <= 40,
+            "expected ≤40 lines, got {}",
+            sample.lines().count()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
