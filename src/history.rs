@@ -66,25 +66,29 @@ impl History {
             text: text.into(),
             ts,
         };
-        if let Err(e) = self.append_file(&entry) {
-            tracing::warn!(error = %e, "history append failed");
+        // V2.11.2 · persist asynchronously so a slow or network FS can't
+        // stall the submit() keypath. If we're not inside a tokio runtime
+        // (tests), fall back to a synchronous write.
+        let path = self.path.clone();
+        let entry_for_disk = entry.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn_blocking(move || {
+                    if let Err(e) = append_file(path.as_deref(), &entry_for_disk) {
+                        tracing::warn!(error = %e, "history append failed");
+                    }
+                });
+            }
+            Err(_) => {
+                if let Err(e) = append_file(path.as_deref(), &entry_for_disk) {
+                    tracing::warn!(error = %e, "history append failed");
+                }
+            }
         }
         self.entries.push(entry);
         // Walking is reset on new entry.
         self.cursor = None;
         self.stash = None;
-    }
-
-    fn append_file(&self, entry: &HistoryEntry) -> std::io::Result<()> {
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(f, "{}", serde_json::to_string(entry).unwrap_or_default())?;
-        Ok(())
     }
 
     /// Walk to an older entry. Returns the new composer text.
@@ -129,6 +133,18 @@ impl History {
     pub fn path(&self) -> Option<&PathBuf> {
         self.path.as_ref()
     }
+}
+
+fn append_file(path: Option<&std::path::Path>, entry: &HistoryEntry) -> std::io::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{}", serde_json::to_string(entry).unwrap_or_default())?;
+    Ok(())
 }
 
 fn resolve_path() -> Option<PathBuf> {

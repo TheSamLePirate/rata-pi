@@ -320,6 +320,12 @@ struct App {
     /// `FileList`.
     file_walk_tx: Option<tokio::sync::mpsc::Sender<crate::files::FileList>>,
 
+    /// V2.11.2 · per-entry rendered-visual + height cache. Keeps
+    /// markdown/syntect/line_count work out of the draw hot path by only
+    /// rebuilding slots whose fingerprint changed (or whose cached width
+    /// no longer matches).
+    visuals_cache: VisualsCache,
+
     // ── V2.10: vim mode toggle ──────────────────────────────────────────
     vim_enabled: bool,
 
@@ -385,6 +391,7 @@ impl App {
             agent_start_tick: None,
             tool_calls_this_turn: 0,
             notify_enabled: true,
+            visuals_cache: VisualsCache::default(),
         }
     }
 
@@ -954,25 +961,37 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: Args
 }
 
 async fn bootstrap(client: &RpcClient, app: &mut App) {
-    if let Ok(ok) = client.call(RpcCommand::GetState).await
+    // V2.11.2 · fire all bootstrap RPCs concurrently. They have no
+    // dependencies on each other and each is a separate round-trip to pi,
+    // so serial-await wasted ~N × RTT at startup. Stats refresh now joins
+    // the party too.
+    let (state, messages, commands, models, stats) = tokio::join!(
+        client.call(RpcCommand::GetState),
+        client.call(RpcCommand::GetMessages),
+        client.call(RpcCommand::GetCommands),
+        client.call(RpcCommand::GetAvailableModels),
+        client.call(RpcCommand::GetSessionStats),
+    );
+
+    if let Ok(ok) = state
         && let Some(v) = ok.data
         && let Ok(s) = serde_json::from_value::<State>(v)
     {
         app.apply_state(&s);
     }
-    if let Ok(ok) = client.call(RpcCommand::GetMessages).await
+    if let Ok(ok) = messages
         && let Some(v) = ok.data
         && let Some(arr) = v.get("messages").and_then(|x| x.as_array())
     {
-        let mut messages: Vec<AgentMessage> = Vec::with_capacity(arr.len());
+        let mut msgs: Vec<AgentMessage> = Vec::with_capacity(arr.len());
         for m in arr {
             if let Ok(msg) = serde_json::from_value::<AgentMessage>(m.clone()) {
-                messages.push(msg);
+                msgs.push(msg);
             }
         }
-        import_messages(app, messages);
+        import_messages(app, msgs);
     }
-    if let Ok(ok) = client.call(RpcCommand::GetCommands).await
+    if let Ok(ok) = commands
         && let Some(v) = ok.data
         && let Some(arr) = v.get("commands").and_then(|x| x.as_array())
     {
@@ -981,7 +1000,7 @@ async fn bootstrap(client: &RpcClient, app: &mut App) {
             .filter_map(|m| serde_json::from_value::<CommandInfo>(m.clone()).ok())
             .collect();
     }
-    if let Ok(ok) = client.call(RpcCommand::GetAvailableModels).await
+    if let Ok(ok) = models
         && let Some(v) = ok.data
         && let Some(arr) = v.get("models").and_then(|x| x.as_array())
     {
@@ -990,7 +1009,12 @@ async fn bootstrap(client: &RpcClient, app: &mut App) {
             .filter_map(|m| serde_json::from_value::<Model>(m.clone()).ok())
             .collect();
     }
-    refresh_stats(client, app).await;
+    if let Ok(ok) = stats
+        && let Some(v) = ok.data
+        && let Ok(s) = serde_json::from_value::<SessionStats>(v)
+    {
+        app.session.stats = Some(s);
+    }
     // Initial git status is fetched via the background task in `ui_loop`
     // (spawn_git_refresh is fired once immediately after bootstrap).
 }
@@ -1000,14 +1024,21 @@ async fn bootstrap(client: &RpcClient, app: &mut App) {
 /// AND materialised into a Vec — the rest are ignored by `filter`.
 const FILES_CAP: usize = 500;
 
-/// Populate modal caches that the draw closure relies on. Runs once per
-/// frame from the UI loop. The operations are idempotent — they short-
-/// circuit when the inputs haven't changed.
-fn prepare_frame_caches(app: &mut App) {
+/// Populate modal + transcript caches that the draw closure relies on.
+/// Runs once per frame from the UI loop. The operations are idempotent —
+/// they short-circuit when the inputs haven't changed.
+///
+/// `terminal_size` is the full terminal size, from which we derive the
+/// transcript body's content-width (terminal-width minus 2 borders and
+/// 1 scrollbar column). The body always spans full terminal width so
+/// this math is exact.
+fn prepare_frame_caches(app: &mut App, terminal_size: ratatui::layout::Size) {
     if let Some(Modal::Files(ff)) = app.modal.as_mut() {
         ff.refresh_filter(FILES_CAP);
         ensure_file_preview(ff);
     }
+    let content_w = terminal_size.width.saturating_sub(3);
+    update_visuals_cache(app, content_w);
 }
 
 /// Build the right-pane preview cache for the currently selected file,
@@ -1194,7 +1225,10 @@ async fn ui_loop(
             // V2.11.1 · Build modal caches once per frame so draw(&App)
             // stays pure and the fuzzy matcher / file reader / syntect
             // never fire inside the render closure.
-            prepare_frame_caches(app);
+            // V2.11.2 · also refreshes the per-entry visuals + heights
+            // cache so markdown/syntect/line_count stays out of draw.
+            let size = terminal.size()?;
+            prepare_frame_caches(app, size);
             terminal.draw(|f| draw(f, app))?;
             last_draw = tokio::time::Instant::now();
         }
@@ -3136,7 +3170,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         draw_widgets(f, r, &above_widgets);
     }
     if let Some(r) = plan_rect {
-        plan_card(&app.plan, &app.theme).render(f, r, &app.theme);
+        plan_card(&app.plan, &app.theme).render(f, r, &app.theme, false);
     }
     draw_editor(f, editor_area, app);
     if let Some(r) = below_rect {
@@ -3522,11 +3556,11 @@ impl Visual {
     fn render(&self, f: &mut ratatui::Frame, area: Rect, idx: usize, app: &App) {
         match self {
             Self::Card(c) => {
-                let mut c = c.clone();
-                c.focused = app.focus_idx == Some(idx);
-                // Keep role color on the border; the Card renderer swaps to
+                // V2.11.2 · focus is an out-of-band lookup (no more clone
+                // of the Card just to flip a flag). The renderer swaps to
                 // BorderType::Double + prepends a ▶ marker when focused.
-                c.render(f, area, &app.theme);
+                let focused = app.focus_idx == Some(idx);
+                c.render(f, area, &app.theme, focused);
             }
             Self::Inline(r) => r.render(f, area),
         }
@@ -3675,144 +3709,291 @@ fn render_card_clipped(
     );
 }
 
-fn build_visuals(app: &App) -> Vec<Visual> {
+/// V2.11.2 · render one Entry to its `Visual`. Factored out of the old
+/// `build_visuals` so the visuals cache can rebuild individual slots
+/// without re-rendering untouched neighbours.
+///
+/// `is_live_tail` is true for the single entry that is currently being
+/// streamed — in that case we append the blinking block cursor and swap
+/// the title chip to "pi · streaming". Non-tail assistant entries get a
+/// stable "pi" title and no cursor, so their cached body never changes.
+fn build_one_visual(entry: &Entry, app: &App, is_live_tail: bool) -> Visual {
     let t = &app.theme;
-    let mut out = Vec::with_capacity(app.transcript.entries().len());
-    for e in app.transcript.entries() {
-        match e {
-            Entry::User(s) => out.push(Visual::Card(Card {
-                icon: "❯",
-                title: "you".into(),
-                right_title: None,
-                body: plain_paragraph(s, t.text),
-                border_color: t.role_user,
-                icon_color: t.role_user,
-                title_color: t.role_user,
-                focused: false,
-            })),
-            Entry::Thinking(s) => {
-                if app.show_thinking {
-                    let body = thinking_body(s, t);
-                    let tokens = approx_tokens(s);
-                    out.push(Visual::Card(Card {
-                        icon: "✦",
-                        title: "thinking".into(),
-                        right_title: Some(format!("{tokens} tok")),
-                        body,
-                        border_color: t.role_thinking,
-                        icon_color: t.role_thinking,
-                        title_color: t.role_thinking,
-                        focused: false,
-                    }));
-                } else {
-                    let count = s.lines().count().max(1);
-                    out.push(Visual::Inline(InlineRow {
-                        lines: vec![Line::from(Span::styled(
-                            format!("  ▸ thinking ({count} lines — Ctrl+T to reveal)"),
-                            Style::default().fg(t.role_thinking),
-                        ))],
-                    }));
-                }
-            }
-            Entry::Assistant(md) => {
-                let mut body = markdown::render(md);
-                // If this is the LAST entry AND pi is still actively
-                // streaming text, append a blinking block cursor to the
-                // final body line so the user can see "it's still going".
-                let is_streaming_tail = app.is_streaming
-                    && matches!(app.live, LiveState::Streaming | LiveState::Llm)
-                    && is_last_assistant(app, md);
-                if is_streaming_tail {
-                    let cursor_on = (app.ticks / 5).is_multiple_of(2);
-                    let cursor_span = Span::styled(
-                        if cursor_on { "▌" } else { " " },
-                        Style::default()
-                            .fg(t.role_assistant)
-                            .add_modifier(Modifier::BOLD),
-                    );
-                    if let Some(last) = body.last_mut() {
-                        last.spans.push(cursor_span);
-                    } else {
-                        body.push(Line::from(cursor_span));
-                    }
-                }
-                out.push(Visual::Card(Card {
+    match entry {
+        Entry::User(s) => Visual::Card(Card {
+            icon: "❯",
+            title: "you".into(),
+            right_title: None,
+            body: plain_paragraph(s, t.text),
+            border_color: t.role_user,
+            icon_color: t.role_user,
+            title_color: t.role_user,
+        }),
+        Entry::Thinking(s) => {
+            if app.show_thinking {
+                let body = thinking_body(s, t);
+                let tokens = approx_tokens(s);
+                Visual::Card(Card {
                     icon: "✦",
-                    title: if is_streaming_tail {
-                        "pi · streaming".into()
-                    } else {
-                        "pi".into()
-                    },
-                    right_title: Some(app.session.model_label.clone()),
-                    body: if body.is_empty() {
-                        vec![Line::from(Span::styled("…", Style::default().fg(t.dim)))]
-                    } else {
-                        body
-                    },
-                    border_color: t.role_assistant,
-                    icon_color: t.role_assistant,
-                    title_color: t.role_assistant,
-                    focused: false,
-                }));
-            }
-            Entry::ToolCall(tc) => out.push(Visual::Card(tool_card(tc, t))),
-            Entry::BashExec(bx) => out.push(Visual::Card(bash_card(bx, t))),
-            Entry::Info(s) => out.push(Visual::Inline(InlineRow {
-                lines: vec![Line::from(Span::styled(
-                    format!("  · {s}"),
-                    Style::default().fg(t.dim),
-                ))],
-            })),
-            Entry::Warn(s) => out.push(Visual::Inline(InlineRow {
-                lines: vec![Line::from(Span::styled(
-                    format!("  ⚠ {s}"),
-                    Style::default().fg(t.warning),
-                ))],
-            })),
-            Entry::Error(s) => out.push(Visual::Inline(InlineRow {
-                lines: vec![Line::from(Span::styled(
-                    format!("  ✗ {s}"),
-                    Style::default().fg(t.error),
-                ))],
-            })),
-            Entry::Compaction(c) => out.push(Visual::Inline(InlineRow {
-                lines: compaction_lines(c, t),
-            })),
-            Entry::Retry(r) => out.push(Visual::Inline(InlineRow {
-                lines: retry_lines(r, t),
-            })),
-            Entry::TurnMarker { number } => {
-                out.push(Visual::Inline(InlineRow {
-                    lines: vec![
-                        Line::default(),
-                        Line::from(vec![
-                            Span::styled("  ──────  ", Style::default().fg(t.dim)),
-                            Span::styled(
-                                format!("turn {number}"),
-                                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                "  ──────────────────────────────────",
-                                Style::default().fg(t.dim),
-                            ),
-                        ]),
-                    ],
-                }));
+                    title: "thinking".into(),
+                    right_title: Some(format!("{tokens} tok")),
+                    body,
+                    border_color: t.role_thinking,
+                    icon_color: t.role_thinking,
+                    title_color: t.role_thinking,
+                })
+            } else {
+                let count = s.lines().count().max(1);
+                Visual::Inline(InlineRow {
+                    lines: vec![Line::from(Span::styled(
+                        format!("  ▸ thinking ({count} lines — Ctrl+T to reveal)"),
+                        Style::default().fg(t.role_thinking),
+                    ))],
+                })
             }
         }
+        Entry::Assistant(md) => {
+            let mut body = markdown::render(md);
+            if is_live_tail {
+                let cursor_on = (app.ticks / 5).is_multiple_of(2);
+                let cursor_span = Span::styled(
+                    if cursor_on { "▌" } else { " " },
+                    Style::default()
+                        .fg(t.role_assistant)
+                        .add_modifier(Modifier::BOLD),
+                );
+                if let Some(last) = body.last_mut() {
+                    last.spans.push(cursor_span);
+                } else {
+                    body.push(Line::from(cursor_span));
+                }
+            }
+            Visual::Card(Card {
+                icon: "✦",
+                title: if is_live_tail {
+                    "pi · streaming".into()
+                } else {
+                    "pi".into()
+                },
+                right_title: Some(app.session.model_label.clone()),
+                body: if body.is_empty() {
+                    vec![Line::from(Span::styled("…", Style::default().fg(t.dim)))]
+                } else {
+                    body
+                },
+                border_color: t.role_assistant,
+                icon_color: t.role_assistant,
+                title_color: t.role_assistant,
+            })
+        }
+        Entry::ToolCall(tc) => Visual::Card(tool_card(tc, t)),
+        Entry::BashExec(bx) => Visual::Card(bash_card(bx, t)),
+        Entry::Info(s) => Visual::Inline(InlineRow {
+            lines: vec![Line::from(Span::styled(
+                format!("  · {s}"),
+                Style::default().fg(t.dim),
+            ))],
+        }),
+        Entry::Warn(s) => Visual::Inline(InlineRow {
+            lines: vec![Line::from(Span::styled(
+                format!("  ⚠ {s}"),
+                Style::default().fg(t.warning),
+            ))],
+        }),
+        Entry::Error(s) => Visual::Inline(InlineRow {
+            lines: vec![Line::from(Span::styled(
+                format!("  ✗ {s}"),
+                Style::default().fg(t.error),
+            ))],
+        }),
+        Entry::Compaction(c) => Visual::Inline(InlineRow {
+            lines: compaction_lines(c, t),
+        }),
+        Entry::Retry(r) => Visual::Inline(InlineRow {
+            lines: retry_lines(r, t),
+        }),
+        Entry::TurnMarker { number } => Visual::Inline(InlineRow {
+            lines: vec![
+                Line::default(),
+                Line::from(vec![
+                    Span::styled("  ──────  ", Style::default().fg(t.dim)),
+                    Span::styled(
+                        format!("turn {number}"),
+                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "  ──────────────────────────────────",
+                        Style::default().fg(t.dim),
+                    ),
+                ]),
+            ],
+        }),
     }
-    out
 }
 
-fn is_last_assistant(app: &App, md: &str) -> bool {
-    app.transcript
-        .entries()
-        .last()
-        .and_then(|e| match e {
-            Entry::Assistant(s) => Some(s.as_str() == md),
-            _ => None,
-        })
-        .unwrap_or(false)
+/// Fingerprint the mutable bits of an Entry. Two entries with equal
+/// fingerprints produce equal `Visual`s under the same theme + show_thinking
+/// setting, so cached slots can be reused.
+///
+/// For append-only text (User/Thinking/Assistant/Info/Warn/Error), the
+/// `len()` is a strict monotonic proxy for content identity in our model:
+/// these entries either grow at the tail or don't change. For structured
+/// entries (ToolCall, BashExec, Compaction, Retry) we hash the specific
+/// fields that can mutate after creation.
+fn fingerprint_entry(entry: &Entry, show_thinking: bool) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::mem::discriminant(entry).hash(&mut h);
+    match entry {
+        Entry::User(s) => s.len().hash(&mut h),
+        Entry::Thinking(s) => {
+            s.len().hash(&mut h);
+            show_thinking.hash(&mut h);
+        }
+        Entry::Assistant(s) => s.len().hash(&mut h),
+        Entry::ToolCall(tc) => {
+            tc.name.len().hash(&mut h);
+            tc.output.len().hash(&mut h);
+            (tc.status as u8).hash(&mut h);
+            tc.is_error.hash(&mut h);
+            tc.expanded.hash(&mut h);
+        }
+        Entry::BashExec(bx) => {
+            bx.command.len().hash(&mut h);
+            bx.output.len().hash(&mut h);
+            bx.exit_code.hash(&mut h);
+            bx.cancelled.hash(&mut h);
+            bx.truncated.hash(&mut h);
+        }
+        Entry::Info(s) | Entry::Warn(s) | Entry::Error(s) => s.len().hash(&mut h),
+        Entry::Compaction(c) => {
+            c.reason.len().hash(&mut h);
+            match &c.state {
+                CompactionState::Running => 0u8.hash(&mut h),
+                CompactionState::Done { summary } => {
+                    1u8.hash(&mut h);
+                    summary.as_deref().map(str::len).unwrap_or(0).hash(&mut h);
+                }
+                CompactionState::Aborted => 2u8.hash(&mut h),
+                CompactionState::Failed(e) => {
+                    3u8.hash(&mut h);
+                    e.len().hash(&mut h);
+                }
+            }
+        }
+        Entry::Retry(r) => {
+            r.attempt.hash(&mut h);
+            r.max_attempts.hash(&mut h);
+            match &r.state {
+                RetryState::Waiting { delay_ms, error } => {
+                    0u8.hash(&mut h);
+                    delay_ms.hash(&mut h);
+                    error.len().hash(&mut h);
+                }
+                RetryState::Succeeded => 1u8.hash(&mut h),
+                RetryState::Exhausted(e) => {
+                    2u8.hash(&mut h);
+                    e.len().hash(&mut h);
+                }
+            }
+        }
+        Entry::TurnMarker { number } => number.hash(&mut h),
+    }
+    h.finish()
+}
+
+/// Per-entry cache slot.
+struct CachedVisual {
+    fingerprint: u64,
+    visual: Visual,
+    /// Width at which `height` was last computed. A width change is the
+    /// only reason we recompute `height` without also rebuilding `visual`.
+    width: u16,
+    height: u16,
+}
+
+/// Transcript rendering cache. Keys rebuilds on theme change and on each
+/// entry's fingerprint.
+#[derive(Default)]
+struct VisualsCache {
+    theme_key: String,
+    entries: Vec<CachedVisual>,
+}
+
+/// Rebuild stale cache slots against the current transcript, and refresh
+/// heights if `content_w` has changed. Idempotent when nothing changed.
+///
+/// The live-streaming tail (last Assistant entry while streaming) is
+/// forced to rebuild every frame so the cursor blink + "pi · streaming"
+/// title stay live without a dedicated invalidation channel.
+fn update_visuals_cache(app: &mut App, content_w: u16) {
+    // Theme change → wipe everything.
+    if app.visuals_cache.theme_key != app.theme.name {
+        app.visuals_cache.theme_key = app.theme.name.to_string();
+        app.visuals_cache.entries.clear();
+    }
+
+    let entries_len = app.transcript.entries().len();
+    // Shrinkage (e.g. /clear, /switch session).
+    if app.visuals_cache.entries.len() > entries_len {
+        app.visuals_cache.entries.truncate(entries_len);
+    }
+
+    // Which entry (if any) is the live-streaming tail this frame.
+    let live_tail_idx: Option<usize> = if app.is_streaming
+        && matches!(app.live, LiveState::Streaming | LiveState::Llm)
+        && matches!(app.transcript.entries().last(), Some(Entry::Assistant(_)))
+    {
+        Some(entries_len - 1)
+    } else {
+        None
+    };
+
+    // Walk entries. Snapshot the raw list length; we'll index into it and
+    // into the cache in lock-step but build_one_visual needs a &App, so we
+    // don't hold a borrow on app.transcript through the inner block.
+    for i in 0..entries_len {
+        let is_live = live_tail_idx == Some(i);
+        let entry_fp = {
+            let entry = &app.transcript.entries()[i];
+            fingerprint_entry(entry, app.show_thinking)
+        };
+        // Live-tail's fingerprint is ignored — we always rebuild it.
+        let target_fp = if is_live { u64::MAX } else { entry_fp };
+
+        let must_rebuild = match app.visuals_cache.entries.get(i) {
+            None => true,
+            Some(c) if is_live => true,
+            Some(c) => c.fingerprint != target_fp,
+        };
+
+        if must_rebuild {
+            // Snapshot Entry by index; the visual build is &App-read-only
+            // but we can't borrow app.transcript and &app together. Clone
+            // the entry — cheap for small variants, moderate for strings.
+            let entry = app.transcript.entries()[i].clone();
+            let visual = build_one_visual(&entry, app, is_live);
+            let height = visual.height(content_w);
+            let slot = CachedVisual {
+                fingerprint: target_fp,
+                visual,
+                width: content_w,
+                height,
+            };
+            if i < app.visuals_cache.entries.len() {
+                app.visuals_cache.entries[i] = slot;
+            } else {
+                app.visuals_cache.entries.push(slot);
+            }
+        } else if let Some(c) = app.visuals_cache.entries.get_mut(i)
+            && c.width != content_w
+        {
+            // Width changed but content didn't — recompute height only.
+            c.height = c.visual.height(content_w);
+            c.width = content_w;
+        }
+    }
 }
 
 fn plain_paragraph(s: &str, color: Color) -> Vec<Line<'static>> {
@@ -3860,7 +4041,6 @@ fn tool_card(tc: &ToolCall, t: &Theme) -> Card {
         border_color: color,
         icon_color: color,
         title_color: color,
-        focused: false,
     }
 }
 
@@ -4308,7 +4488,6 @@ fn bash_card(bx: &BashExec, t: &Theme) -> Card {
         border_color: status_color,
         icon_color: t.role_bash,
         title_color: t.role_bash,
-        focused: false,
     }
 }
 
@@ -4421,9 +4600,10 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let sbar_col = Rect::new(inner.x + content_w, inner.y, 1, inner.height);
     let content = Rect::new(inner.x, inner.y, content_w, inner.height);
 
-    // Build one Visual per entry, skipping Thinking when hidden.
-    let visuals = build_visuals(app);
-    if visuals.is_empty() {
+    // V2.11.2 · read from the visuals cache populated in `prepare_frame_
+    // caches`. No markdown / syntect / line_count runs inside this function.
+    let cache = &app.visuals_cache.entries;
+    if cache.is_empty() {
         let hint = Paragraph::new(Text::from(vec![
             Line::from(Span::styled(
                 "welcome to rata-pi",
@@ -4440,9 +4620,20 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Heights at the content width (leaves room for the scrollbar column).
-    let heights: Vec<u16> = visuals.iter().map(|v| v.height(content_w)).collect();
-    let total_h: u16 = heights.iter().fold(0u16, |a, b| a.saturating_add(*b));
+    // Heights are cached at `content_w` by the prepare step. If the width
+    // this draw sees disagrees (a resize landed between prepare and draw),
+    // fall back to per-entry height() — correctness wins over the cache
+    // for this one frame.
+    let total_h: u16 = cache
+        .iter()
+        .map(|c| {
+            if c.width == content_w {
+                c.height
+            } else {
+                c.visual.height(content_w)
+            }
+        })
+        .fold(0u16, |a, h| a.saturating_add(h));
     let viewport = content.height;
     let max_offset = total_h.saturating_sub(viewport);
 
@@ -4450,10 +4641,24 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let offset: u16 = if let Some(idx) = app.focus_idx {
         // Center the focused card in the viewport.
         let mut prefix: u16 = 0;
-        for h in &heights[..idx.min(heights.len())] {
-            prefix = prefix.saturating_add(*h);
+        for c in &cache[..idx.min(cache.len())] {
+            let h = if c.width == content_w {
+                c.height
+            } else {
+                c.visual.height(content_w)
+            };
+            prefix = prefix.saturating_add(h);
         }
-        let focused_h = heights.get(idx).copied().unwrap_or(0);
+        let focused_h = cache
+            .get(idx)
+            .map(|c| {
+                if c.width == content_w {
+                    c.height
+                } else {
+                    c.visual.height(content_w)
+                }
+            })
+            .unwrap_or(0);
         let mid = prefix.saturating_add(focused_h / 2);
         mid.saturating_sub(viewport / 2).min(max_offset)
     } else {
@@ -4474,9 +4679,14 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let mut y_cursor: u16 = 0;
     let mut draw_y: u16 = content.y;
     let end_y = content.y + viewport;
-    for (i, (v, h)) in visuals.iter().zip(heights.iter()).enumerate() {
+    for (i, c) in cache.iter().enumerate() {
+        let h = if c.width == content_w {
+            c.height
+        } else {
+            c.visual.height(content_w)
+        };
         let top = y_cursor;
-        let bottom = y_cursor.saturating_add(*h);
+        let bottom = y_cursor.saturating_add(h);
         y_cursor = bottom;
         if bottom <= offset {
             continue;
@@ -4484,6 +4694,7 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
         if top >= offset + viewport {
             break;
         }
+        let v = &c.visual;
         // How much of this visual's top is already scrolled off?
         let skip = offset.saturating_sub(top);
         let remaining_vertical = end_y.saturating_sub(draw_y);
@@ -4492,17 +4703,10 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
             break;
         }
         let target = Rect::new(content.x, draw_y, content.width, draw_h);
-        if skip == 0 && draw_h >= *h {
-            // Card fully fits: draw normally.
+        if skip == 0 && draw_h >= h {
             v.render(f, target, i, app);
         } else {
-            // Either the top is scrolled off (skip > 0) or the card is
-            // taller than the remaining viewport (bottom is cut). Render
-            // the full card into a scratch buffer, then blit the visible
-            // slice into the frame's buffer. Guarantees the tail of a
-            // long streaming assistant card is always in view in auto-
-            // follow mode.
-            v.render_clipped(f, target, i, app, skip, *h);
+            v.render_clipped(f, target, i, app, skip, h);
             if skip > 0 {
                 render_cutoff_hint(f, Rect::new(target.x, target.y, target.width, 1), t);
             }
@@ -5608,7 +5812,6 @@ fn plan_card(plan: &crate::plan::Plan, t: &Theme) -> crate::ui::cards::Card {
         },
         icon_color: t.accent,
         title_color: t.accent,
-        focused: false,
     }
 }
 
@@ -6264,4 +6467,74 @@ fn ext_input_text(placeholder: Option<&str>, value: &str, t: &Theme) -> Text<'st
     };
     lines.push(display);
     Text::from(lines)
+}
+
+// ─────────────────────────────────────────────── visuals cache tests ──
+
+#[cfg(test)]
+mod visuals_cache_tests {
+    use super::*;
+
+    fn user(s: &str) -> Entry {
+        Entry::User(s.into())
+    }
+
+    fn assistant(s: &str) -> Entry {
+        Entry::Assistant(s.into())
+    }
+
+    #[test]
+    fn fingerprint_equal_for_equal_content() {
+        let a = fingerprint_entry(&user("hello"), false);
+        let b = fingerprint_entry(&user("hello"), false);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_differs_on_appended_text() {
+        // Assistant text grows; the fingerprint must change so the cache
+        // rebuilds. We key on len(), so strictly monotonic growth works.
+        let a = fingerprint_entry(&assistant("hi"), false);
+        let b = fingerprint_entry(&assistant("hi there"), false);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_differs_across_variants() {
+        // Two entries with equal body-len but different variants must not
+        // share a fingerprint — we hash std::mem::discriminant first.
+        let a = fingerprint_entry(&user("abc"), false);
+        let b = fingerprint_entry(&assistant("abc"), false);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_respects_show_thinking() {
+        // Thinking is rendered differently when show_thinking toggles,
+        // so the key must include the flag.
+        let e = Entry::Thinking("abc".into());
+        let a = fingerprint_entry(&e, false);
+        let b = fingerprint_entry(&e, true);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_covers_tool_status_transitions() {
+        let mut tc = crate::ui::transcript::ToolCall {
+            id: "x".into(),
+            name: "bash".into(),
+            args: serde_json::Value::Null,
+            output: String::new(),
+            status: crate::ui::transcript::ToolStatus::Running,
+            is_error: false,
+            expanded: false,
+        };
+        let running = fingerprint_entry(&Entry::ToolCall(tc.clone()), false);
+        tc.status = crate::ui::transcript::ToolStatus::Ok;
+        let ok = fingerprint_entry(&Entry::ToolCall(tc.clone()), false);
+        tc.expanded = true;
+        let expanded = fingerprint_entry(&Entry::ToolCall(tc), false);
+        assert_ne!(running, ok);
+        assert_ne!(ok, expanded);
+    }
 }

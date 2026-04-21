@@ -477,6 +477,52 @@ Plan-mode work shipped in V2.9. TODO widget + `/diagnostics` deferred to V2.11+.
 
 ---
 
+## V2.11.2 — Render hot-path: visuals + heights cache, parallel bootstrap, async history ✅
+
+Closes the P0 + P1 items from the full codebase audit.
+
+### P0 · per-entry visuals + heights cache
+- [x] **`fingerprint_entry(entry, show_thinking) -> u64`** — fingerprints the mutable bits of every Entry variant so two equal fingerprints imply equal renders under the same theme. Strings use `.len()` (our transcript only grows at the tail, so len is a strict monotonic identity proxy). Structured entries (ToolCall, BashExec, Compaction, Retry) hash their mutable fields explicitly.
+- [x] **`CachedVisual { fingerprint, visual, width, height }`** — one slot per Entry. `VisualsCache { theme_key, entries }` on App.
+- [x] **`update_visuals_cache(app, content_w)`** — rebuilds only slots whose fingerprint changed; recomputes `height` only when the width changed. Wipes everything on theme change. Truncates on transcript shrink (`/clear`, session switch).
+- [x] **Live-streaming tail is forced to rebuild each frame** so the blinking cursor + "pi · streaming" title stay animated without polluting the fingerprint space.
+- [x] **`build_one_visual(entry, app, is_live_tail) -> Visual`** — extracted from the old `build_visuals`. Per-entry render path.
+- [x] **`draw_body` reads from cache** directly: `let cache = &app.visuals_cache.entries;`. No markdown/syntect/line_count calls inside `draw()` any more. If content_w disagrees (mid-frame resize), the draw falls back to a per-entry `height()` for correctness on that one frame; the next `prepare_frame_caches` cycle re-syncs.
+- [x] Plumbed via `prepare_frame_caches(app, terminal.size()?)` — `content_w` is derived from `terminal.width - 3` (2 borders + 1 scrollbar column). The body always spans full terminal width so the math is exact without duplicating the Layout chain.
+- [x] **5 unit tests** on `fingerprint_entry`: equal-content, appended-text, variant distinction, show_thinking flag, and ToolCall status/expanded transitions. First tests on `src/app.rs`.
+
+### P1 · focus out of Card
+- [x] Removed `focused: bool` from `Card`. Made `render` / `render_to_buffer` take `focused` as an argument.
+- [x] `Visual::render` no longer clones the Card — it looks up focus via `app.focus_idx == Some(idx)` and passes it to `Card::render`. The cached Card stays immutable across focus toggles.
+
+### P1 · parallel bootstrap
+- [x] `bootstrap()` now fires `GetState / GetMessages / GetCommands / GetAvailableModels / GetSessionStats` concurrently via `tokio::join!`. Round-trip count unchanged; latency at startup drops from Σ RTTs to max RTT.
+
+### P1 · async `History::record`
+- [x] `append_file(path, entry)` extracted as a free function and wrapped in `spawn_blocking` when a tokio runtime is present (falls back to sync for unit tests). The submit keypath is no longer blocked on filesystem writes.
+
+### Gates
+- **114 tests pass** (V2.11.1 had 109; +5 fingerprint tests).
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo fmt --check` clean.
+- `cargo build --features notify` clean.
+
+### Expected perf delta (qualitative)
+- 100-entry session with 10 assistant cards containing fenced code blocks, 30 fps redraw: before — 10 pulldown-cmark parses + N syntect runs × 30 fps. After — 0 per frame; rebuilds only when content changes. Orders of magnitude.
+- Per-card `Paragraph::new(body.clone())` in `height()` and `render_to_buffer()` still occurs inside ratatui but once per visible card rather than once per cached card (the untouched slot already has a cached `height`).
+- Focus navigation (`j`/`k` in focus mode): previously triggered a full Card clone per frame for every visible card. Now: zero allocations from the focus toggle — focus is an index lookup at render time.
+- Boot latency: was Σ(5 × RTT); now max(5 × RTT) + parse. On 50 ms RTT that's ~250 ms → ~50 ms.
+- Prompt submission on slow disks: no longer stalls on `history.jsonl` append.
+
+### Notes
+- The cache size is O(transcript-length). Each slot holds a `Visual` (Card body = `Vec<Line<'static>>`). For a 10 000-entry session that can reach tens of MB — acceptable for a dev tool, but worth remembering. If it bites, a tiered cache (recent 500 full, older summarized) is straightforward.
+- `content_w` is captured at `prepare_frame_caches` time. A resize between prepare and draw (rare — both fire synchronously in the same tick) triggers the per-entry fallback branch in draw_body for one frame. The next frame re-syncs.
+- Live-tail treatment leaks no cost when idle: the "is streaming" gate is exact (`app.is_streaming && LiveState ∈ {Streaming, Llm}`). When idle, the last entry's fingerprint is cached and the body is reused.
+- `is_last_assistant` is gone — the live-tail index is computed once per prepare in `update_visuals_cache`, inlined.
+- `History::record` falls back to sync I/O when no tokio runtime is present, so unit tests (no runtime) still exercise the file code path.
+
+---
+
 ## V2.11.1 — Perf pass: responsiveness audit ✅
 
 Responding to a deep architectural review that identified five bottlenecks.

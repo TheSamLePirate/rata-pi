@@ -23,12 +23,14 @@ pub struct Card {
     pub border_color: Color,
     pub icon_color: Color,
     pub title_color: Color,
-    pub focused: bool,
 }
 
 impl Card {
     /// How many terminal rows does this card occupy at the given outer width?
     /// Uses Ratatui's own `Paragraph::line_count` so wrap math matches render.
+    ///
+    /// Focus state does not affect height (the title row is one row whether
+    /// focused or not), so the caller doesn't need to pass it.
     pub fn height(&self, outer_width: u16) -> u16 {
         if outer_width < 4 {
             return 2;
@@ -44,18 +46,21 @@ impl Card {
         body_h.saturating_add(2) // top + bottom border
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) {
-        self.render_to_buffer(area, f.buffer_mut(), theme);
+    pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme, focused: bool) {
+        self.render_to_buffer(area, f.buffer_mut(), theme, focused);
     }
 
     /// Render into any buffer at `area`. Used directly by `render` and also
     /// by the transcript virtualization path when it needs a scratch buffer
     /// to clip a tall card to the visible window.
-    pub fn render_to_buffer(&self, area: Rect, buf: &mut Buffer, _theme: &Theme) {
+    ///
+    /// `focused` is passed in (not stored on `Card`) so the cached body and
+    /// chrome can be reused across focus toggles without rebuild.
+    pub fn render_to_buffer(&self, area: Rect, buf: &mut Buffer, _theme: &Theme, focused: bool) {
         let border_style = Style::default().fg(self.border_color);
         // Swap border weight based on focus so the focused card is obviously
         // different, without changing hue (role colors stay meaningful).
-        let btype = if self.focused {
+        let btype = if focused {
             BorderType::Double
         } else {
             BorderType::Rounded
@@ -63,7 +68,7 @@ impl Card {
 
         // Leading marker + icon + title. The marker only appears when
         // focused so the focused card gets a very clear "you are here" cue.
-        let focus_mark = if self.focused {
+        let focus_mark = if focused {
             vec![
                 Span::styled(
                     " ▶",
