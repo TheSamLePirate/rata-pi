@@ -6575,3 +6575,420 @@ mod visuals_cache_tests {
         assert_ne!(ok, expanded);
     }
 }
+
+// ────────────────────────────────────── App::on_event reducer tests ──
+
+#[cfg(test)]
+mod reducer_tests {
+    //! Drive the full state machine through scripted `Incoming` events.
+    //!
+    //! `App::on_event` is a pure `(State, Event) -> State` function — it
+    //! doesn't touch the RPC client, the filesystem, or the terminal. So we
+    //! construct a fresh `App`, feed it events, and assert against the
+    //! resulting public state.
+    //!
+    //! These tests pin down the behaviors the UI depends on. Any regression
+    //! in the live-status machine, the transcript stream-assembly, or the
+    //! turn bookkeeping will show up here.
+    use super::*;
+    use crate::rpc::types::{
+        AgentMessage, AssistantBlock, ContentBlock, Cost, ToolResultPayload, Usage,
+    };
+
+    fn app() -> App {
+        let mut a = App::new(None);
+        // Notifications emit OSC 777 to stdout; disable so test runs
+        // don't dump escape sequences into the test harness output.
+        a.notify_enabled = false;
+        a
+    }
+
+    fn text_delta(s: &str) -> Incoming {
+        Incoming::MessageUpdate {
+            message: serde_json::Value::Null,
+            assistant_message_event: AssistantEvent::TextDelta {
+                content_index: 0,
+                delta: s.into(),
+                partial: serde_json::Value::Null,
+            },
+        }
+    }
+
+    fn thinking_delta(s: &str) -> Incoming {
+        Incoming::MessageUpdate {
+            message: serde_json::Value::Null,
+            assistant_message_event: AssistantEvent::ThinkingDelta {
+                content_index: 0,
+                delta: s.into(),
+                partial: serde_json::Value::Null,
+            },
+        }
+    }
+
+    fn tool_result_text(s: &str) -> ToolResultPayload {
+        ToolResultPayload {
+            content: vec![ContentBlock::Text { text: s.into() }],
+            details: serde_json::Value::Null,
+        }
+    }
+
+    // ── Agent lifecycle ──────────────────────────────────────────────────
+
+    #[test]
+    fn agent_start_sets_streaming_and_llm_state() {
+        let mut a = app();
+        assert!(!a.is_streaming);
+        assert!(matches!(a.live, LiveState::Idle));
+        a.on_event(Incoming::AgentStart);
+        assert!(a.is_streaming);
+        assert!(matches!(a.live, LiveState::Llm));
+        assert_eq!(a.tool_calls_this_turn, 0);
+        assert!(a.agent_start_tick.is_some());
+    }
+
+    #[test]
+    fn agent_end_returns_to_idle_and_clears_tool_running() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(Incoming::ToolExecutionStart {
+            tool_call_id: "t1".into(),
+            tool_name: "bash".into(),
+            args: serde_json::Value::Null,
+        });
+        assert_eq!(a.tool_running, 1);
+        a.on_event(Incoming::AgentEnd { messages: vec![] });
+        assert!(!a.is_streaming);
+        assert_eq!(a.tool_running, 0);
+        assert!(matches!(a.live, LiveState::Idle));
+        assert_eq!(a.agent_start_tick, None);
+    }
+
+    // ── Turn bookkeeping ─────────────────────────────────────────────────
+
+    #[test]
+    fn turn_start_bumps_counter_without_first_divider() {
+        let mut a = app();
+        a.on_event(Incoming::TurnStart);
+        assert_eq!(a.turn_count, 1);
+        // No divider before turn 1.
+        let has_marker = a
+            .transcript
+            .entries()
+            .iter()
+            .any(|e| matches!(e, Entry::TurnMarker { .. }));
+        assert!(!has_marker);
+    }
+
+    #[test]
+    fn second_turn_start_pushes_divider() {
+        let mut a = app();
+        a.on_event(Incoming::TurnStart);
+        a.on_event(Incoming::TurnStart);
+        assert_eq!(a.turn_count, 2);
+        let markers: Vec<u32> = a
+            .transcript
+            .entries()
+            .iter()
+            .filter_map(|e| match e {
+                Entry::TurnMarker { number } => Some(*number),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers, vec![2]);
+    }
+
+    #[test]
+    fn turn_end_with_cost_accrues_session_total() {
+        let mut a = app();
+        let ev = Incoming::TurnEnd {
+            message: Some(AgentMessage::Assistant {
+                content: vec![AssistantBlock::Text { text: "hi".into() }],
+                api: None,
+                provider: None,
+                model: None,
+                usage: Some(Usage {
+                    input: 100,
+                    output: 10,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost: Some(Cost {
+                        total: 0.012,
+                        ..Default::default()
+                    }),
+                }),
+                stop_reason: None,
+                timestamp: 0,
+                entry_id: None,
+            }),
+            tool_results: vec![],
+        };
+        a.on_event(ev);
+        assert!((a.cost_session - 0.012).abs() < 1e-9);
+        assert_eq!(a.cost_series.back().copied(), Some(0.012));
+    }
+
+    // ── Message deltas → transcript ──────────────────────────────────────
+
+    #[test]
+    fn text_delta_accumulates_into_single_assistant_entry() {
+        let mut a = app();
+        a.on_event(text_delta("Hel"));
+        a.on_event(text_delta("lo "));
+        a.on_event(text_delta("world"));
+        let last = a.transcript.entries().last().unwrap();
+        assert!(matches!(last, Entry::Assistant(s) if s == "Hello world"));
+        assert!(matches!(a.live, LiveState::Streaming));
+    }
+
+    #[test]
+    fn thinking_delta_is_separate_entry_from_assistant_text() {
+        let mut a = app();
+        a.on_event(thinking_delta("hmm"));
+        a.on_event(text_delta("ok"));
+        let n = a.transcript.entries().len();
+        assert_eq!(n, 2);
+        assert!(matches!(
+            a.transcript.entries()[0],
+            Entry::Thinking(ref s) if s == "hmm"
+        ));
+        assert!(matches!(
+            a.transcript.entries()[1],
+            Entry::Assistant(ref s) if s == "ok"
+        ));
+        assert!(matches!(a.live, LiveState::Streaming));
+    }
+
+    #[test]
+    fn stream_error_pushes_warn_and_sets_error_state() {
+        let mut a = app();
+        a.on_event(Incoming::MessageUpdate {
+            message: serde_json::Value::Null,
+            assistant_message_event: AssistantEvent::Error {
+                reason: crate::rpc::types::ErrorReason::Error,
+                partial: serde_json::Value::Null,
+            },
+        });
+        assert!(matches!(a.live, LiveState::Error));
+        assert!(matches!(
+            a.transcript.entries().last(),
+            Some(Entry::Warn(_))
+        ));
+    }
+
+    // ── Tool execution lifecycle ─────────────────────────────────────────
+
+    #[test]
+    fn tool_start_then_end_updates_counters_and_transcript() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(Incoming::ToolExecutionStart {
+            tool_call_id: "t1".into(),
+            tool_name: "bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+        });
+        assert_eq!(a.tool_running, 1);
+        assert_eq!(a.tool_done, 0);
+        assert_eq!(a.tool_calls_this_turn, 1);
+        assert!(matches!(a.live, LiveState::Tool));
+        a.on_event(Incoming::ToolExecutionEnd {
+            tool_call_id: "t1".into(),
+            tool_name: "bash".into(),
+            result: tool_result_text("done"),
+            is_error: false,
+        });
+        assert_eq!(a.tool_running, 0);
+        assert_eq!(a.tool_done, 1);
+        // Back to LLM since we were streaming.
+        assert!(matches!(a.live, LiveState::Llm));
+    }
+
+    #[test]
+    fn tool_end_when_not_streaming_stays_tool_not_llm() {
+        let mut a = app();
+        // No AgentStart — simulating the tool_result stage after agent_end.
+        a.on_event(Incoming::ToolExecutionStart {
+            tool_call_id: "t1".into(),
+            tool_name: "bash".into(),
+            args: serde_json::Value::Null,
+        });
+        a.on_event(Incoming::ToolExecutionEnd {
+            tool_call_id: "t1".into(),
+            tool_name: "bash".into(),
+            result: tool_result_text("ok"),
+            is_error: false,
+        });
+        // Live state isn't flipped back to LLM (we weren't streaming).
+        assert!(!matches!(a.live, LiveState::Llm));
+    }
+
+    // ── Auto-retry ───────────────────────────────────────────────────────
+
+    #[test]
+    fn auto_retry_start_enters_retrying_and_records_entry() {
+        let mut a = app();
+        a.on_event(Incoming::AutoRetryStart {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 500,
+            error_message: Some("429 Too Many Requests".into()),
+        });
+        match a.live {
+            LiveState::Retrying {
+                attempt,
+                max_attempts,
+                delay_ms,
+            } => {
+                assert_eq!(attempt, 1);
+                assert_eq!(max_attempts, 3);
+                assert_eq!(delay_ms, 500);
+            }
+            _ => panic!("expected Retrying state"),
+        }
+        assert!(matches!(
+            a.transcript.entries().last(),
+            Some(Entry::Retry(_))
+        ));
+    }
+
+    #[test]
+    fn auto_retry_end_succeeded_while_streaming_goes_llm() {
+        let mut a = app();
+        a.is_streaming = true;
+        a.on_event(Incoming::AutoRetryStart {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 100,
+            error_message: None,
+        });
+        a.on_event(Incoming::AutoRetryEnd {
+            success: true,
+            attempt: 1,
+            final_error: None,
+        });
+        assert!(matches!(a.live, LiveState::Llm));
+    }
+
+    #[test]
+    fn auto_retry_end_exhausted_goes_idle() {
+        let mut a = app();
+        a.on_event(Incoming::AutoRetryStart {
+            attempt: 3,
+            max_attempts: 3,
+            delay_ms: 100,
+            error_message: None,
+        });
+        a.on_event(Incoming::AutoRetryEnd {
+            success: false,
+            attempt: 3,
+            final_error: Some("rate limited".into()),
+        });
+        assert!(matches!(a.live, LiveState::Idle));
+    }
+
+    // ── Compaction ───────────────────────────────────────────────────────
+
+    #[test]
+    fn compaction_start_and_end_flow() {
+        let mut a = app();
+        a.on_event(Incoming::CompactionStart {
+            reason: crate::rpc::types::CompactionReason::Threshold,
+        });
+        assert!(matches!(a.live, LiveState::Compacting));
+        assert!(matches!(
+            a.transcript.entries().last(),
+            Some(Entry::Compaction(_))
+        ));
+        a.on_event(Incoming::CompactionEnd {
+            reason: crate::rpc::types::CompactionReason::Threshold,
+            result: Some(crate::rpc::types::CompactionResult {
+                summary: "summarised".into(),
+                first_kept_entry_id: None,
+                tokens_before: 10_000,
+                details: serde_json::Value::Null,
+            }),
+            aborted: false,
+            will_retry: false,
+            error_message: None,
+        });
+        assert!(matches!(a.live, LiveState::Idle));
+    }
+
+    // ── Queue update ─────────────────────────────────────────────────────
+
+    #[test]
+    fn queue_update_replaces_session_queues() {
+        let mut a = app();
+        a.on_event(Incoming::QueueUpdate {
+            steering: vec!["steer A".into(), "steer B".into()],
+            follow_up: vec!["follow-up X".into()],
+        });
+        assert_eq!(a.session.queue_steering, vec!["steer A", "steer B"]);
+        assert_eq!(a.session.queue_follow_up, vec!["follow-up X"]);
+    }
+
+    // ── Extension errors ─────────────────────────────────────────────────
+
+    #[test]
+    fn extension_error_pushes_error_entry() {
+        let mut a = app();
+        a.on_event(Incoming::ExtensionError {
+            extension_path: Some("/ext.js".into()),
+            event: Some("init".into()),
+            error: Some("boom".into()),
+        });
+        let last = a.transcript.entries().last().unwrap();
+        assert!(matches!(last, Entry::Error(s) if s.contains("boom")));
+    }
+
+    // ── Liveness probe ───────────────────────────────────────────────────
+
+    #[test]
+    fn any_event_bumps_last_event_tick() {
+        let mut a = app();
+        a.ticks = 100;
+        a.last_event_tick = 0;
+        a.on_event(Incoming::AgentStart);
+        assert_eq!(a.last_event_tick, 100);
+    }
+
+    // ── Full turn transcript shape ───────────────────────────────────────
+
+    #[test]
+    fn full_turn_produces_expected_entries() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(Incoming::TurnStart);
+        a.on_event(thinking_delta("let me think…"));
+        a.on_event(text_delta("Hello "));
+        a.on_event(text_delta("world"));
+        a.on_event(Incoming::ToolExecutionStart {
+            tool_call_id: "t1".into(),
+            tool_name: "bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+        });
+        a.on_event(Incoming::ToolExecutionEnd {
+            tool_call_id: "t1".into(),
+            tool_name: "bash".into(),
+            result: tool_result_text("file1\nfile2"),
+            is_error: false,
+        });
+        a.on_event(Incoming::AgentEnd { messages: vec![] });
+
+        // Thinking, Assistant, ToolCall (no TurnMarker because it's turn 1)
+        let kinds: Vec<&str> = a
+            .transcript
+            .entries()
+            .iter()
+            .map(|e| match e {
+                Entry::Thinking(_) => "thinking",
+                Entry::Assistant(_) => "assistant",
+                Entry::ToolCall(_) => "tool",
+                Entry::TurnMarker { .. } => "turn",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["thinking", "assistant", "tool"]);
+        assert!(!a.is_streaming);
+        assert!(matches!(a.live, LiveState::Idle));
+    }
+}
