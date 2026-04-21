@@ -1291,9 +1291,60 @@ async fn handle_modal_key(
         return;
     };
     match modal {
-        Modal::Stats(_) | Modal::Help | Modal::Diff(_) | Modal::GitStatus(_) | Modal::GitLog(_) => {
+        Modal::Stats(_) | Modal::Help | Modal::GitStatus(_) => match code {
+            KeyCode::Esc | KeyCode::Enter => app.modal = None,
+            _ => {}
+        },
+        Modal::Diff(d) => match code {
+            KeyCode::Esc => app.modal = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                d.scroll = d.scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                d.scroll = d.scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                d.scroll = d.scroll.saturating_add(10);
+            }
+            KeyCode::PageUp => {
+                d.scroll = d.scroll.saturating_sub(10);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                d.scroll = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                d.scroll = u16::MAX;
+            }
+            _ => {}
+        },
+        Modal::GitLog(state) => {
+            let n = state.commits.len();
             match code {
-                KeyCode::Esc | KeyCode::Enter => app.modal = None,
+                KeyCode::Esc => app.modal = None,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if n > 0 {
+                        state.selected = (state.selected + 1).min(n - 1);
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    state.selected = state.selected.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    if n > 0 {
+                        state.selected = (state.selected + 10).min(n - 1);
+                    }
+                }
+                KeyCode::PageUp => {
+                    state.selected = state.selected.saturating_sub(10);
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    state.selected = 0;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    if n > 0 {
+                        state.selected = n - 1;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1922,6 +1973,7 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
                         },
                         staged,
                         diff: d,
+                        scroll: 0,
                     }));
                 }
                 Err(e) => app.flash(format!("git diff failed: {e}")),
@@ -4289,7 +4341,9 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::History(l) => Some(2 + l.selected as u16),
         Modal::Forks(l) => Some(2 + l.selected as u16),
         Modal::Files(ff) => Some(2 + ff.selected as u16),
+        Modal::GitLog(s) => Some(2 + s.selected as u16),
         Modal::ExtSelect { selected, .. } => Some(*selected as u16),
+        // Diff modal uses raw line-scroll (no selection), handled below.
         _ => None,
     };
 
@@ -4300,16 +4354,17 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         .line_count(text_width) as u16;
     let total_lines = rendered.max(source_lines);
     let viewport = inner.height;
-    let scroll_y = if let Some(line) = selected_line {
-        if total_lines > viewport {
-            let half = viewport / 2;
-            line.saturating_sub(half)
-                .min(total_lines.saturating_sub(viewport))
-        } else {
-            0
-        }
-    } else {
-        0
+    let max_scroll = total_lines.saturating_sub(viewport);
+    let scroll_y = match modal {
+        // Diff: free-form scroll, no selection. Clamp to end-of-content.
+        Modal::Diff(d) => d.scroll.min(max_scroll),
+        _ => match selected_line {
+            Some(line) if total_lines > viewport => {
+                let half = viewport / 2;
+                line.saturating_sub(half).min(max_scroll)
+            }
+            _ => 0,
+        },
     };
 
     // Render the scrollbar when needed and compute the main text rect.
@@ -4557,21 +4612,34 @@ fn git_log_body(state: &crate::ui::modal::GitLogState, t: &Theme) -> Vec<Line<'s
         Style::default().fg(t.dim),
     )]));
     out.push(Line::default());
-    for c in &state.commits {
+    for (i, c) in state.commits.iter().enumerate() {
+        let is_sel = i == state.selected;
+        let marker = if is_sel { "▸" } else { " " };
+        let subject_style = if is_sel {
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.text)
+        };
         out.push(Line::from(vec![
             Span::styled(
-                format!("  {:<8}  ", c.hash),
+                format!(" {marker} "),
+                Style::default()
+                    .fg(if is_sel { t.accent } else { t.dim })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<8}  ", c.hash),
                 Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("{:<20}  ", truncate_preview(&c.author, 20)),
-                Style::default().fg(t.accent),
+                Style::default().fg(t.accent_strong),
             ),
             Span::styled(
                 format!("{:<14}  ", truncate_preview(&c.date, 14)),
                 Style::default().fg(t.dim),
             ),
-            Span::styled(c.subject.clone(), Style::default().fg(t.text)),
+            Span::styled(c.subject.clone(), subject_style),
         ]));
     }
     out

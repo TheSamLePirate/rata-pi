@@ -95,13 +95,13 @@ pub struct DiffView {
     pub title: String,
     pub staged: bool,
     pub diff: String,
+    /// Line-granular scroll offset into the rendered diff lines.
+    pub scroll: u16,
 }
 
 #[derive(Debug)]
 pub struct GitLogState {
     pub commits: Vec<Commit>,
-    /// Reserved for per-entry detail pane in a future revision.
-    #[allow(dead_code)]
     pub selected: usize,
 }
 
