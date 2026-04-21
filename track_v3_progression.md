@@ -196,7 +196,7 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 - [x] Shortcuts modal scroll regression — **new** `shortcuts_modal_scroll_and_close_bindings` (PageDown bumps by 10, Home resets, `q` closes).
 - [x] Test count target — **230** (started V3 at 194; V3.h adds +7 reaching comfortably above the 220 floor).
 
-**Shipped as** `<tbd>`
+**Shipped as** `b38c4cc`
 
 ---
 
