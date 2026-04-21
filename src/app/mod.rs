@@ -486,15 +486,24 @@ impl App {
             return;
         };
 
-        // V2.12.g · interview markers come first so the modal opens
-        // before the plan-mode auto-continue fires. Skipped when we're
-        // already in a modal (pre-existing interview or other blocker).
+        // V2.12.g · detect an interview (marker → fenced block → bare
+        // JSON, in that order) and open the modal. Strip the detected
+        // range from the visible assistant card so the user doesn't see
+        // the raw JSON, and push an Info row for a clear audit trail.
+        // Skipped when we're already in a modal (pre-existing interview
+        // or other blocker).
         if self.modal.is_none()
-            && let Some((iv, _)) = crate::interview::parse_marker(&text)
+            && let Some((iv, range)) = crate::interview::detect_interview(&text)
         {
+            let stripped = crate::interview::strip_range(&text, range);
+            self.transcript.rewrite_last_assistant(stripped);
+            let title = iv.title.clone();
             let state = crate::interview::InterviewState::from_interview(iv);
             self.modal = Some(Modal::Interview(Box::new(state)));
-            self.flash("agent opened an interview — answer and Ctrl+Enter to submit");
+            self.transcript.push(Entry::Info(format!(
+                "✍ agent opened an interview: \"{title}\" — answer and Ctrl+Enter to submit (Esc cancels)"
+            )));
+            self.flash(format!("interview · {title}"));
         }
 
         let mut advanced = false;
@@ -6898,6 +6907,65 @@ mod reducer_tests {
                     crate::interview::FieldValue::Text { .. }
                 ));
             }
+            other => panic!("expected Modal::Interview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_end_detects_interview_in_fenced_code_block() {
+        // Agents often drop the [[INTERVIEW:]] wrapper and put the JSON
+        // in a fenced code block instead. Verify the lenient detector
+        // opens the modal AND strips the JSON from the assistant card.
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(text_delta(
+            "Here's a quick form:\n\n```json\n{\n  \"title\": \"Settings\",\n  \"fields\": [\n    { \"type\": \"text\", \"id\": \"name\", \"label\": \"Name\" }\n  ]\n}\n```\n\nPlease fill it out.",
+        ));
+        a.on_event(Incoming::AgentEnd { messages: vec![] });
+
+        // Modal is open.
+        match &a.modal {
+            Some(Modal::Interview(state)) => {
+                assert_eq!(state.title, "Settings");
+            }
+            other => panic!("expected Modal::Interview, got {other:?}"),
+        }
+
+        // Assistant card no longer contains the raw JSON.
+        let assistant_text = a
+            .transcript
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Entry::Assistant(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            !assistant_text.contains("\"fields\""),
+            "got {assistant_text:?}"
+        );
+        assert!(assistant_text.contains("Here's a quick form"));
+        assert!(assistant_text.contains("Please fill it out"));
+
+        // Info row records the event.
+        let has_info = a.transcript.entries().iter().any(
+            |e| matches!(e, Entry::Info(s) if s.contains("interview") && s.contains("Settings")),
+        );
+        assert!(has_info, "expected info row about the interview");
+    }
+
+    #[test]
+    fn agent_end_detects_interview_in_bare_json() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(text_delta(
+            "{\"title\":\"Raw\",\"fields\":[{\"type\":\"toggle\",\"id\":\"ok\",\"label\":\"OK\"}]}",
+        ));
+        a.on_event(Incoming::AgentEnd { messages: vec![] });
+        match &a.modal {
+            Some(Modal::Interview(state)) => assert_eq!(state.title, "Raw"),
             other => panic!("expected Modal::Interview, got {other:?}"),
         }
     }

@@ -549,15 +549,33 @@ Interview mode is the agent's way of asking you **structured** questions instead
 
 ### How it starts
 
-The agent emits exactly one marker in its assistant text:
+The agent can emit the form in any of three shapes — rata-pi's detector tries them in order:
 
-```
-[[INTERVIEW: { ...json form definition... }]]
-```
+1. **Canonical marker** (preferred, renders cleanest):
+   ```
+   [[INTERVIEW: { "title": "...", "fields": [ ... ] }]]
+   ```
+2. **Fenced code block** (commonly used by chat-trained agents):
+   ```
+   ```json
+   { "title": "...", "fields": [ ... ] }
+   ```
+   ```
+   Any language tag works (`json`, `interview`, none).
+3. **Bare JSON object** in the message body. Must deserialize as a valid Interview and carry at least one interactive field — accidental JSON snippets are rejected.
 
-rata-pi parses the JSON on `agent_end`, strips the noise from the visible transcript, and opens the Interview modal. A flash message appears: *"agent opened an interview — answer and Ctrl+Enter to submit"*.
+On detection rata-pi:
+* **Strips** the form JSON (including the surrounding markers / fences) from the visible assistant card — you're not left staring at raw JSON.
+* **Opens** the Interview modal with defaults hydrated.
+* **Pushes** an `Info` row into the transcript: `✍ agent opened an interview: "Title" — answer and Ctrl+Enter to submit (Esc cancels)`.
+* **Flashes** `interview · Title` in the status bar.
 
-The capability hint explaining this grammar is automatically appended to your outgoing prompts (when no plan is active), so the agent knows the feature exists without you prompting for it.
+The capability hint describing all three shapes is automatically appended to your outgoing prompts (when no plan is active), so the agent knows the feature exists without you prompting for it.
+
+**Validation** (prevents accidental triggering on unrelated JSON):
+* `title` must be a non-empty string.
+* `fields` must be a non-empty array.
+* At least one field must have a recognized interactive `type` (not just `section` / `info`).
 
 ### Field types
 

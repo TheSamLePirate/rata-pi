@@ -662,15 +662,165 @@ pub fn parse_marker(text: &str) -> Option<(Interview, std::ops::Range<usize>)> {
 #[allow(dead_code)]
 pub fn strip_marker(text: &str) -> String {
     match parse_marker(text) {
-        Some((_, range)) => {
-            let mut out = String::with_capacity(text.len());
-            out.push_str(&text[..range.start]);
-            out.push_str(&text[range.end..]);
-            // Collapse the blank gap the marker leaves behind.
-            out.trim().to_string()
-        }
+        Some((_, range)) => strip_range(text, range),
         None => text.to_string(),
     }
+}
+
+/// Remove the byte-range `range` from `text` and return the remainder
+/// with surrounding whitespace collapsed (so the assistant card doesn't
+/// end up with a blank paragraph where the form used to live).
+pub fn strip_range(text: &str, range: std::ops::Range<usize>) -> String {
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..range.start]);
+    out.push_str(&text[range.end..]);
+    // Collapse any run of 3+ newlines (common after a removed block) to 2.
+    let mut collapsed = String::with_capacity(out.len());
+    let mut newline_run = 0usize;
+    for ch in out.chars() {
+        if ch == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                collapsed.push(ch);
+            }
+        } else {
+            newline_run = 0;
+            collapsed.push(ch);
+        }
+    }
+    collapsed.trim().to_string()
+}
+
+/// Robust interview detector: tries multiple shapes in priority order.
+///
+/// 1. The canonical `[[INTERVIEW: …]]` marker (per [`parse_marker`]).
+/// 2. Any fenced code block whose body deserializes as an [`Interview`]
+///    and has at least one recognized field type.
+/// 3. A bare JSON object in the text that deserializes the same way.
+///
+/// Fallbacks 2 and 3 exist because agents in the wild often drop the
+/// wrapper — they write "Here's a form:" followed by a fenced JSON
+/// block, or just the JSON on its own. Requiring the exact marker is
+/// correct in theory but brittle in practice, so we accept any
+/// interview-shaped JSON that clearly isn't accidental (validated via
+/// non-empty `title` + non-empty `fields` + at least one field with a
+/// known `type`).
+///
+/// Returns the parsed Interview plus the byte-range in `text` to strip
+/// from the visible transcript.
+pub fn detect_interview(text: &str) -> Option<(Interview, std::ops::Range<usize>)> {
+    if let Some(hit) = parse_marker(text) {
+        return Some(hit);
+    }
+    if let Some(hit) = scan_fenced_blocks(text) {
+        return Some(hit);
+    }
+    scan_bare_json(text)
+}
+
+/// Find the first fenced code block (``` … ```) whose body parses as an
+/// Interview. The language tag is ignored — only the content matters.
+fn scan_fenced_blocks(text: &str) -> Option<(Interview, std::ops::Range<usize>)> {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + 3 <= bytes.len() {
+        if &bytes[i..i + 3] == b"```" {
+            let fence_start = i;
+            let mut j = i + 3;
+            // Skip language tag up to newline.
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                break;
+            }
+            let body_start = j + 1;
+            // Find closing fence on its own line.
+            let Some(close_rel) = text[body_start..].find("```") else {
+                break;
+            };
+            let body_end = body_start + close_rel;
+            let fence_end = body_end + 3;
+            let body = text[body_start..body_end].trim();
+            if let Some(iv) = try_parse_interview(body) {
+                return Some((iv, fence_start..fence_end));
+            }
+            i = fence_end;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Find the first balanced `{…}` JSON object in `text` that parses as an
+/// Interview.
+fn scan_bare_json(text: &str) -> Option<(Interview, std::ops::Range<usize>)> {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // Walk forward keeping balanced-brace state and tolerating
+            // quoted strings, then try to parse the resulting slice.
+            let mut depth: i32 = 0;
+            let mut in_str = false;
+            let mut escape = false;
+            let start = i;
+            let mut j = i;
+            while j < bytes.len() {
+                let b = bytes[j];
+                if in_str {
+                    if escape {
+                        escape = false;
+                    } else if b == b'\\' {
+                        escape = true;
+                    } else if b == b'"' {
+                        in_str = false;
+                    }
+                    j += 1;
+                    continue;
+                }
+                match b {
+                    b'"' => in_str = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let candidate = &text[start..=j];
+                            if let Some(iv) = try_parse_interview(candidate) {
+                                return Some((iv, start..j + 1));
+                            }
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            i = j.saturating_add(1);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Parse a JSON slice as an [`Interview`] and apply the "not accidental"
+/// validation rules — non-empty `title` + non-empty `fields` + at least
+/// one recognized field type.
+fn try_parse_interview(s: &str) -> Option<Interview> {
+    let iv: Interview = serde_json::from_str(s).ok()?;
+    if iv.title.trim().is_empty() {
+        return None;
+    }
+    if iv.fields.is_empty() {
+        return None;
+    }
+    // At least one interactive field (not just sections/info).
+    if !iv.fields.iter().any(|f| f.is_interactive()) {
+        return None;
+    }
+    Some(iv)
 }
 
 /// A short natural-language hint the host can inject into outgoing
@@ -678,17 +828,21 @@ pub fn strip_marker(text: &str) -> String {
 pub fn capability_hint() -> &'static str {
     concat!(
         "\n\n[rata-pi] When you need structured input from the user ",
-        "(multiple related questions), emit exactly one marker in your ",
-        "reply:\n",
-        "[[INTERVIEW: {\"title\":\"…\",\"fields\":[ … ]}]]\n",
-        "The UI renders a form; the user's answers arrive as a JSON ",
-        "<interview-response> block in their next message. Field types: ",
-        "`text` (+ optional `multiline`), `toggle`, `select` (radio), ",
-        "`multiselect` (checkboxes), `number` (with optional `min`/`max`), ",
-        "`section` (divider), `info` (note). Every interactive field must ",
-        "have `id` + `label`; use `required: true` to block empty submits ",
-        "and `default` to preseed. Prefer one interview over many `ask` ",
-        "round-trips when the questions are related.",
+        "(multiple related questions), emit ONE interview form in your ",
+        "reply. Preferred wrapper (renders cleanest):\n",
+        "  [[INTERVIEW: {\"title\":\"…\",\"fields\":[ … ]}]]\n",
+        "Also accepted (same JSON body): a ```json fenced block, or the ",
+        "bare JSON object on its own — the UI detects any of these.\n",
+        "When detected, a form modal opens; the user's answers arrive ",
+        "as a JSON <interview-response> block in their next message, ",
+        "and the raw JSON is stripped from your visible card.\n",
+        "Field types: `text` (+ optional `multiline`), `toggle`, ",
+        "`select` (radio), `multiselect` (checkboxes), `number` (with ",
+        "optional `min`/`max`), `section` (divider), `info` (note). ",
+        "Every interactive field must have `id` + `label`; use ",
+        "`required: true` to block empty submits and `default` to ",
+        "preseed. Prefer one interview over many `ask` round-trips when ",
+        "the questions are related.",
     )
 }
 
@@ -976,6 +1130,103 @@ mod tests {
             serde_json::json!(["router", "testing"])
         );
         assert_eq!(answers["port"], 5173.0);
+    }
+
+    // ── lenient detection (fenced + bare JSON fallbacks) ─────────────────
+
+    #[test]
+    fn detect_prefers_marker_when_present() {
+        let src = r#"lorem [[INTERVIEW: {"title":"M","fields":[
+            {"type":"text","id":"a","label":"A"}
+        ]}]] ipsum"#;
+        let (iv, _) = detect_interview(src).unwrap();
+        assert_eq!(iv.title, "M");
+    }
+
+    #[test]
+    fn detect_fenced_code_block() {
+        let src = r#"Here's the form:
+
+```json
+{
+  "title": "Setup",
+  "fields": [
+    { "type": "text", "id": "name", "label": "Name" }
+  ]
+}
+```
+
+Please fill it out."#;
+        let (iv, range) = detect_interview(src).expect("detects fenced");
+        assert_eq!(iv.title, "Setup");
+        // The range must include the entire fenced block so stripping
+        // removes the triple-backticks too.
+        assert!(src[range.start..range.end].starts_with("```"));
+        assert!(src[range.start..range.end].ends_with("```"));
+    }
+
+    #[test]
+    fn detect_fenced_block_any_language_tag() {
+        // `json-interview` or missing tag — both work.
+        let src = "blah\n```interview\n{\"title\":\"T\",\"fields\":[{\"type\":\"toggle\",\"id\":\"x\",\"label\":\"X\"}]}\n```\n";
+        let (iv, _) = detect_interview(src).expect("detects");
+        assert_eq!(iv.title, "T");
+    }
+
+    #[test]
+    fn detect_bare_json() {
+        let src = r#"Here's the form you need:
+
+{
+  "title": "Onboarding",
+  "fields": [
+    { "type": "text", "id": "email", "label": "Email", "required": true }
+  ]
+}
+
+End of message."#;
+        let (iv, range) = detect_interview(src).expect("detects bare json");
+        assert_eq!(iv.title, "Onboarding");
+        assert!(src[range.start..range.end].trim().starts_with('{'));
+        assert!(src[range.start..range.end].trim().ends_with('}'));
+    }
+
+    #[test]
+    fn detect_rejects_accidental_json() {
+        // Valid JSON object but not interview-shaped.
+        let src = r#"Config:
+```json
+{"foo": "bar", "baz": 1}
+```"#;
+        assert!(detect_interview(src).is_none());
+    }
+
+    #[test]
+    fn detect_rejects_empty_fields_list() {
+        let src = r#"```json
+{"title":"Empty","fields":[]}
+```"#;
+        assert!(detect_interview(src).is_none());
+    }
+
+    #[test]
+    fn detect_rejects_only_sections() {
+        // Has fields but none interactive — doesn't count as an interview.
+        let src = r#"```json
+{"title":"T","fields":[{"type":"section","title":"S"}]}
+```"#;
+        assert!(detect_interview(src).is_none());
+    }
+
+    #[test]
+    fn strip_range_collapses_newlines() {
+        let text = "before\n\n\n\nafter";
+        let out = strip_range(text, 6..8);
+        // The removed range leaves 2+ newlines which we collapse to 2 max,
+        // and surrounding whitespace is trimmed.
+        assert!(out.starts_with("before"));
+        assert!(out.ends_with("after"));
+        assert!(!out.contains("\n\n\n\n"));
     }
 
     #[test]

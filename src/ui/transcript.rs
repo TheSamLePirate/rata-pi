@@ -113,6 +113,24 @@ impl Transcript {
         }
     }
 
+    /// Rewrite the text of the most recent Assistant entry. If the
+    /// rewrite would leave it empty, the entry is removed. Used by the
+    /// interview detector to strip the raw form JSON from the visible
+    /// transcript after opening the modal.
+    pub fn rewrite_last_assistant(&mut self, new_text: String) {
+        if let Some(i) = self
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, Entry::Assistant(_)))
+        {
+            if new_text.trim().is_empty() {
+                self.entries.remove(i);
+            } else if let Entry::Assistant(s) = &mut self.entries[i] {
+                *s = new_text;
+            }
+        }
+    }
+
     /// Append a thinking delta. Thinking arrives before assistant text in a
     /// turn; if the tail is already a Thinking entry we extend it.
     pub fn append_thinking(&mut self, delta: &str) {
