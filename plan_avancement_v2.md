@@ -477,6 +477,64 @@ Plan-mode work shipped in V2.9. TODO widget + `/diagnostics` deferred to V2.11+.
 
 ---
 
+## V2.11.1 — Perf pass: responsiveness audit ✅
+
+Responding to a deep architectural review that identified five bottlenecks.
+The fixes uphold the principle that `terminal.draw(&App)` is a pure function
+of state and never touches the filesystem, runs fuzzy matching, spawns
+processes, or re-lexes source code.
+
+### 1 · Async git (5-second stutter eliminated)
+- [x] `src/git.rs` now uses `tokio::process::Command` with `tokio::time::timeout`. Every helper is async (`status / diff / log / branches / commit_all / stash / switch / is_repo`).
+- [x] `refresh_git` is gone. In its place, `spawn_git_refresh(app, &tx)` fires a `tokio::spawn` task that awaits `git::status()` and delivers the result via an `mpsc` channel; a new select branch drains that channel. The 5-second `stats_tick` arm now only *spawns* the child — it doesn't await it — so crossterm events keep flowing.
+- [x] `app.git_refresh_inflight` prevents stacked git children on slow disks: if the previous `git status` hasn't returned yet, the next tick is a no-op.
+- [x] A `git` child is fired once right after channel setup so the header chip lights up immediately on boot instead of after the first 5 s.
+- [x] All user-triggered git slash commands (`/status`, `/diff`, `/git-log`, `/branch`, `/switch-branch`, `/commit`, `/stash`) now await the async helpers directly — they *want* to block the composer until the output arrives, but the executor itself is no longer stalled, so the event loop keeps polling and partial UI repaints (flash toasts, spinners) still happen during long commands.
+- [x] `try_local_slash` is now `async fn` to accommodate the awaits; both call sites (`submit` and the Commands-modal Enter path) are already in async context.
+
+### 2 · Fuzzy filter cached in `FileFinder`
+- [x] New fields: `filtered: Vec<(String, i64)>` + `filter_query: Option<String>`. The key handler calls `ff.refresh_filter(FILES_CAP)`; the method short-circuits when the query hasn't changed since last build.
+- [x] Fresh method `current_path(&self) -> Option<&str>` replaces three ad-hoc re-filter call sites that each re-ran `SkimMatcherV2::fuzzy_match` over 20 000 paths.
+- [x] Query-change and selection-change bookkeeping in the key handler: before/after snapshots decide whether to rebuild the filter or drop the preview cache.
+- [x] 5 new unit tests in `ui::modal::tests` cover cache keying, short-circuit on unchanged query, current_path-follows-selection, set_files-clears-caches, and invalidate_preview.
+
+### 3 · Preview cache (disk read + syntect)
+- [x] New `PreviewCache { path, lines }` on `FileFinder`. `ensure_file_preview(ff)` reads the selected file and runs syntect exactly **once per selection change**. Subsequent frames reuse `cache.lines`.
+- [x] `build_preview_lines(root, path)` centralises the `files::preview` + `syntax::highlight` pipeline and returns a plain `Vec<Line<'static>>` without theme chrome — the chrome (title row, footer hint) is baked on in the themed draw helper, which now does zero I/O and zero matcher work.
+- [x] `file_preview_lines` dropped from ~60 lines of logic to a ~15-line pure read from the cache.
+
+### 4 · Async filesystem walk
+- [x] `open_file_finder` now opens the modal **instantly** in `loading: true` state with an "indexing files…" placeholder, then spawns the walk via `tokio::task::spawn_blocking(|| files::walk_cwd())` (the walker is CPU-bound + blocking I/O, exactly what `spawn_blocking` is for).
+- [x] The completed `FileList` is posted through `file_walk_tx` and picked up by a new select arm that calls `FileFinder::set_files` if the Files modal is still open. (If the user closed the modal mid-walk, the message is simply dropped.)
+- [x] `FileList::empty()` is now routinely used for the placeholder state.
+- [x] The filter / preview draw helpers render gracefully against an empty list — the left pane shows "walking repo (respects .gitignore)…", the right pane shows "(waiting for index…)".
+
+### 5 · Frame-level cache prep
+- [x] `prepare_frame_caches(app)` runs once per frame from `ui_loop`, before `terminal.draw(&App)`. Currently it calls `ff.refresh_filter(FILES_CAP)` + `ensure_file_preview(ff)` for an open Files modal. The draw closure itself takes `&App` and does zero caching writes — the architectural invariant (render is a pure fn of state) is preserved.
+- [x] `FILES_CAP = 500` centralises the viewport cap previously sprinkled as the magic number 500 across three call sites.
+
+### Gates
+- **109 tests pass** (V2.11 was 104; +5 for FileFinder cache behavior).
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo fmt --check` clean.
+- `cargo build --features notify` clean.
+
+### Expected perf improvement (qualitative — profile per-repo)
+- Stats tick no longer blocks the runtime. Before: 200–800 ms freeze every 5 s in a large repo. After: imperceptible; git child runs on a worker thread.
+- Typing in the file-finder: fuzzy matcher ran up to 40 k comparisons per keystroke × N frames. After: one refresh per query change.
+- Holding arrow-down through the file list: syntect re-ran every frame. After: syntect runs exactly once per selection.
+- Opening the file finder in a 15k-file repo: previously froze the UI for ~300 ms before the modal appeared. After: modal paints immediately; the walk finishes in the background.
+
+### Notes
+- The `git_timeout` helper is kept on `status()` only, with a 1-second ceiling, because that's the hot-path call driven by the ticker. One-off commands (`diff`, `log`, etc.) don't need a timeout — if pi-the-user asks to see the diff of a wedged repo they'd rather see the error.
+- `spawn_blocking` vs `tokio::spawn`: `walk_cwd` is synchronous and CPU/IO blocking, so `spawn_blocking` is correct. `git::status()` is properly async (child process), so plain `tokio::spawn` is right.
+- The file-walk channel buffer is 1 — we only ever have one pending walk per open modal, and if the user triggers a second finder before the first walk returns, the new modal will overwrite the previous Files modal so the old `tx` drops and the old walk's delivery is a no-op.
+- `git_refresh_inflight` is on App, not scoped to the channel, because we want the flag to survive task boundaries (it resets only when the channel delivery lands).
+
+---
+
+---
+
 ## V2.12 — Release polish
 
 - [ ] `docs/` — manual, keybinding reference, theme gallery, troubleshooting

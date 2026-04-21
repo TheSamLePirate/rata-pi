@@ -310,6 +310,15 @@ struct App {
 
     // ── V2.7: git status (refreshed on stats_tick) ───────────────────────
     git_status: Option<crate::git::GitStatus>,
+    /// V2.11.1 · a `git status` child is already in flight; skip spawning
+    /// another one until it resolves. Prevents stacking git processes on
+    /// slow disks.
+    git_refresh_inflight: bool,
+
+    /// V2.11.1 · sender half of the file-walk channel. Populated once in
+    /// `ui_loop`; `spawn_file_walk` clones it to deliver the completed
+    /// `FileList`.
+    file_walk_tx: Option<tokio::sync::mpsc::Sender<crate::files::FileList>>,
 
     // ── V2.10: vim mode toggle ──────────────────────────────────────────
     vim_enabled: bool,
@@ -368,6 +377,8 @@ impl App {
             turn_count: 0,
             last_sec_tick: 0,
             git_status: None,
+            git_refresh_inflight: false,
+            file_walk_tx: None,
             vim_enabled: false,
             plan: crate::plan::Plan::default(),
             pending_auto_prompt: None,
@@ -980,17 +991,79 @@ async fn bootstrap(client: &RpcClient, app: &mut App) {
             .collect();
     }
     refresh_stats(client, app).await;
-    refresh_git(app);
+    // Initial git status is fetched via the background task in `ui_loop`
+    // (spawn_git_refresh is fired once immediately after bootstrap).
 }
 
-/// Re-read git status on the low-rate ticker so the header chip is live.
-fn refresh_git(app: &mut App) {
-    let st = crate::git::status();
-    if st.is_repo {
-        app.git_status = Some(st);
-    } else {
-        app.git_status = None;
+/// Viewport cap for the file-finder fuzzy-filter list. Keeping this
+/// modest is a perf knob: even at 20k files, only the top 500 are scored
+/// AND materialised into a Vec — the rest are ignored by `filter`.
+const FILES_CAP: usize = 500;
+
+/// Populate modal caches that the draw closure relies on. Runs once per
+/// frame from the UI loop. The operations are idempotent — they short-
+/// circuit when the inputs haven't changed.
+fn prepare_frame_caches(app: &mut App) {
+    if let Some(Modal::Files(ff)) = app.modal.as_mut() {
+        ff.refresh_filter(FILES_CAP);
+        ensure_file_preview(ff);
     }
+}
+
+/// Build the right-pane preview cache for the currently selected file,
+/// IF it's missing or stale. Runs disk read + syntect ONCE per selection
+/// change — not once per frame.
+fn ensure_file_preview(ff: &mut crate::ui::modal::FileFinder) {
+    let Some(path) = ff.current_path().map(str::to_string) else {
+        ff.preview_cache = None;
+        return;
+    };
+    if ff.preview_cache.as_ref().is_some_and(|c| c.path == path) {
+        return;
+    }
+    let root = ff.files.root.clone();
+    let lines = build_preview_lines(&root, &path);
+    ff.preview_cache = Some(crate::ui::modal::PreviewCache { path, lines });
+}
+
+/// Pure function: read + highlight + assemble the preview rows. Produces
+/// plain `Line` data with no theme dependency for the syntect portion; the
+/// surrounding header/footer chrome is themed in `file_preview_lines` from
+/// the live app theme.
+fn build_preview_lines(root: &std::path::Path, path: &str) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    match crate::files::preview(root, path) {
+        Some((text, lang)) => {
+            let highlighted = crate::ui::syntax::highlight(&text, &lang);
+            if highlighted.is_empty() {
+                out.push(Line::from(Span::raw("(empty file)")));
+            } else {
+                out.extend(highlighted);
+            }
+        }
+        None => {
+            out.push(Line::from(Span::raw(
+                "(preview unavailable — binary or too large)",
+            )));
+        }
+    }
+    out
+}
+
+/// Fire `git status` in the background; the result arrives via the
+/// `git_rx` channel in the main loop. Fire-and-forget so the stats ticker
+/// never blocks event polling.
+fn spawn_git_refresh(app: &mut App, tx: &tokio::sync::mpsc::Sender<Option<crate::git::GitStatus>>) {
+    if app.git_refresh_inflight {
+        return;
+    }
+    app.git_refresh_inflight = true;
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let st = crate::git::status().await;
+        let result = if st.is_repo { Some(st) } else { None };
+        let _ = tx.send(result).await;
+    });
 }
 
 async fn refresh_stats(client: &RpcClient, app: &mut App) {
@@ -1094,6 +1167,20 @@ async fn ui_loop(
     let mut stats_tick = tokio::time::interval(Duration::from_secs(5));
     stats_tick.tick().await;
 
+    // V2.11.1 · git status runs in a background task and delivers results
+    // via this channel so the stats_tick branch never blocks. Buffer 4 is
+    // plenty — the latest result wins and older ones can be coalesced.
+    let (git_tx, mut git_rx) = tokio::sync::mpsc::channel::<Option<crate::git::GitStatus>>(4);
+    // Fire once on boot so the header chip lights up without waiting for
+    // the first 5-second tick.
+    spawn_git_refresh(app, &git_tx);
+
+    // V2.11.1 · file-walk channel: `spawn_file_walk` fires `walk_cwd()` on
+    // a blocking thread and delivers the `FileList` here. The select
+    // branch then pokes the active Files modal with `set_files`.
+    let (file_walk_tx, mut file_walk_rx) = tokio::sync::mpsc::channel::<crate::files::FileList>(1);
+    app.file_walk_tx = Some(file_walk_tx);
+
     // 30 fps soft cap on redraws. During heavy pi streaming we coalesce
     // bursts of events under a single render so the markdown / syntect /
     // virtualization work doesn't swamp the runtime.
@@ -1104,6 +1191,10 @@ async fn ui_loop(
 
     loop {
         if tokio::time::Instant::now().duration_since(last_draw) >= MIN_FRAME {
+            // V2.11.1 · Build modal caches once per frame so draw(&App)
+            // stays pure and the fuzzy matcher / file reader / syntect
+            // never fire inside the render closure.
+            prepare_frame_caches(app);
             terminal.draw(|f| draw(f, app))?;
             last_draw = tokio::time::Instant::now();
         }
@@ -1150,7 +1241,16 @@ async fn ui_loop(
             }
             _ = stats_tick.tick() => {
                 if let Some(c) = client { refresh_stats(c, app).await; }
-                refresh_git(app);
+                spawn_git_refresh(app, &git_tx);
+            }
+            Some(result) = git_rx.recv() => {
+                app.git_status = result;
+                app.git_refresh_inflight = false;
+            }
+            Some(list) = file_walk_rx.recv() => {
+                if let Some(Modal::Files(ff)) = app.modal.as_mut() {
+                    ff.set_files(list);
+                }
             }
         }
     }
@@ -1649,7 +1749,7 @@ async fn handle_modal_key(
                         .map(|b| b.name.clone());
                     app.modal = None;
                     if let Some(name) = pick {
-                        match crate::git::switch(&name) {
+                        match crate::git::switch(&name).await {
                             Ok(_) => app.flash(format!("switched to {name}")),
                             Err(e) => app.flash(format!("switch failed: {e}")),
                         }
@@ -1692,7 +1792,7 @@ async fn handle_modal_key(
                         } else {
                             app.modal = None;
                             let name = cmd.name.clone();
-                            if !try_local_slash(app, &name, "") {
+                            if !try_local_slash(app, &name, "").await {
                                 if let Some(c) = client {
                                     try_pi_slash(app, c, &name, "").await;
                                 } else {
@@ -1799,15 +1899,26 @@ async fn handle_modal_key(
             }
         }
         Modal::Files(ff) => {
-            let n = crate::files::filter(&ff.files.files, &ff.query, 500).len();
+            // V2.11.1 · use the cached filter + track selection changes
+            // so the fuzzy matcher never runs inside a key-press handler
+            // and the preview cache drops when the selection moves.
+            ff.refresh_filter(FILES_CAP);
+            let n = ff.filtered.len();
+            let prev_sel = ff.selected;
+            let prev_query = ff.query.clone();
             if handle_list_keys(&mut ff.query, &mut ff.selected, code, n) {
+                if ff.query != prev_query {
+                    ff.refresh_filter(FILES_CAP);
+                }
+                if ff.selected != prev_sel {
+                    ff.invalidate_preview();
+                }
                 return;
             }
             match code {
                 KeyCode::Esc => app.modal = None,
                 KeyCode::Enter => {
-                    let scored = crate::files::filter(&ff.files.files, &ff.query, 500);
-                    let Some((path, _)) = scored.get(ff.selected).cloned() else {
+                    let Some(path) = ff.current_path().map(str::to_string) else {
                         return;
                     };
                     let mode = ff.mode;
@@ -2227,15 +2338,36 @@ fn handle_plan_slash(app: &mut App, arg: &str) {
 }
 
 fn open_file_finder(app: &mut App, query: String, mode: crate::ui::modal::FilePickMode) {
-    let files = crate::files::walk_cwd();
-    app.modal = Some(Modal::Files(crate::ui::modal::FileFinder {
+    // V2.11.1 · opening the modal is instant. The walk runs on a blocking
+    // thread (see `spawn_file_walk`) and fills `files` asynchronously so
+    // large repos no longer freeze the UI for the 200-500 ms walk.
+    let ff = crate::ui::modal::FileFinder {
         title: "files".into(),
         hint: "type to filter · Enter inserts @path · Esc cancels".into(),
-        files,
+        files: crate::files::FileList::empty(),
         query,
         selected: 0,
         mode,
-    }));
+        loading: true,
+        filtered: Vec::new(),
+        filter_query: None,
+        preview_cache: None,
+    };
+    app.modal = Some(Modal::Files(ff));
+    spawn_file_walk(app);
+}
+
+/// Spawn the filesystem walk on a blocking thread and deliver the result
+/// via `app.file_walk_rx`. Caller is expected to have already set a
+/// `FileFinder` modal in `loading: true` state.
+fn spawn_file_walk(app: &mut App) {
+    let Some(tx) = app.file_walk_tx.clone() else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        let list = crate::files::walk_cwd();
+        let _ = tx.blocking_send(list);
+    });
 }
 
 /// Copy `text` to the clipboard, reporting outcome via the transient flash.
@@ -2293,7 +2425,7 @@ fn merged_commands(pi_commands: &[CommandInfo]) -> Vec<crate::ui::commands::Menu
 }
 
 /// Handle slash commands that do NOT need pi. Returns true if consumed.
-fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
+async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
     match name {
         "help" => {
             app.modal = Some(Modal::Help);
@@ -2391,13 +2523,13 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
         }
         // ── git (all local: we shell out to `git`) ───────────────────
         "status" => {
-            let st = crate::git::status();
+            let st = crate::git::status().await;
             app.modal = Some(Modal::GitStatus(Box::new(st)));
             true
         }
         "diff" => {
             let staged = arg.contains("--staged") || arg.contains("--cached");
-            match crate::git::diff(staged) {
+            match crate::git::diff(staged).await {
                 Ok(d) => {
                     app.modal = Some(Modal::Diff(crate::ui::modal::DiffView {
                         title: if staged {
@@ -2420,7 +2552,7 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
             } else {
                 arg.parse().unwrap_or(30)
             };
-            match crate::git::log(n) {
+            match crate::git::log(n).await {
                 Ok(commits) => {
                     app.modal = Some(Modal::GitLog(crate::ui::modal::GitLogState {
                         commits,
@@ -2432,7 +2564,7 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
             true
         }
         "branch" => {
-            match crate::git::branches() {
+            match crate::git::branches().await {
                 Ok(bs) => {
                     app.modal = Some(Modal::GitBranch(crate::ui::modal::GitBranchState {
                         branches: bs,
@@ -2448,7 +2580,7 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
             if arg.is_empty() {
                 app.flash("usage: /switch-branch <name>");
             } else {
-                match crate::git::switch(arg) {
+                match crate::git::switch(arg).await {
                     Ok(_) => app.flash(format!("switched to {arg}")),
                     Err(e) => app.flash(format!("switch failed: {e}")),
                 }
@@ -2459,7 +2591,7 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
             if arg.is_empty() {
                 app.flash("usage: /commit <message>");
             } else {
-                match crate::git::commit_all(arg) {
+                match crate::git::commit_all(arg).await {
                     Ok(o) => {
                         let head = o.lines().next().unwrap_or("committed");
                         app.flash(format!("commit: {head}"));
@@ -2470,7 +2602,7 @@ fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
             true
         }
         "stash" => {
-            match crate::git::stash() {
+            match crate::git::stash().await {
                 Ok(o) => app.flash(o.lines().next().unwrap_or("stashed").to_string()),
                 Err(e) => app.flash(format!("stash failed: {e}")),
             }
@@ -2797,7 +2929,7 @@ async fn submit(app: &mut App, client: Option<&RpcClient>) {
         let mut parts = rest.splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim();
-        if try_local_slash(app, name, arg) {
+        if try_local_slash(app, name, arg).await {
             return;
         }
         // Local didn't handle it — if pi is here, try pi-requiring ones.
@@ -4903,11 +5035,14 @@ fn file_finder_text(
     t: &Theme,
     list_width: u16,
 ) -> Text<'static> {
+    // Reads directly from `ff.filtered`, which `prepare_frame_caches`
+    // keeps in sync with the query. No matcher runs inside this function.
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let viewport_cap: usize = 500;
-    let scored = crate::files::filter(&ff.files.files, &ff.query, viewport_cap);
+    let scored = &ff.filtered;
 
-    let hint_bits = if ff.files.truncated {
+    let hint_bits = if ff.loading {
+        "   (indexing files…)".to_string()
+    } else if ff.files.truncated {
         format!(
             "   ({} / {}+ files truncated)",
             scored.len(),
@@ -4926,6 +5061,14 @@ fn file_finder_text(
         Span::styled(hint_bits, Style::default().fg(t.dim)),
     ]));
     lines.push(Line::default());
+
+    if ff.loading && scored.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "walking repo (respects .gitignore)…",
+            Style::default().fg(t.dim),
+        )));
+        return Text::from(lines);
+    }
 
     if scored.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -4966,46 +5109,28 @@ fn file_finder_text(
 }
 
 /// Right-pane preview of the selected file: first ~40 lines, syntect-
-/// highlighted by extension.
+/// highlighted by extension. Reads purely from `ff.preview_cache`, which
+/// `prepare_frame_caches` populates on selection changes. The file system
+/// is NOT touched inside this function.
 fn file_preview_lines(ff: &crate::ui::modal::FileFinder, t: &Theme) -> Vec<Line<'static>> {
-    let scored = crate::files::filter(&ff.files.files, &ff.query, 500);
-    let Some((path, _)) = scored.get(ff.selected) else {
-        return vec![Line::from(Span::styled(
-            "(no selection)",
-            Style::default().fg(t.dim),
-        ))];
+    let Some(cache) = ff.preview_cache.as_ref() else {
+        let msg = if ff.loading {
+            "(waiting for index…)"
+        } else {
+            "(no selection)"
+        };
+        return vec![Line::from(Span::styled(msg, Style::default().fg(t.dim)))];
     };
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("  ▤ ", Style::default().fg(t.accent)),
         Span::styled(
-            path.clone(),
+            cache.path.clone(),
             Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::default());
-
-    match crate::files::preview(&ff.files.root, path) {
-        Some((text, lang)) => {
-            let highlighted = crate::ui::syntax::highlight(&text, &lang);
-            if highlighted.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "(empty file)",
-                    Style::default().fg(t.dim),
-                )));
-            } else {
-                for l in highlighted {
-                    lines.push(l);
-                }
-            }
-        }
-        None => {
-            lines.push(Line::from(Span::styled(
-                "(preview unavailable — binary or too large)",
-                Style::default().fg(t.dim),
-            )));
-        }
-    }
+    lines.extend(cache.lines.iter().cloned());
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         "  Enter inserts @path · Esc closes",

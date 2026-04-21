@@ -6,6 +6,7 @@
 //! instructing the app whether to close, keep, or fire an RPC as the result.
 
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 
 use crate::files::FileList;
 use crate::git::{Branch, Commit, GitStatus};
@@ -16,6 +17,12 @@ use crate::ui::commands::MenuItem;
 /// Fuzzy file finder state. The `files` list is captured at modal-open
 /// time; `query` is typed live; `selected` indexes into the fuzzy-filtered
 /// subset.
+///
+/// V2.11.1 caches both the filtered path list and the rendered preview so
+/// neither the fuzzy matcher nor syntect runs in the draw closure. The
+/// caches are keyed on the inputs that can invalidate them (query string
+/// for the filter; selected index + active query for the preview) and are
+/// invalidated eagerly in the key handler.
 #[derive(Debug)]
 pub struct FileFinder {
     pub title: String,
@@ -23,9 +30,27 @@ pub struct FileFinder {
     pub files: FileList,
     pub query: String,
     pub selected: usize,
-    /// Where to put the picked path: into the composer verbatim, or as a
-    /// `@path` replacement token inside the existing composer text.
     pub mode: FilePickMode,
+    /// V2.11.1 · background walk has not finished yet; the modal shows a
+    /// "indexing files…" placeholder until the FileList arrives.
+    pub loading: bool,
+    /// V2.11.1 · cached fuzzy-filtered list — a snapshot of `filter(files,
+    /// query, cap)`. Rebuilt in `refresh_filter` whenever the query string
+    /// or the underlying file list changes.
+    pub filtered: Vec<(String, i64)>,
+    /// V2.11.1 · the query the `filtered` cache was built against. `None`
+    /// means the cache is empty and must be rebuilt on next access.
+    pub filter_query: Option<String>,
+    /// V2.11.1 · cached highlighted preview for the `selected` path. The
+    /// `Vec<Line<'static>>` is produced once (file read + syntect) and
+    /// reused every frame until the selection moves.
+    pub preview_cache: Option<PreviewCache>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewCache {
+    pub path: String,
+    pub lines: Vec<Line<'static>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +59,44 @@ pub enum FilePickMode {
     Insert,
     /// Replace the final `@<incomplete>` token with `@<path>`.
     AtToken,
+}
+
+impl FileFinder {
+    /// Rebuild the filtered list when the query or the underlying list
+    /// changes. Cheap if nothing moved (the keys match and we short-circuit).
+    pub fn refresh_filter(&mut self, cap: usize) {
+        let needs = !matches!(&self.filter_query, Some(q) if q == &self.query);
+        if !needs {
+            return;
+        }
+        self.filtered = crate::files::filter(&self.files.files, &self.query, cap);
+        self.filter_query = Some(self.query.clone());
+        // Clamp selection — a fresh filter may have shrunk the list.
+        if self.selected >= self.filtered.len() {
+            self.selected = self.filtered.len().saturating_sub(1);
+        }
+        // Selection's content probably changed; drop the preview cache.
+        self.preview_cache = None;
+    }
+
+    /// The path currently selected in the cached list, if any.
+    pub fn current_path(&self) -> Option<&str> {
+        self.filtered.get(self.selected).map(|(p, _)| p.as_str())
+    }
+
+    /// Invalidate the preview cache — called when the selection moves.
+    pub fn invalidate_preview(&mut self) {
+        self.preview_cache = None;
+    }
+
+    /// Swap in a freshly-walked file list (from the background `walk_cwd`).
+    pub fn set_files(&mut self, files: FileList) {
+        self.files = files;
+        self.loading = false;
+        self.filter_query = None;
+        self.filtered.clear();
+        self.preview_cache = None;
+    }
 }
 
 #[derive(Debug)]
@@ -215,4 +278,91 @@ pub fn matches_query(haystack: &str, query: &str) -> bool {
         return true;
     }
     haystack.to_lowercase().contains(&query.to_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::files::FileList;
+    use std::path::PathBuf;
+
+    fn finder_with(files: Vec<&str>) -> FileFinder {
+        FileFinder {
+            title: "t".into(),
+            hint: "h".into(),
+            files: FileList {
+                root: PathBuf::from("."),
+                files: files.into_iter().map(|s| s.to_string()).collect(),
+                truncated: false,
+            },
+            query: String::new(),
+            selected: 0,
+            mode: FilePickMode::Insert,
+            loading: false,
+            filtered: Vec::new(),
+            filter_query: None,
+            preview_cache: None,
+        }
+    }
+
+    #[test]
+    fn refresh_filter_caches_by_query() {
+        let mut ff = finder_with(vec!["a.rs", "b.rs", "c.rs"]);
+        ff.refresh_filter(10);
+        assert_eq!(ff.filter_query.as_deref(), Some(""));
+        assert_eq!(ff.filtered.len(), 3);
+
+        // Changing the query rebuilds.
+        ff.query = "b".into();
+        ff.refresh_filter(10);
+        assert_eq!(ff.filter_query.as_deref(), Some("b"));
+        assert!(ff.filtered.iter().any(|(p, _)| p == "b.rs"));
+    }
+
+    #[test]
+    fn refresh_filter_short_circuits_when_query_unchanged() {
+        let mut ff = finder_with(vec!["a.rs"]);
+        ff.refresh_filter(10);
+        let first = ff.filtered.clone();
+        ff.refresh_filter(10);
+        assert_eq!(first, ff.filtered);
+    }
+
+    #[test]
+    fn current_path_follows_selection() {
+        let mut ff = finder_with(vec!["a.rs", "b.rs"]);
+        ff.refresh_filter(10);
+        ff.selected = 1;
+        assert_eq!(ff.current_path(), Some("b.rs"));
+    }
+
+    #[test]
+    fn set_files_clears_caches() {
+        let mut ff = finder_with(vec!["a.rs"]);
+        ff.refresh_filter(10);
+        ff.preview_cache = Some(PreviewCache {
+            path: "a.rs".into(),
+            lines: vec![],
+        });
+        ff.set_files(FileList {
+            root: PathBuf::from("."),
+            files: vec!["x.rs".into()],
+            truncated: false,
+        });
+        assert!(ff.filter_query.is_none());
+        assert!(ff.filtered.is_empty());
+        assert!(ff.preview_cache.is_none());
+        assert!(!ff.loading);
+    }
+
+    #[test]
+    fn invalidate_preview_drops_cache() {
+        let mut ff = finder_with(vec!["a.rs"]);
+        ff.preview_cache = Some(PreviewCache {
+            path: "a.rs".into(),
+            lines: vec![],
+        });
+        ff.invalidate_preview();
+        assert!(ff.preview_cache.is_none());
+    }
 }

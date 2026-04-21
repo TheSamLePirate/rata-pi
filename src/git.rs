@@ -1,12 +1,13 @@
-//! Thin wrapper over the `git` binary. All calls are synchronous but fast —
-//! the caller decides whether to invoke them off a user gesture (modal open)
-//! or on a low-rate timer (header chip refresh).
+//! Thin wrapper over the `git` binary. Every call is async so the TUI tick
+//! loop can await without blocking the Tokio executor.
 //!
 //! We intentionally skip `git2` (libgit2): shell-out is smaller, has no C
 //! dependency, and `git` is on every dev machine.
 
-use std::process::Command;
 use std::time::Duration;
+
+use tokio::process::Command;
+use tokio::time::timeout;
 
 #[derive(Debug, Clone, Default)]
 pub struct GitStatus {
@@ -39,48 +40,50 @@ pub struct Branch {
     pub current: bool,
 }
 
-/// Run `git` with args, return stdout on success.
-fn git(args: &[&str]) -> Result<String, String> {
-    match Command::new("git").args(args).output() {
-        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).to_string()),
-        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
-        Err(e) => Err(e.to_string()),
+/// Run `git` with args, return stdout on success. Purely async — `git`
+/// runs as a child via tokio's process module.
+async fn git(args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 }
 
-/// Run `git` with args but give up after `timeout` (kept small for the
-/// refresh path so a wedged repo can't freeze the UI tick).
-fn git_timeout(args: &[&str], timeout: Duration) -> Result<String, String> {
-    use std::sync::mpsc;
-    use std::thread;
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let r = git(&args.iter().map(String::as_str).collect::<Vec<_>>());
-        let _ = tx.send(r);
-    });
-    rx.recv_timeout(timeout)
-        .map_err(|_| "git timed out".to_string())
-        .and_then(|r| r)
+/// Run `git` with a wall-clock ceiling. Used on the hot path (refresh ticker)
+/// where a wedged repo would otherwise stall the UI.
+async fn git_timeout(args: &[&str], dur: Duration) -> Result<String, String> {
+    match timeout(dur, git(args)).await {
+        Ok(r) => r,
+        Err(_) => Err("git timed out".into()),
+    }
 }
 
-#[allow(dead_code)] // exposed for future callers / tests
-pub fn is_repo() -> bool {
+#[allow(dead_code)]
+pub async fn is_repo() -> bool {
     git_timeout(
         &["rev-parse", "--is-inside-work-tree"],
         Duration::from_millis(500),
     )
+    .await
     .map(|s| s.trim() == "true")
     .unwrap_or(false)
 }
 
 /// Read a lightweight status summary. Uses `git status --porcelain=v2 --branch`.
-pub fn status() -> GitStatus {
+pub async fn status() -> GitStatus {
     let mut st = GitStatus::default();
     let out = match git_timeout(
         &["status", "--porcelain=v2", "--branch"],
         Duration::from_millis(1000),
-    ) {
+    )
+    .await
+    {
         Ok(o) => o,
         Err(_) => return st,
     };
@@ -92,7 +95,6 @@ pub fn status() -> GitStatus {
                 st.branch = Some(rest.to_string());
             }
         } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
-            // "+<ahead> -<behind>"
             for part in rest.split_whitespace() {
                 if let Some(n) = part.strip_prefix('+') {
                     st.ahead = n.parse().unwrap_or(0);
@@ -101,7 +103,6 @@ pub fn status() -> GitStatus {
                 }
             }
         } else if let Some(stripped) = line.strip_prefix("1 ") {
-            // Ordinary changed entry: `1 XY <...>`.
             classify_file_entry(&mut st, stripped);
         } else if let Some(stripped) = line.strip_prefix("2 ") {
             classify_file_entry(&mut st, stripped);
@@ -113,7 +114,6 @@ pub fn status() -> GitStatus {
 }
 
 fn classify_file_entry(st: &mut GitStatus, rest: &str) {
-    // First two chars are XY — X is index (staged), Y is worktree (unstaged).
     let xy = rest.as_bytes();
     if xy.len() < 2 {
         return;
@@ -127,19 +127,18 @@ fn classify_file_entry(st: &mut GitStatus, rest: &str) {
     }
 }
 
-/// `git diff` or `git diff --cached`.
-pub fn diff(staged: bool) -> Result<String, String> {
+pub async fn diff(staged: bool) -> Result<String, String> {
     let mut args = vec!["--no-pager", "diff", "--no-color"];
     if staged {
         args.push("--cached");
     }
-    git(&args)
+    git(&args).await
 }
 
-pub fn log(n: u32) -> Result<Vec<Commit>, String> {
+pub async fn log(n: u32) -> Result<Vec<Commit>, String> {
     let n_str = n.to_string();
-    // Use ISO-like date + compact author via pretty format. Field separator
-    // is the ASCII unit separator 0x1F so message bodies can't break it.
+    // Field separator is the ASCII unit separator 0x1F so message bodies
+    // can't break it.
     let fmt = "%h\x1f%an\x1f%ar\x1f%s";
     let out = git(&[
         "--no-pager",
@@ -148,7 +147,8 @@ pub fn log(n: u32) -> Result<Vec<Commit>, String> {
         &n_str,
         "--pretty=format:",
         &format!("--pretty=format:{fmt}"),
-    ])?;
+    ])
+    .await?;
     let mut commits = Vec::new();
     for line in out.lines() {
         let parts: Vec<&str> = line.split('\x1f').collect();
@@ -164,12 +164,13 @@ pub fn log(n: u32) -> Result<Vec<Commit>, String> {
     Ok(commits)
 }
 
-pub fn branches() -> Result<Vec<Branch>, String> {
+pub async fn branches() -> Result<Vec<Branch>, String> {
     let out = git(&[
         "for-each-ref",
         "--format=%(HEAD) %(refname:short)",
         "refs/heads/",
-    ])?;
+    ])
+    .await?;
     let mut list = Vec::new();
     for line in out.lines() {
         let line = line.trim_end();
@@ -182,16 +183,16 @@ pub fn branches() -> Result<Vec<Branch>, String> {
     Ok(list)
 }
 
-pub fn commit_all(msg: &str) -> Result<String, String> {
-    git(&["commit", "-a", "-m", msg])
+pub async fn commit_all(msg: &str) -> Result<String, String> {
+    git(&["commit", "-a", "-m", msg]).await
 }
 
-pub fn stash() -> Result<String, String> {
-    git(&["stash", "push"])
+pub async fn stash() -> Result<String, String> {
+    git(&["stash", "push"]).await
 }
 
-pub fn switch(name: &str) -> Result<String, String> {
-    git(&["switch", name])
+pub async fn switch(name: &str) -> Result<String, String> {
+    git(&["switch", name]).await
 }
 
 #[cfg(test)]
@@ -200,8 +201,6 @@ mod tests {
 
     #[test]
     fn classify_staged_and_unstaged() {
-        // Porcelain v2 entry: after stripping the "1 " / "2 " prefix, the
-        // two leading chars ARE the XY status code (no space between).
         let mut s = GitStatus::default();
         classify_file_entry(&mut s, "MM N... 100644 100644 100644 <h1> <h2> path");
         assert_eq!(s.staged, 1);
