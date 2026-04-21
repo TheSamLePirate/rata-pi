@@ -34,6 +34,7 @@ pub const TOKYO_NIGHT: Theme = Theme {
     gauge_low: rgb(0x9e, 0xce, 0x6a),
     gauge_mid: rgb(0xe0, 0xaf, 0x68),
     gauge_high: rgb(0xf7, 0x76, 0x8e),
+    syntect_name: "base16-ocean.dark",
 };
 
 // ──────────────────────────────────────────────────────── dracula ──
@@ -62,6 +63,7 @@ pub const DRACULA: Theme = Theme {
     gauge_low: rgb(0x50, 0xfa, 0x7b),
     gauge_mid: rgb(0xff, 0xb8, 0x6c),
     gauge_high: rgb(0xff, 0x55, 0x55),
+    syntect_name: "base16-eighties.dark",
 };
 
 // ─────────────────────────────────────────────── solarized-dark ──
@@ -90,6 +92,7 @@ pub const SOLARIZED_DARK: Theme = Theme {
     gauge_low: rgb(0x85, 0x99, 0x00),
     gauge_mid: rgb(0xb5, 0x89, 0x00),
     gauge_high: rgb(0xdc, 0x32, 0x2f),
+    syntect_name: "Solarized (dark)",
 };
 
 // ───────────────────────────────────────────── catppuccin-mocha ──
@@ -118,6 +121,7 @@ pub const CATPPUCCIN_MOCHA: Theme = Theme {
     gauge_low: rgb(0xa6, 0xe3, 0xa1),
     gauge_mid: rgb(0xfa, 0xb3, 0x87),
     gauge_high: rgb(0xf3, 0x8b, 0xa8),
+    syntect_name: "base16-mocha.dark",
 };
 
 // ───────────────────────────────────────────────── gruvbox-dark ──
@@ -146,6 +150,7 @@ pub const GRUVBOX_DARK: Theme = Theme {
     gauge_low: rgb(0xb8, 0xbb, 0x26),
     gauge_mid: rgb(0xfa, 0xbd, 0x2f),
     gauge_high: rgb(0xfb, 0x49, 0x34),
+    syntect_name: "base16-eighties.dark",
 };
 
 // ──────────────────────────────────────────────────────────── nord ──
@@ -174,6 +179,7 @@ pub const NORD: Theme = Theme {
     gauge_low: rgb(0xa3, 0xbe, 0x8c),
     gauge_mid: rgb(0xeb, 0xcb, 0x8b),
     gauge_high: rgb(0xbf, 0x61, 0x6a),
+    syntect_name: "base16-ocean.dark",
 };
 
 /// Cycle order.

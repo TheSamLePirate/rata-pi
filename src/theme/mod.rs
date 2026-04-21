@@ -48,6 +48,13 @@ pub struct Theme {
     pub gauge_low: Color,
     pub gauge_mid: Color,
     pub gauge_high: Color,
+
+    /// V3.g.1 · name of the syntect palette to use for fenced-code
+    /// highlighting. Must resolve via `ThemeSet::load_defaults().themes`.
+    /// Current bundled palette names: `base16-ocean.dark`,
+    /// `base16-eighties.dark`, `base16-mocha.dark`, `base16-ocean.light`,
+    /// `InspiredGitHub`, `Solarized (dark)`, `Solarized (light)`.
+    pub syntect_name: &'static str,
 }
 
 /// The list of built-in themes in cycle order.

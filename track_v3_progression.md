@@ -165,21 +165,23 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 ---
 
-## V3.g — Theme + docs
+## V3.g — Theme + docs ✅
 
-- [ ] `src/ui/markdown.rs` takes `&Theme`; no hardcoded `Color::X` outside mapping tables
-- [ ] `src/ui/syntax.rs` — per-theme syntect palette via `theme.syntect_name`
-- [ ] `Theme` struct gains `syntect_name: &'static str`
-- [ ] README refreshed (what / how to run / features / pi dep / links)
-- [ ] USER_GUIDE — Plan approval section added
-- [ ] USER_GUIDE — /settings `show raw markers` row documented
-- [ ] USER_GUIDE — heartbeat-color legend added
-- [ ] USER_GUIDE — marker visibility policy restated
-- [ ] Tests:
-  - [ ] swapping theme changes markdown rendered spans
-  - [ ] syntax palette selection per theme
+- [x] `Theme` struct gains `syntect_name: &'static str`; each of the 6 built-ins picks a palette (tokyo-night → ocean.dark · dracula → eighties.dark · solarized-dark → Solarized (dark) · catppuccin-mocha → mocha.dark · gruvbox-dark → eighties.dark · nord → ocean.dark)
+- [x] `src/ui/syntax.rs` — `highlight(code, lang, theme)` takes `&Theme`; per-name palette cache via OnceLock<Mutex<HashMap>>; unknown palette names fall back to `base16-ocean.dark`
+- [x] `src/ui/markdown.rs` — `render(md, theme)` takes `&Theme`; every previously-hardcoded `Color::DarkGray / Cyan / Blue / Yellow / Magenta / Green` now goes through the semantic slot (dim / accent / accent_strong / warning / success / muted)
+- [x] All call sites migrated: `files::preview` cache, `build_one_visual` (assistant markdown), tool card body (file content highlight), `diff_body_line`, diff widget's `highlight_body`
+- [x] README refreshed (what / how to run / features / pi dep / links)
+- [x] USER_GUIDE — Plan approval section rewritten (authority rule, Review modal, Edit sub-mode, text-entry sub-mode, amendment merge semantics, marker visibility)
+- [x] USER_GUIDE — /settings `show raw markers` row documented
+- [x] USER_GUIDE — heartbeat-color legend added to "Status widget and header"
+- [x] USER_GUIDE — Tab / Shift+Tab added to /settings keyboard table; cycle-row arrow distinction documented
+- [x] Tests:
+  - [x] `heading_color_tracks_theme_accent` — swapping theme changes markdown span fg
+  - [x] `different_themes_produce_different_palettes` — per-theme syntect palette selection
+  - [x] `unknown_palette_falls_back_gracefully` — missing palette doesn't crash
 
-**Shipped as** ``
+**Shipped as** `<tbd>`
 
 ---
 
@@ -233,21 +235,22 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
 
 | | V2.13 | V3.a | V3.b | V3.c | V3.d | V3.e | V3.f | V3.g | V3.h | V3.i | V3.j |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| Tests | 194 | 197 | 203 | 203 | 203 | 207 | **220** | | ≥ 220 | | |
-| `src/app/mod.rs` LoC | 8 266 | 8 311 | 8 348 | 8 348 | 6 132 | 6 204 | 6 769 | | | | |
-| Modules under `src/app/` | 3 | 3 | 3 | 3 | 8 | 8 | 8 | | | | |
-| Agent plans require user accept | no | no | no | no | no | no | **yes** | | | | |
-| Plan markers visible in transcript | yes | yes | yes | yes | yes | yes | **no** (default) | | | | |
-| Flash color-coded by kind | no | no | no | no | no | yes | yes | | | | |
-| Release binary (MiB) | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | | | | |
-| Hardcoded `Color::X` in markdown/syntax | many | many | many | many | many | many | many | | | | |
-| CI test OS count | 2 | 2 | 2 | 3 | 3 | 3 | 3 | | | | |
-| CI jobs total | 4 | 4 | 4 | 6 | 6 | 6 | 6 | | | | |
-| Clippy `-D warnings` enforced in CI | no | no | no | yes | yes | yes | yes | | | | |
-| Per-frame I/O in /settings | 3+ | 3+ | 0 | 0 | 0 | 0 | 0 | | | | |
-| Per-frame transcript hash walk | O(n) | O(n) | O(1) idle | O(1) idle | O(1) idle | O(1) idle | O(1) idle | | | | |
-| Clippy clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | | | |
-| Fmt clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | | | |
+| Tests | 194 | 197 | 203 | 203 | 203 | 207 | 220 | **223** | ≥ 220 | | |
+| `src/app/mod.rs` LoC | 8 266 | 8 311 | 8 348 | 8 348 | 6 132 | 6 204 | 6 769 | 6 772 | | | |
+| Modules under `src/app/` | 3 | 3 | 3 | 3 | 8 | 8 | 8 | 8 | | | |
+| Agent plans require user accept | no | no | no | no | no | no | yes | yes | | | |
+| Plan markers visible in transcript | yes | yes | yes | yes | yes | yes | no (default) | no (default) | | | |
+| Markdown / syntax theme-aware | no | no | no | no | no | no | no | **yes** | | | |
+| Flash color-coded by kind | no | no | no | no | no | yes | yes | yes | | | |
+| Release binary (MiB) | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | 5.3 | | | |
+| Hardcoded `Color::X` in markdown/syntax | many | many | many | many | many | many | many | **0** | | | |
+| CI test OS count | 2 | 2 | 2 | 3 | 3 | 3 | 3 | 3 | | | |
+| CI jobs total | 4 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | | | |
+| Clippy `-D warnings` enforced in CI | no | no | no | yes | yes | yes | yes | yes | | | |
+| Per-frame I/O in /settings | 3+ | 3+ | 0 | 0 | 0 | 0 | 0 | 0 | | | |
+| Per-frame transcript hash walk | O(n) | O(n) | O(1) idle | O(1) idle | O(1) idle | O(1) idle | O(1) idle | O(1) idle | | | |
+| Clippy clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | | |
+| Fmt clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | | |
 
 ---
 

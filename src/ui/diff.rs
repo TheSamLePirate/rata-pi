@@ -92,7 +92,7 @@ pub fn render(diff: &str, t: &Theme) -> Vec<Line<'static>> {
             "·".into()
         };
 
-        let body_spans = highlight_body(body, &lang, text_style);
+        let body_spans = highlight_body(body, &lang, text_style, t);
         let mut spans = vec![
             Span::styled(format!(" {ln_left:>4} "), Style::default().fg(t.dim)),
             Span::styled(format!("{ln_right:>4} "), Style::default().fg(t.dim)),
@@ -114,14 +114,14 @@ pub fn render(diff: &str, t: &Theme) -> Vec<Line<'static>> {
     out
 }
 
-fn highlight_body(body: &str, lang: &str, fallback: Style) -> Vec<Span<'static>> {
+fn highlight_body(body: &str, lang: &str, fallback: Style, theme: &Theme) -> Vec<Span<'static>> {
     if body.is_empty() {
         return vec![Span::raw("")];
     }
     if lang.is_empty() {
         return vec![Span::styled(body.to_string(), fallback)];
     }
-    let highlighted = crate::ui::syntax::highlight(body, lang);
+    let highlighted = crate::ui::syntax::highlight(body, lang, theme);
     match highlighted.into_iter().next() {
         Some(line) if !line.spans.is_empty() => line.spans,
         _ => vec![Span::styled(body.to_string(), fallback)],

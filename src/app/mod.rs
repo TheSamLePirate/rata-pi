@@ -1042,9 +1042,10 @@ const FILES_CAP: usize = 500;
 /// 1 scrollbar column). The body always spans full terminal width so
 /// this math is exact.
 fn prepare_frame_caches(app: &mut App, terminal_size: ratatui::layout::Size) {
+    let theme = app.theme;
     if let Some(Modal::Files(ff)) = app.modal.as_mut() {
         ff.refresh_filter(FILES_CAP);
-        ensure_file_preview(ff);
+        ensure_file_preview(ff, &theme);
     }
     let content_w = terminal_size.width.saturating_sub(3);
     update_visuals_cache(app, content_w);
@@ -1053,7 +1054,7 @@ fn prepare_frame_caches(app: &mut App, terminal_size: ratatui::layout::Size) {
 /// Build the right-pane preview cache for the currently selected file,
 /// IF it's missing or stale. Runs disk read + syntect ONCE per selection
 /// change — not once per frame.
-fn ensure_file_preview(ff: &mut crate::ui::modal::FileFinder) {
+fn ensure_file_preview(ff: &mut crate::ui::modal::FileFinder, theme: &Theme) {
     let Some(path) = ff.current_path().map(str::to_string) else {
         ff.preview_cache = None;
         return;
@@ -1062,19 +1063,18 @@ fn ensure_file_preview(ff: &mut crate::ui::modal::FileFinder) {
         return;
     }
     let root = ff.files.root.clone();
-    let lines = build_preview_lines(&root, &path);
+    let lines = build_preview_lines(&root, &path, theme);
     ff.preview_cache = Some(crate::ui::modal::PreviewCache { path, lines });
 }
 
-/// Pure function: read + highlight + assemble the preview rows. Produces
-/// plain `Line` data with no theme dependency for the syntect portion; the
-/// surrounding header/footer chrome is themed in `file_preview_lines` from
-/// the live app theme.
-fn build_preview_lines(root: &std::path::Path, path: &str) -> Vec<Line<'static>> {
+/// Pure function: read + highlight + assemble the preview rows. V3.g.1 ·
+/// the syntect pass now takes the active theme so fenced-code colouring
+/// matches the selected palette.
+fn build_preview_lines(root: &std::path::Path, path: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     match crate::files::preview(root, path) {
         Some((text, lang)) => {
-            let highlighted = crate::ui::syntax::highlight(&text, &lang);
+            let highlighted = crate::ui::syntax::highlight(&text, &lang, theme);
             if highlighted.is_empty() {
                 out.push(Line::from(Span::raw("(empty file)")));
             } else {
@@ -3024,7 +3024,7 @@ fn build_one_visual(entry: &Entry, app: &App, is_live_tail: bool) -> Visual {
             }
         }
         Entry::Assistant(md) => {
-            let mut body = markdown::render(md);
+            let mut body = markdown::render(md, t);
             if is_live_tail {
                 let cursor_on = (app.ticks / 5).is_multiple_of(2);
                 let cursor_span = Span::styled(
@@ -3328,7 +3328,7 @@ fn build_read_body(tc: &ToolCall, t: &Theme) -> Vec<Line<'static>> {
             .to_string();
         body.push(Line::default());
         let content = strip_line_numbers(&output);
-        for l in crate::ui::syntax::highlight(&content, &lang)
+        for l in crate::ui::syntax::highlight(&content, &lang, t)
             .into_iter()
             .take(400)
         {
@@ -3413,7 +3413,10 @@ fn build_write_body(tc: &ToolCall, t: &Theme) -> Vec<Line<'static>> {
             .to_string();
         body.push(Line::default());
         let max = if tc.expanded { 400 } else { 6 };
-        for l in crate::ui::syntax::highlight(c, &lang).into_iter().take(max) {
+        for l in crate::ui::syntax::highlight(c, &lang, t)
+            .into_iter()
+            .take(max)
+        {
             body.push(l);
         }
         if !tc.expanded && c.lines().count() > 6 {
@@ -3522,7 +3525,7 @@ fn diff_body_line(prefix: &str, text: &str, lang: &str, color: Color, t: &Theme)
     let spans = if lang.is_empty() {
         vec![Span::styled(text.to_string(), Style::default().fg(color))]
     } else {
-        crate::ui::syntax::highlight(text, lang)
+        crate::ui::syntax::highlight(text, lang, t)
             .into_iter()
             .next()
             .map(|l| l.spans)

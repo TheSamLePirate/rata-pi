@@ -516,7 +516,7 @@ When a pi extension calls `ext_ui_select`, `ext_ui_confirm`, `ext_ui_input`, or 
 | **Session** | Info | session name · connection status · pi binary path |
 | **Model** | Cycle | active model · thinking level · steering mode · follow-up mode |
 | **Behavior** | Toggle | show thinking · notifications · auto-compaction · auto-retry · plan auto-run |
-| **Appearance** | Cycle / Toggle | theme · vim mode |
+| **Appearance** | Cycle / Toggle | theme · vim mode · show raw markers |
 | **Live state** | Info | live label + elapsed · turn · tools running/done · queue sizes · context window usage · session cost |
 | **Capabilities** | Info | terminal kind · Kitty keyboard · graphics · clipboard backend · `notify` feature |
 | **Paths** | Info | history file · crash-dump directory |
@@ -526,20 +526,24 @@ When a pi extension calls `ext_ui_select`, `ext_ui_confirm`, `ext_ui_input`, or 
 
 * **Info** rows are read-only (most of the "state" rows). `↑ ↓` steps past them to the next interactive row.
 * **Toggle** rows show `[x] yes` / `[ ] no`. `Enter` / `Space` flips them. Toggles that also need pi notified (auto-compaction / auto-retry) fire the corresponding RPC in the background.
-* **Cycle** rows show `◂ current ▸`. `Enter` / `Space` / `→` advances to the next value, `←` steps back (currently aliased to forward for theme/model because pi's RPC doesn't expose a reverse endpoint).
+* **Cycle** rows show `◂ current ▸` for truly bidirectional cycles (theme) and just `▸` for pi-backed cycles that don't have a `previous_*` RPC (model, thinking level, steering mode, follow-up mode). `Enter` / `Space` / `→` advances; `←` on single-direction rows is a no-op.
+
+### `show raw markers` (Appearance)
+
+Default is **off** — plan markers (`[[PLAN_SET: …]]`, `[[STEP_DONE]]`, `[[PLAN_ADD: …]]`, `[[STEP_FAILED: …]]`) are stripped from the visible assistant transcript once rata-pi has parsed them. The semantic effect still fires (plan proposal, step advance, etc.). Toggle it **on** to keep the raw brackets visible — useful for debugging marker emission or inspecting the agent's exact output. Interview markers are always stripped; this toggle controls plan markers only.
 
 ### Keyboard
 
 | Key | Action |
 |---|---|
-| `↑` / `k` | Previous interactive row (skips Headers) |
-| `↓` / `j` | Next interactive row |
+| `↑` / `k` / `Shift+Tab` | Previous interactive row (skips Headers) |
+| `↓` / `j` / `Tab` | Next interactive row |
 | `Home` / `g` | First interactive row |
 | `End` / `G` | Last interactive row |
 | `PgUp` / `PgDn` | Move selection ±5 (pauses focus-follow auto-scroll) |
 | `Enter` / `Space` | Toggle or cycle-forward |
 | `→` | Cycle forward |
-| `←` | Cycle backward |
+| `←` | Cycle backward (theme only) |
 | `Esc` | Close modal |
 
 The focused row has a `▶` marker and a bold label; the value side stays accent-colored. The modal auto-scrolls to keep the selection visible as you navigate, and the scrollbar widget appears on the right when the panel is taller than the modal frame.
@@ -565,7 +569,58 @@ Navigation: `↑ ↓` / `j k` scroll one line, `PgUp` / `PgDn` scroll ten lines,
 
 ## Plan mode
 
-Plan mode turns rata-pi into a step-tracking harness for multi-step tasks. The agent itself can author a plan via markers in its assistant text, OR you can hand-author one.
+Plan mode turns rata-pi into a step-tracking harness for multi-step tasks. The agent itself can propose a plan via markers in its assistant text, OR you can hand-author one.
+
+### Authority rule (V3.f)
+Agent plans are **proposals**; user plans are **commands**. That means:
+
+* `[[PLAN_SET: …]]` from the agent **opens a Plan Review modal**. Nothing runs until you Accept, Edit, or Deny.
+* `/plan set a | b | c` from you **activates immediately** — you're the author and the approver in one gesture.
+* `[[STEP_DONE]]` / `[[STEP_FAILED: …]]` are no-ops unless an accepted active plan exists.
+* `[[PLAN_ADD: …]]` while an active plan exists **opens the review modal again** as an amendment preview — you see the full amended list and Accept / Edit / Deny it.
+
+### Plan Review modal
+Opens automatically on any agent-authored `PLAN_SET` or `PLAN_ADD`. Two modes:
+
+**Review mode (default)** — action chips + step list, read-only.
+
+| Key | Action |
+|---|---|
+| `a` | Accept the plan |
+| `e` | Switch to Edit mode |
+| `d` / `Esc` | Deny the plan |
+| `t` | Toggle auto-run pref |
+| `↑↓` / `j` / `k` | Scroll the step list |
+| `h` / `l` / `←` / `→` | Focus the action chips |
+| `Enter` | Activate the focused chip |
+
+**Edit mode** — focus-list + mutation keys.
+
+| Key | Action |
+|---|---|
+| `↑↓` / `j` / `k` | Navigate focused step |
+| `Enter` / `i` | Enter text-entry on the focused step |
+| `a` | Insert a blank step below focus and enter text-entry on it |
+| `x` / `Del` | Delete the focused step |
+| `t` | Toggle auto-run pref |
+| `Ctrl+S` | Accept the edited list (commits draft → active plan) |
+| `Esc` | Back to Review mode |
+
+**Edit + text-entry sub-mode** — raw text editor for one step:
+
+| Key | Action |
+|---|---|
+| printable | Insert at cursor |
+| `Backspace` / `Delete` | Delete before / after cursor |
+| `←` / `→` / `Home` / `End` | Cursor motion |
+| `Enter` | Commit buffer → step; return to Edit |
+| `Esc` | Drop edits; return to Edit |
+
+### Auto-run after accept
+Default is **YOLO ON** — after you Accept, rata-pi immediately stages the first-step prompt so pi starts running. Toggle off before pressing `a`/Enter with `t` if you want to hand-drive the plan yourself.
+
+### Amendment semantics
+When `[[PLAN_ADD: x]]` fires on an active plan, the Review modal shows the **amended** full list (existing steps + new `x`). On Accept, rata-pi **merges** the edited list into the active plan: steps whose text matches an existing step keep their status + attempts; new texts land as Pending. This means amending a plan at step 3 won't re-run step 1.
 
 ### Status glyphs
 * `[ ]` pending
@@ -573,11 +628,11 @@ Plan mode turns rata-pi into a step-tracking harness for multi-step tasks. The a
 * `[x]` done
 * `[✗]` failed
 
-### Commands
+### Slash commands (user-authored, no review)
 | Command | Effect |
 |---|---|
 | `/plan` or `/plan show` | Open the PlanView modal |
-| `/plan set a | b | c` | Replace plan with three steps |
+| `/plan set a | b | c` | Replace plan with three steps (activates immediately) |
 | `/plan add <text>` | Append one step |
 | `/plan done` | Mark the active step done and advance |
 | `/plan fail <reason>` | Mark the active step failed and halt auto-run |
@@ -586,22 +641,23 @@ Plan mode turns rata-pi into a step-tracking harness for multi-step tasks. The a
 | `/plan auto on\|off` | Toggle auto-continue follow-ups |
 
 ### Agent-authored markers
-When the agent emits any of these in its assistant text, rata-pi parses them on `agent_end`:
+When the agent emits any of these in its assistant text, rata-pi parses them from the authoritative `agent_end.messages` payload:
 
 | Marker | Effect |
 |---|---|
-| `[[PLAN_SET: a \| b \| c]]` | Replace the plan with those items |
-| `[[PLAN_ADD: text]]` | Append one item |
-| `[[STEP_DONE]]` | Mark the active step done; advance |
-| `[[STEP_FAILED: reason]]` | Mark the active step failed; halt |
+| `[[PLAN_SET: a \| b \| c]]` | Propose a plan (opens Review modal) |
+| `[[PLAN_ADD: text]]` | Propose an amendment (opens Review modal with amended list) |
+| `[[STEP_DONE]]` | Mark the active step done; advance (only on accepted plans) |
+| `[[STEP_FAILED: reason]]` | Mark the active step failed; halt (only on accepted plans) |
 
-These markers are **hidden** from the visible transcript rendering (they still pass through pi).
+### Marker visibility
+By default the above markers are **stripped** from the visible assistant transcript tail after parsing — you see the prose, not the protocol brackets. Flip `/settings → Appearance → show raw markers` to keep them visible for debugging.
 
 ### Prompt injection
-While a plan is active, every outgoing prompt is wrapped with the plan state as context so the agent sees the full list and which step is active. When no plan is active, a short capability hint is appended to prompts so the agent knows the marker grammar exists.
+While a plan is active, every outgoing prompt is wrapped with the plan state as context so the agent sees the full list and which step is active. When no plan is active, a short capability hint is appended to prompts so the agent knows the marker grammar exists. A `proposed_plan` that hasn't been accepted does **not** participate in prompt wrapping.
 
 ### Auto-continue
-With `/plan auto on`, every `agent_end` with pending steps auto-queues a "continue with the next step" follow-up. The loop halts when:
+With `/plan auto on` (and auto-run kept ON at accept time), every `agent_end` with pending steps auto-queues a "continue with the next step" follow-up. The loop halts when:
 * A step is marked failed (agent or user).
 * All steps are done.
 * The per-step attempt counter hits `MAX_ATTEMPTS = 3`.
@@ -972,7 +1028,7 @@ Exports include turn dividers, user / thinking / assistant sections, tool call d
 
 Left → right:
 1. `rata-pi` wordmark.
-2. Heartbeat dot — color-coded: green on recent events, yellow after 10 s silent while streaming, red after 100 ticks or when pi is offline.
+2. Heartbeat dot — color-coded; see legend below.
 3. Spinner — only spins while pi is actively streaming.
 4. Model label — shortened to `<id>` tail when the full `<provider>/<id>` is longer than 24 chars.
 5. Live state — `idle / sending / llm / thinking / tool / streaming / compacting / retrying / error`.
@@ -981,6 +1037,18 @@ Left → right:
 8. Turn counter — `tN`, only once the first turn has started.
 
 Every other status-ish thing that used to live in the header (thinking level, session name, connection label, notify backend, capabilities) is now in `/settings`.
+
+### Heartbeat-color legend (V3.g.3)
+
+The leftmost dot in the header encodes RPC liveness at a glance:
+
+| Color | Meaning |
+|---|---|
+| green (`theme.success`) | Recent event from pi — connection healthy |
+| yellow (`theme.warning`) | No event for ≥ 10 s while streaming — possible hiccup |
+| red (`theme.error`) | No event for ≥ 100 ticks OR pi is offline (failed to spawn) |
+
+Green is the normal steady state during active exchanges. Yellow fires when pi stops pushing deltas mid-stream (network stutter, slow tool call) and red fires when the process has gone fully quiet. `/settings → Session → connection` shows the authoritative spawn-error string when the dot is red because of offline mode.
 
 ### Status widget (3 rows, V2.13.d slim)
 
