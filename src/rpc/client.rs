@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use color_eyre::eyre::{Context, Result, eyre};
 use futures::StreamExt;
@@ -47,6 +48,12 @@ pub enum RpcError {
     Closed,
     #[error("pi returned an error on {command}: {message}")]
     Remote { command: String, message: String },
+    /// V3.a · per-call timeout elapsed before pi produced a response. The
+    /// waiter is removed from `pending` so a late response is dropped
+    /// cleanly. Callers typically surface this as a non-fatal flash rather
+    /// than treating it as a session-ending error.
+    #[error("rpc timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// Messages the writer task consumes.
@@ -119,9 +126,22 @@ impl RpcClient {
         format!("req-{}", self.id_counter.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Send a command and await its correlated response. Non-success responses
-    /// surface as `Err(RpcError::Remote)`.
+    /// Send a command and await its correlated response. Defaults to a 10 s
+    /// bound so a single degraded RPC can never freeze the UI indefinitely —
+    /// hot paths that want tighter bounds call [`RpcClient::call_timeout`]
+    /// directly. Non-success responses surface as `Err(RpcError::Remote)`.
     pub async fn call(&self, command: RpcCommand) -> Result<RpcOk, RpcError> {
+        self.call_timeout(command, Duration::from_secs(10)).await
+    }
+
+    /// Like [`RpcClient::call`] but with an explicit per-call timeout. On
+    /// `Timeout` the pending waiter is removed so a late response from pi is
+    /// dropped cleanly rather than leaking into the map.
+    pub async fn call_timeout(
+        &self,
+        command: RpcCommand,
+        timeout: Duration,
+    ) -> Result<RpcOk, RpcError> {
         let id = self.next_id();
         let env = Envelope {
             id: Some(id.clone()),
@@ -137,16 +157,25 @@ impl RpcClient {
         if self.debug_rpc {
             tracing::debug!(rpc_out = %json);
         }
-        self.tx
-            .send(OutMsg::Json(json))
-            .await
-            .map_err(|_| RpcError::Closed)?;
+        // V3.a · if the writer channel is dead, yank the entry we just
+        // inserted so repeated Closed errors can't accumulate dead waiters.
+        if self.tx.send(OutMsg::Json(json)).await.is_err() {
+            self.pending.lock().await.remove(&id);
+            return Err(RpcError::Closed);
+        }
 
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => {
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                // Reader task exited and dropped the oneshot sender.
                 self.pending.lock().await.remove(&id);
                 Err(RpcError::Closed)
+            }
+            Err(_) => {
+                // Bound elapsed. Evict the waiter; the reader will find no
+                // match for the eventual response (if any) and discard it.
+                self.pending.lock().await.remove(&id);
+                Err(RpcError::Timeout(timeout))
             }
         }
     }
@@ -348,4 +377,56 @@ pub fn spawn(pi_bin: &str, pi_argv: &[String], debug_rpc: bool) -> Result<(RpcCl
     let pi =
         super::process::spawn(pi_bin, pi_argv).wrap_err_with(|| eyre!("spawning pi {pi_bin:?}"))?;
     Ok(RpcClient::spawn(pi, debug_rpc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an `RpcClient` that is wired to a local writer channel but has
+    /// no reader/stderr tasks. Enough to exercise the send-path error and
+    /// timeout semantics without a real pi process.
+    fn test_client() -> (RpcClient, mpsc::Receiver<OutMsg>) {
+        let (tx, rx) = mpsc::channel::<OutMsg>(16);
+        let client = RpcClient {
+            tx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            id_counter: AtomicU64::new(1),
+            debug_rpc: false,
+        };
+        (client, rx)
+    }
+
+    /// V3.a regression: if the writer channel is closed before `call` can
+    /// send, the inserted pending entry must be removed — otherwise repeated
+    /// Closed calls accumulate dead waiters in the map.
+    #[tokio::test]
+    async fn call_removes_pending_on_send_failure() {
+        let (client, rx) = test_client();
+        drop(rx); // writer side is dead
+        let result = client.call(RpcCommand::GetState).await;
+        assert!(matches!(result, Err(RpcError::Closed)));
+        assert!(
+            client.pending.lock().await.is_empty(),
+            "pending map should be drained on send failure"
+        );
+    }
+
+    /// V3.a: `call_timeout` surfaces `RpcError::Timeout(dur)` when pi never
+    /// answers and cleans the pending map behind itself.
+    #[tokio::test]
+    async fn call_timeout_returns_timeout_when_idle() {
+        let (client, _rx) = test_client(); // hold rx so send() succeeds
+        let result = client
+            .call_timeout(RpcCommand::GetState, Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(result, Err(RpcError::Timeout(d)) if d == Duration::from_millis(50)),
+            "expected Timeout(50ms), got {result:?}"
+        );
+        assert!(
+            client.pending.lock().await.is_empty(),
+            "pending map should be drained on timeout"
+        );
+    }
 }

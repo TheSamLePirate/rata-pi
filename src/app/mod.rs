@@ -1120,12 +1120,16 @@ async fn bootstrap(client: &RpcClient, app: &mut App) {
     // dependencies on each other and each is a separate round-trip to pi,
     // so serial-await wasted ~N × RTT at startup. Stats refresh now joins
     // the party too.
+    // V3.a · each sub-call is bounded at 3 s. A degraded pi (accepts input,
+    // never responds) can no longer hang startup indefinitely — a missing
+    // piece just degrades to the offline-default value for that slot.
+    const BOOT_TIMEOUT: Duration = Duration::from_secs(3);
     let (state, messages, commands, models, stats) = tokio::join!(
-        client.call(RpcCommand::GetState),
-        client.call(RpcCommand::GetMessages),
-        client.call(RpcCommand::GetCommands),
-        client.call(RpcCommand::GetAvailableModels),
-        client.call(RpcCommand::GetSessionStats),
+        client.call_timeout(RpcCommand::GetState, BOOT_TIMEOUT),
+        client.call_timeout(RpcCommand::GetMessages, BOOT_TIMEOUT),
+        client.call_timeout(RpcCommand::GetCommands, BOOT_TIMEOUT),
+        client.call_timeout(RpcCommand::GetAvailableModels, BOOT_TIMEOUT),
+        client.call_timeout(RpcCommand::GetSessionStats, BOOT_TIMEOUT),
     );
 
     if let Ok(ok) = state
@@ -1253,11 +1257,25 @@ fn spawn_git_refresh(app: &mut App, tx: &tokio::sync::mpsc::Sender<Option<crate:
 }
 
 async fn refresh_stats(client: &RpcClient, app: &mut App) {
-    if let Ok(ok) = client.call(RpcCommand::GetSessionStats).await
-        && let Some(v) = ok.data
-        && let Ok(s) = serde_json::from_value::<SessionStats>(v)
+    // V3.a · 1 s bound. This runs every 5 s from the stats tick; if pi is
+    // degraded we'd rather drop a refresh (and flash once) than stall the
+    // whole event loop. Late responses are discarded by the reader because
+    // `call_timeout` evicts the pending waiter on timeout.
+    match client
+        .call_timeout(RpcCommand::GetSessionStats, Duration::from_secs(1))
+        .await
     {
-        app.session.stats = Some(s);
+        Ok(ok) => {
+            if let Some(v) = ok.data
+                && let Ok(s) = serde_json::from_value::<SessionStats>(v)
+            {
+                app.session.stats = Some(s);
+            }
+        }
+        Err(RpcError::Timeout(_)) => {
+            app.flash("pi didn't answer stats in 1s");
+        }
+        Err(_) => { /* Closed / Remote: other paths surface it. */ }
     }
 }
 
@@ -5419,16 +5437,28 @@ async fn dispatch_settings_action(
                 let _ = c
                     .fire(RpcCommand::SetAutoCompaction { enabled: next })
                     .await;
+                app.flash(format!("auto-compact {}", on_off(next)));
+            } else {
+                // V3.a · local flag flipped but there's no pi to persist it.
+                // Warn the user so they don't think the setting stuck.
+                app.flash(format!(
+                    "auto-compact {} — offline, applies next session",
+                    on_off(next)
+                ));
             }
-            app.flash(format!("auto-compact {}", on_off(next)));
         }
         SettingsAction::Toggle(ToggleAction::AutoRetry) => {
             let next = !app.session.auto_retry.unwrap_or(true);
             app.session.auto_retry = Some(next);
             if let Some(c) = client {
                 let _ = c.fire(RpcCommand::SetAutoRetry { enabled: next }).await;
+                app.flash(format!("auto-retry {}", on_off(next)));
+            } else {
+                app.flash(format!(
+                    "auto-retry {} — offline, applies next session",
+                    on_off(next)
+                ));
             }
-            app.flash(format!("auto-retry {}", on_off(next)));
         }
         SettingsAction::Toggle(ToggleAction::PlanAutoRun) => {
             app.plan.auto_run = !app.plan.auto_run;
@@ -8061,6 +8091,41 @@ I'll take it from here.",
         a.modal = Some(Modal::Settings(crate::ui::modal::SettingsState::default()));
         let (_, close) = settings_modal_key(KeyCode::Esc, KeyModifiers::NONE, &mut a);
         assert!(close);
+    }
+
+    /// V3.a · AutoCompact / AutoRetry toggles flip the local state even when
+    /// pi is offline; the user sees a flash explaining the change won't
+    /// persist until next session.
+    #[tokio::test]
+    async fn settings_toggle_offline_flashes_for_rpc_backed_flags() {
+        for (action, expected_label) in [
+            (ToggleAction::AutoCompact, "auto-compact"),
+            (ToggleAction::AutoRetry, "auto-retry"),
+        ] {
+            let mut a = app();
+            a.flash = None;
+            let before_compact = a.session.auto_compaction;
+            let before_retry = a.session.auto_retry;
+            dispatch_settings_action(&mut a, None, SettingsAction::Toggle(action)).await;
+            // Local flag flipped.
+            match action {
+                ToggleAction::AutoCompact => assert_ne!(
+                    a.session.auto_compaction, before_compact,
+                    "auto_compaction should toggle locally even when offline"
+                ),
+                ToggleAction::AutoRetry => assert_ne!(
+                    a.session.auto_retry, before_retry,
+                    "auto_retry should toggle locally even when offline"
+                ),
+                _ => unreachable!(),
+            }
+            // Flash explains the offline caveat.
+            let flash_text = a.flash.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
+            assert!(
+                flash_text.contains(expected_label) && flash_text.contains("offline"),
+                "expected offline flash for {action:?}, got {flash_text:?}"
+            );
+        }
     }
 
     // ── V2.13.a · /shortcuts modal ──────────────────────────────────────
