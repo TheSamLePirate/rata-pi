@@ -23,7 +23,7 @@ Each sub-milestone ships as its own commit with subject `feat(v3.X): <summary>` 
   - [x] `call_timeout` returns `Timeout` when oneshot idle (`call_timeout_returns_timeout_when_idle`)
   - [x] offline toggle flashes and flips local state (`settings_toggle_offline_flashes_for_rpc_backed_flags`)
 
-**Shipped as** `5b0b8d5`
+**Shipped as** `022e358`
 
 ---
 
