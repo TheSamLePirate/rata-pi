@@ -16,6 +16,7 @@
 //! - `draw`    · terminal chrome drawing (header, body, editor, footer, status)
 
 mod draw;
+mod events;
 mod modals;
 mod visuals;
 
@@ -67,11 +68,17 @@ use crate::cli::Args;
 use crate::history::{History, HistoryEntry};
 use crate::rpc::client::{self, RpcClient, RpcError};
 use crate::rpc::commands::{ExtensionUiResponse, RpcCommand};
-use crate::rpc::events::{AssistantEvent, Incoming};
+use crate::rpc::events::Incoming;
 use crate::rpc::types::{
-    AgentMessage, AssistantBlock, CommandInfo, ContentBlock, FollowUpMode, ForkMessage, Model,
-    SessionStats, State, SteeringMode, StopReason, ThinkingLevel, ToolResultPayload, UserContent,
+    AgentMessage, CommandInfo, FollowUpMode, ForkMessage, Model, SessionStats, State, SteeringMode,
+    ThinkingLevel,
 };
+// Re-exported for the reducer_tests module; prod code uses these inside
+// events.rs, not here.
+#[cfg(test)]
+use crate::rpc::events::AssistantEvent;
+#[cfg(test)]
+use crate::rpc::types::StopReason;
 use crate::theme::{self, Theme};
 use crate::ui::cards::{Card, InlineRow};
 use crate::ui::ext_ui::{ExtReq, ExtUiState, WidgetPlacement, parse as parse_ext};
@@ -656,14 +663,7 @@ impl App {
     }
 
     fn apply_state(&mut self, s: &State) {
-        if let Some(m) = &s.model {
-            self.session.model_label = format!("{}/{}", m.provider, m.id);
-        }
-        self.session.thinking = Some(s.thinking_level);
-        self.session.steering_mode = Some(s.steering_mode);
-        self.session.follow_up_mode = Some(s.follow_up_mode);
-        self.session.auto_compaction = Some(s.auto_compaction_enabled);
-        self.session.session_name = s.session_name.clone();
+        events::apply_state(self, s);
     }
 
     /// Ensure `focus_idx` stays within bounds as the transcript grows or is
@@ -680,275 +680,7 @@ impl App {
     }
 
     fn on_event(&mut self, ev: Incoming) {
-        self.event_received();
-        match ev {
-            Incoming::AgentStart => {
-                self.is_streaming = true;
-                self.set_live(LiveState::Llm);
-                self.agent_start_tick = Some(self.ticks);
-                self.tool_calls_this_turn = 0;
-            }
-            Incoming::AgentEnd { messages } => {
-                self.is_streaming = false;
-                self.composer_mode = ComposerMode::Prompt;
-                self.tool_running = 0;
-                // V2.12.f · for non-retryable API failures (e.g. "Your
-                // credit balance is too low"), pi sets stop_reason=Error
-                // + error_message on the assistant message and closes
-                // the turn with agent_end. No stream-error event fires
-                // before this, so we MUST scan agent_end.messages for a
-                // failed assistant entry and surface it. Otherwise the
-                // user sees nothing at all.
-                let mut had_error = false;
-                for m in &messages {
-                    if let AgentMessage::Assistant {
-                        stop_reason: Some(StopReason::Error),
-                        error_message,
-                        ..
-                    } = m
-                    {
-                        had_error = true;
-                        let msg = error_message
-                            .clone()
-                            .unwrap_or_else(|| "agent ended with error".to_string());
-                        self.transcript.push(Entry::Error(format!("pi: {msg}")));
-                        if self.notify_enabled {
-                            let body = truncate_preview(&msg, 100);
-                            let _ = crate::notify::notify("pi · agent error", &body);
-                        }
-                        break;
-                    }
-                }
-                if had_error {
-                    self.set_live(LiveState::Error);
-                } else {
-                    self.set_live(LiveState::Idle);
-                }
-                // Plan-mode marker handling: scan the last assistant text
-                // for [[STEP_DONE]] / [[STEP_FAILED]] / [[PLAN_SET]] /
-                // [[PLAN_ADD]] and apply.
-                self.apply_plan_markers_on_agent_end();
-                if self.notify_enabled && !had_error {
-                    let dur = self
-                        .agent_start_tick
-                        .map(|t0| self.ticks.saturating_sub(t0))
-                        .unwrap_or(0);
-                    // Notify only on turns that took ≥ 10 s (100 ticks)
-                    // so quick round-trips don't spam the desktop.
-                    if let Some((title, body)) =
-                        crate::notify::agent_end_notice(dur, 100, self.tool_calls_this_turn)
-                    {
-                        let _ = crate::notify::notify(&title, &body);
-                    }
-                }
-                self.agent_start_tick = None;
-            }
-            Incoming::TurnStart => {
-                self.turn_count = self.turn_count.saturating_add(1);
-                // Only emit a visible separator between turns (not before the
-                // first). The marker reads as a graphical "turn N" divider
-                // in the transcript.
-                if self.turn_count > 1 {
-                    self.transcript.push(Entry::TurnMarker {
-                        number: self.turn_count,
-                    });
-                }
-            }
-            Incoming::TurnEnd {
-                message: Some(AgentMessage::Assistant { usage: Some(u), .. }),
-                ..
-            } => {
-                if let Some(c) = u.cost {
-                    self.cost_session += c.total;
-                    self.cost_series.push_back(c.total);
-                    if self.cost_series.len() > 30 {
-                        self.cost_series.pop_front();
-                    }
-                }
-            }
-            Incoming::MessageUpdate {
-                assistant_message_event,
-                ..
-            } => match assistant_message_event {
-                AssistantEvent::TextDelta { delta, .. } => {
-                    self.set_live(LiveState::Streaming);
-                    self.push_tokens(approx_tokens(&delta));
-                    self.transcript.append_assistant(&delta);
-                }
-                AssistantEvent::ThinkingDelta { delta, .. } => {
-                    self.set_live(LiveState::Thinking);
-                    self.push_tokens(approx_tokens(&delta));
-                    self.transcript.append_thinking(&delta);
-                }
-                AssistantEvent::Error { reason, error } => {
-                    self.set_live(LiveState::Error);
-                    // Pi sends the final failed AssistantMessage in the
-                    // `error` field (was mis-named `partial` in older
-                    // rata-pi — silent default-to-null was masking every
-                    // API failure). Probe it for a human-readable message.
-                    let detail = extract_error_detail(&error);
-                    let msg = match detail {
-                        Some(d) => format!("stream error ({reason:?}): {d}"),
-                        None => format!("stream error: {reason:?}"),
-                    };
-                    self.transcript.push(Entry::Error(msg.clone()));
-                    if self.notify_enabled {
-                        let body = truncate_preview(&msg, 100);
-                        let _ = crate::notify::notify("pi · stream error", &body);
-                    }
-                }
-                _ => {}
-            },
-            Incoming::ToolExecutionStart {
-                tool_call_id,
-                tool_name,
-                args,
-            } => {
-                self.tool_running = self.tool_running.saturating_add(1);
-                self.tool_calls_this_turn = self.tool_calls_this_turn.saturating_add(1);
-                self.set_live(LiveState::Tool);
-                self.transcript.start_tool(tool_call_id, tool_name, args);
-            }
-            Incoming::ToolExecutionUpdate {
-                tool_call_id,
-                partial_result,
-                ..
-            } => self
-                .transcript
-                .update_tool_output(&tool_call_id, &partial_result),
-            Incoming::ToolExecutionEnd {
-                tool_call_id,
-                result,
-                is_error,
-                ..
-            } => {
-                self.tool_running = self.tool_running.saturating_sub(1);
-                self.tool_done = self.tool_done.saturating_add(1);
-                if self.tool_running == 0 && self.is_streaming {
-                    self.set_live(LiveState::Llm);
-                }
-                if is_error && self.notify_enabled {
-                    let text = result
-                        .content
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .next()
-                        .unwrap_or("");
-                    let first = text.lines().next().unwrap_or("").trim();
-                    let body = if first.is_empty() {
-                        "tool call failed".to_string()
-                    } else {
-                        truncate_preview(first, 80)
-                    };
-                    let _ = crate::notify::notify("pi · tool error", &body);
-                }
-                self.transcript
-                    .finish_tool(&tool_call_id, &result, is_error);
-            }
-            Incoming::AutoRetryStart {
-                attempt,
-                max_attempts,
-                delay_ms,
-                error_message,
-            } => {
-                self.set_live(LiveState::Retrying {
-                    attempt,
-                    max_attempts,
-                    delay_ms,
-                });
-                self.transcript.push_retry_waiting(
-                    attempt,
-                    max_attempts,
-                    delay_ms,
-                    error_message.unwrap_or_else(|| "transient error".into()),
-                );
-            }
-            Incoming::AutoRetryEnd {
-                success,
-                attempt,
-                final_error,
-            } => {
-                let state = if success {
-                    RetryState::Succeeded
-                } else {
-                    RetryState::Exhausted(final_error.clone().unwrap_or_else(|| "unknown".into()))
-                };
-                if success && self.is_streaming {
-                    self.set_live(LiveState::Llm);
-                } else {
-                    self.set_live(LiveState::Idle);
-                }
-                if !success && self.notify_enabled {
-                    let body = final_error
-                        .as_deref()
-                        .map(|s| truncate_preview(s, 80))
-                        .unwrap_or_else(|| "retries exhausted".to_string());
-                    let _ = crate::notify::notify("pi · retries exhausted", &body);
-                }
-                self.transcript.resolve_retry(attempt, state);
-            }
-            Incoming::CompactionStart { reason } => {
-                self.set_live(LiveState::Compacting);
-                self.transcript.push_compaction_start(format!("{reason:?}"));
-            }
-            Incoming::CompactionEnd {
-                reason,
-                result,
-                aborted,
-                error_message,
-                ..
-            } => {
-                let reason = format!("{reason:?}");
-                let state = if aborted {
-                    CompactionState::Aborted
-                } else if let Some(msg) = error_message {
-                    CompactionState::Failed(msg)
-                } else {
-                    CompactionState::Done {
-                        summary: result.map(|r| r.summary),
-                    }
-                };
-                if self.is_streaming {
-                    self.set_live(LiveState::Llm);
-                } else {
-                    self.set_live(LiveState::Idle);
-                }
-                self.transcript.finish_compaction(reason, state);
-            }
-            Incoming::ExtensionError { error, .. } => {
-                self.transcript.push(Entry::Error(format!(
-                    "extension error: {}",
-                    error.as_deref().unwrap_or("(no detail)")
-                )));
-            }
-            // V2.12.f · pi rejected a fire-and-forget command (usually the
-            // `prompt` RPC — "insufficient credits", "rate limit",
-            // "context too large"). Surface it in the transcript instead
-            // of silently dropping.
-            Incoming::CommandError { command, message } => {
-                self.is_streaming = false;
-                self.composer_mode = ComposerMode::Prompt;
-                self.set_live(LiveState::Error);
-                self.tool_running = 0;
-                self.transcript
-                    .push(Entry::Error(format!("{command}: {message}")));
-                if self.notify_enabled {
-                    let body = truncate_preview(&message, 100);
-                    let _ = crate::notify::notify(&format!("pi · {command} failed"), &body);
-                }
-            }
-            Incoming::QueueUpdate {
-                steering,
-                follow_up,
-            } => {
-                self.session.queue_steering = steering;
-                self.session.queue_follow_up = follow_up;
-            }
-            _ => {}
-        }
+        events::on_event(self, ev);
     }
 }
 
@@ -1050,97 +782,6 @@ fn args_preview(args: &serde_json::Value) -> String {
 
 // ───────────────────────────────────────────────────────── bootstrap ──
 
-fn import_messages(app: &mut App, messages: Vec<AgentMessage>) {
-    for m in messages {
-        match m {
-            AgentMessage::User { content, .. } => {
-                let text = user_content_text(&content);
-                app.transcript.push(Entry::User(text));
-            }
-            AgentMessage::Assistant { content, .. } => {
-                let mut thinking = String::new();
-                let mut assistant_text = String::new();
-                let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
-                for block in content {
-                    match block {
-                        AssistantBlock::Thinking { thinking: t } => {
-                            if !thinking.is_empty() {
-                                thinking.push('\n');
-                            }
-                            thinking.push_str(&t);
-                        }
-                        AssistantBlock::Text { text } => {
-                            if !assistant_text.is_empty() {
-                                assistant_text.push('\n');
-                            }
-                            assistant_text.push_str(&text);
-                        }
-                        AssistantBlock::ToolCall {
-                            id,
-                            name,
-                            arguments,
-                        } => tool_calls.push((id, name, arguments)),
-                    }
-                }
-                if !thinking.is_empty() {
-                    app.transcript.push(Entry::Thinking(thinking));
-                }
-                if !assistant_text.is_empty() {
-                    app.transcript.push(Entry::Assistant(assistant_text));
-                }
-                for (id, name, args) in tool_calls {
-                    app.transcript.start_tool(id, name, args);
-                }
-            }
-            AgentMessage::ToolResult {
-                tool_call_id,
-                content,
-                is_error,
-                ..
-            } => {
-                let payload = ToolResultPayload {
-                    content,
-                    details: serde_json::Value::Null,
-                };
-                app.transcript
-                    .finish_tool(&tool_call_id, &payload, is_error);
-            }
-            AgentMessage::BashExecution {
-                command,
-                output,
-                exit_code,
-                cancelled,
-                truncated,
-                full_output_path,
-                ..
-            } => {
-                app.transcript.push(Entry::BashExec(BashExec {
-                    command,
-                    output: crate::ui::ansi::strip(&output),
-                    exit_code,
-                    cancelled,
-                    truncated,
-                    full_output_path,
-                }));
-            }
-        }
-    }
-}
-
-fn user_content_text(c: &UserContent) -> String {
-    match c {
-        UserContent::Text(s) => s.clone(),
-        UserContent::Blocks(bs) => bs
-            .iter()
-            .map(|b| match b {
-                ContentBlock::Text { text } => text.clone(),
-                ContentBlock::Image { .. } => "[image]".into(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
 // ───────────────────────────────────────────────────────── main loop ──
 
 async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: Args) -> Result<()> {
@@ -1201,7 +842,7 @@ async fn bootstrap(client: &RpcClient, app: &mut App) {
                 msgs.push(msg);
             }
         }
-        import_messages(app, msgs);
+        events::import_messages(app, msgs);
     }
     if let Ok(ok) = commands
         && let Some(v) = ok.data
