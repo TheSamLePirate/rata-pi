@@ -24,17 +24,19 @@ This guide documents **every feature**: command-line arguments, key bindings, sl
 14. [Plan mode](#plan-mode)
 15. [Interview mode](#interview-mode)
 16. [File finder and `@path`](#file-finder-and-path)
-14. [Git integration](#git-integration)
-15. [Themes](#themes)
-16. [Vim mode](#vim-mode)
-17. [Notifications](#notifications)
-18. [Clipboard](#clipboard)
-19. [Transcript export](#transcript-export)
-20. [Status widget and header](#status-widget-and-header)
-21. [Files rata-pi reads and writes](#files-rata-pi-reads-and-writes)
-22. [Terminal capabilities](#terminal-capabilities)
-23. [Crash reports](#crash-reports)
-24. [Troubleshooting](#troubleshooting)
+17. [Transcript search](#transcript-search)
+18. [Composer templates](#composer-templates)
+19. [Git integration](#git-integration)
+20. [Themes](#themes)
+21. [Vim mode](#vim-mode)
+22. [Notifications](#notifications)
+23. [Clipboard](#clipboard)
+24. [Transcript export](#transcript-export)
+25. [Status widget and header](#status-widget-and-header)
+26. [Files rata-pi reads and writes](#files-rata-pi-reads-and-writes)
+27. [Terminal capabilities](#terminal-capabilities)
+28. [Crash reports](#crash-reports)
+29. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -270,6 +272,14 @@ Enter semantics:
 * `/copy` — copy the last assistant message to the clipboard.
 * `/clear` — clear the transcript view only (pi state intact).
 * `/retry` — re-submit the last user prompt (uses steer if streaming).
+* `/search [query]` — open the transcript-search overlay. With no arg the query field opens empty; with an arg it pre-populates, runs live, and the cursor lands on the most recent match. See [Transcript search](#transcript-search).
+
+### Composer templates
+* `/template` (alias `/tpl`) — open the two-pane template picker. See [Composer templates](#composer-templates).
+* `/template save <name>` — snapshot the current composer body under `<name>`.
+* `/template use <name>` — load a named template into the composer (alias `/template load <name>`).
+* `/template list` — same as `/template` with no arg.
+* `/template delete <name>` — remove a template (alias `/template rm <name>`).
 
 ### Model / thinking
 * `/model` — open the model picker (F5).
@@ -373,6 +383,9 @@ Extensions, prompts, and skills registered by pi appear in the Commands picker u
 | `Ctrl+U` | Kill to start of line |
 | `Ctrl+K` | Kill to end of line |
 | `Ctrl+W` | Kill word back |
+| `Ctrl+Z` | Undo (64-snapshot ring) |
+| `Ctrl+Shift+Z` | Redo |
+| `Ctrl+Enter` | Submit (symmetric with Interview / Plan Review) |
 
 ### Focus mode
 | Key | Action |
@@ -433,10 +446,21 @@ rata-pi captures mouse events. Bracketed paste is also enabled.
 
 | Gesture | Action |
 |---|---|
-| Wheel up / down | Scroll transcript |
+| Wheel up / down | Scroll transcript, or scroll the focused modal when one is open |
 | Left click on a card | Focus that card |
 | Double left click on a tool card | Toggle expand |
 | Left click on the `⬇ live tail` chip | Re-pin live tail |
+| Left click **outside** any open modal | Close the modal (V4.a) |
+| Left click a Plan Review action chip | `Accept` / `Edit` / `Deny` / toggle auto-run |
+| Left click a list-modal row | Select that row (Enter still activates) |
+| Left click a Settings row | Move focus to that row |
+| Left click a Thinking-picker option | Pick that level |
+| Left click an Ext-UI confirm / select chip | Activate that choice |
+
+Plan Review chips, list-modal rows, Settings rows, Thinking options, and
+Ext dialogs are the click-reachable surfaces today. The Commands modal is
+keyboard-only (category headings + mixed row layout make hit-testing
+ambiguous).
 
 Mouse-drag selection is not wired to rata-pi's rendering. Terminals often allow holding `Shift` (or equivalent) to bypass the app and use the terminal's native selection.
 
@@ -500,6 +524,12 @@ Every tunable setting and observable state, in one scrollable panel. See [Settin
 ### `Shortcuts` (`/shortcuts`)
 Read-only keybinding reference for every context (global, editor, focus mode, modals, vim, interview, mouse). See [Shortcuts panel](#shortcuts-panel).
 
+### `Search` (`/search`)
+Transcript-search overlay. See [Transcript search](#transcript-search).
+
+### `Templates` (`/template`)
+Composer-template picker. See [Composer templates](#composer-templates).
+
 ### Extension UI dialogs
 When a pi extension calls `ext_ui_select`, `ext_ui_confirm`, `ext_ui_input`, or `ext_ui_editor`, a dialog modal opens. `↑↓` (select), `Y/N/←→` (confirm), type-to-fill (input/editor). Enter submits, Esc cancels.
 
@@ -516,7 +546,7 @@ When a pi extension calls `ext_ui_select`, `ext_ui_confirm`, `ext_ui_input`, or 
 | **Session** | Info | session name · connection status · pi binary path |
 | **Model** | Cycle | active model · thinking level · steering mode · follow-up mode |
 | **Behavior** | Toggle | show thinking · notifications · auto-compaction · auto-retry · plan auto-run |
-| **Appearance** | Cycle / Toggle | theme · vim mode · show raw markers |
+| **Appearance** | Cycle / Toggle | theme · vim mode · show raw markers · focus marker |
 | **Live state** | Info | live label + elapsed · turn · tools running/done · queue sizes · context window usage · session cost |
 | **Capabilities** | Info | terminal kind · Kitty keyboard · graphics · clipboard backend · `notify` feature |
 | **Paths** | Info | history file · crash-dump directory |
@@ -531,6 +561,18 @@ When a pi extension calls `ext_ui_select`, `ext_ui_confirm`, `ext_ui_input`, or 
 ### `show raw markers` (Appearance)
 
 Default is **off** — plan markers (`[[PLAN_SET: …]]`, `[[STEP_DONE]]`, `[[PLAN_ADD: …]]`, `[[STEP_FAILED: …]]`) are stripped from the visible assistant transcript once rata-pi has parsed them. The semantic effect still fires (plan proposal, step advance, etc.). Toggle it **on** to keep the raw brackets visible — useful for debugging marker emission or inspecting the agent's exact output. Interview markers are always stripped; this toggle controls plan markers only.
+
+### `focus marker` (Appearance)
+
+Cycle row controlling how focus mode highlights the active transcript card:
+
+* `both` (default) — border **and** `▶` left-margin glyph on the focused card.
+* `border-only` — just the accent border; no margin glyph.
+* `marker-only` — just the margin glyph; border stays neutral.
+
+Useful when the border clutters a narrow terminal, or when your
+theme's border color is too close to the text color for easy
+scanning. Persisted across launches.
 
 ### Keyboard
 
@@ -547,6 +589,31 @@ Default is **off** — plan markers (`[[PLAN_SET: …]]`, `[[STEP_DONE]]`, `[[PL
 | `Esc` | Close modal |
 
 The focused row has a `▶` marker and a bold label; the value side stays accent-colored. The modal auto-scrolls to keep the selection visible as you navigate, and the scrollbar widget appears on the right when the panel is taller than the modal frame.
+
+### Preferences persistence
+
+Six preferences persist across launches as JSON:
+
+| Key | Type | Default |
+|---|---|---|
+| `theme` | string | `"tokyo-night"` |
+| `notify` | bool | `false` |
+| `vim` | bool | `false` |
+| `show_thinking` | bool | `true` |
+| `show_raw_markers` | bool | `false` |
+| `focus_marker` | `"both"` \| `"border-only"` \| `"marker-only"` | `"both"` |
+
+The file lives at `<config_dir>/rata-pi/config.json` (see [Files
+rata-pi reads and writes](#files-rata-pi-reads-and-writes) for the
+OS-specific path). Every interactive change writes the full config
+file (best-effort; failures log at debug and are swallowed — a failed
+write never crashes the app). Missing keys fall back to the defaults
+baked into `App::new`, so old configs keep loading after upgrades.
+
+The composer **draft** is saved separately (`draft.txt`) when you
+quit with `Ctrl+C` / `Ctrl+D` with unsent text in the composer, and
+restored on next launch. Clear it by simply submitting or hitting
+`Esc` to clear the composer before quitting.
 
 ---
 
@@ -927,6 +994,93 @@ When the terminal is wide enough for a two-pane layout, the right pane shows the
 
 ---
 
+## Transcript search
+
+`/search [query]` opens a live overlay over the transcript. As you
+type, rata-pi recomputes the hit list (case-insensitive substring
+match against every transcript entry's rendered text). Each hit
+shows the matching entry's role and a short snippet with the match
+highlighted. The current hit is tracked by `hit_idx`; `Enter` closes
+the overlay and focuses that entry in the transcript.
+
+### Keyboard
+
+| Key | Action |
+|---|---|
+| printable | Append to the query |
+| `Backspace` / `Delete` | Edit the query |
+| `←` / `→` / `Home` / `End` | Move the query caret |
+| `n` / `↓` / `Tab` | Next hit |
+| `N` / `↑` / `Shift+Tab` | Previous hit |
+| `Enter` | Close overlay and focus the current hit |
+| `Esc` | Close overlay without focusing |
+
+### Behaviour notes
+
+* `/search` with no argument opens the overlay with an empty query
+  and zero hits. Start typing.
+* `/search <query>` pre-fills the query and jumps the cursor to the
+  **most recent** match — matching the V3.j.3 "jump-to-latest"
+  behaviour users were already used to.
+* While the query has no hits, `n` / `N` are treated as printable
+  characters (so you can type `naive`). Once at least one hit
+  exists, `n` / `N` become navigation.
+* The hit list is computed from the full transcript, so very long
+  sessions may pause briefly on each keystroke. The query is kept
+  short in practice — three to six characters is enough to
+  disambiguate most sessions.
+
+### What is *not* implemented
+
+Inline highlight-on-match in the transcript body. The overlay's
+per-hit snippet plus the jump-to-focus on Enter is the shipped
+experience — see [`track_v4_progression.md`](../track_v4_progression.md)
+for the tracked deviation.
+
+---
+
+## Composer templates
+
+Templates are named snippets you save from the composer and reload
+later. They persist to the platform config dir, so they survive
+restarts.
+
+### Slash surface
+
+| Command | Effect |
+|---|---|
+| `/template` (alias `/tpl`) | Open the template picker |
+| `/template save <name>` | Snapshot the current composer body under `<name>` |
+| `/template use <name>` (alias `load`) | Load `<name>` into the composer |
+| `/template list` | Same as `/template` |
+| `/template delete <name>` (alias `rm`) | Remove `<name>` |
+
+### Picker modal
+
+Two-pane layout: left shows the list of template names, right shows
+the body of the selected template.
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` / `j` / `k` | Move selection |
+| `Home` / `g` / `End` / `G` | First / last |
+| `Enter` | Load the focused template's body into the composer; close modal |
+| `d` / `Del` | Delete the focused template (refreshes the list) |
+| `Esc` | Close modal |
+
+If no templates are saved yet, `/template` flashes
+`no templates saved yet — /template save <name> first` instead of
+opening an empty modal.
+
+### Persistence
+
+Templates are stored alongside the user config under
+`<config_dir>/rata-pi/templates.json`. Deletes and renames are
+atomic — the picker's in-memory list is always re-snapshotted from
+disk when you open the modal.
+
+---
+
 ## Git integration
 
 Hidden when launched outside a repo.
@@ -952,10 +1106,11 @@ Built-in themes:
 4. **catppuccin-mocha**
 5. **gruvbox-dark**
 6. **nord**
+7. **high-contrast** — CVD-friendly / low-color terminal fallback
 
 ### Switching
-* `Alt+T`, `Ctrl+Shift+T` (on Kitty keyboard terminals), or `F12` cycles through the six themes.
-* `/theme <name>` applies by name (case-insensitive): `/theme dracula`, `/theme nord`, etc.
+* `Alt+T`, `Ctrl+Shift+T` (on Kitty keyboard terminals), or `F12` cycles through the seven themes.
+* `/theme <name>` applies by name (case-insensitive): `/theme dracula`, `/theme high-contrast`, etc.
 * `/theme` with no arg cycles.
 * `/themes` opens a picker.
 
@@ -963,7 +1118,9 @@ Built-in themes:
 Each theme drives 21 semantic color slots: accent / accent_strong / muted / dim / text / success / warning / error, role colors for user / assistant / thinking / tool / bash, border colors (idle / active / modal), diff colors (add / remove / hunk / file), and context-gauge gradient colors (low / mid / high). Everything in the UI pulls from these — including the keybinding chips, the focus border, the diff viewer, the gauge, the modal borders, and the toast stack.
 
 ### Persistence
-Theme choice is **not** persisted across launches today (resets to `tokyo-night`). A TOML theme loader with hot-reload is a planned follow-up.
+Theme choice **persists** across launches. It's written to
+`<config_dir>/rata-pi/config.json` alongside the other persisted
+preferences (see [Preferences persistence](#preferences-persistence)).
 
 ---
 
@@ -1075,6 +1232,9 @@ The keybinding hint row that used to live here is gone — open `/shortcuts` for
 | `~/.local/share/rata-pi/history.jsonl` | Prompt history, append-only |
 | `~/.local/share/rata-pi/exports/transcript-<ts>.md` | Markdown exports |
 | `~/.local/state/rata-pi/crash-<unix_ts>.log` | Crash dumps (XDG state dir on Linux; `data_local_dir/rata-pi/` elsewhere) |
+| `~/.config/rata-pi/config.json` | Persisted preferences (theme, notify, vim, show_thinking, show_raw_markers, focus_marker) |
+| `~/.config/rata-pi/draft.txt` | Composer draft auto-saved on quit, restored on next launch |
+| `~/.config/rata-pi/templates.json` | Saved composer templates |
 | `<log dir>/rata-pi.log` | Trace log — path logged to stderr at startup |
 
 rata-pi does not write to the pi session files directly — pi owns those. rata-pi speaks only through the RPC protocol.
@@ -1202,6 +1362,14 @@ plan view            /plan
 plan set             /plan set a | b | c
 plan done            /plan done
 plan auto-run        /plan auto on|off
+
+search transcript    /search [query]    n/N walks hits · Enter focuses
+templates            /template          Enter loads · d deletes
+template save        /template save <name>
+template use         /template use <name>
+
+composer undo        Ctrl+Z
+composer redo        Ctrl+Shift+Z
 
 doctor               /doctor
 notifications        /notify
