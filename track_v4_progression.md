@@ -31,7 +31,7 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
   - [x] `click_list_row_sets_selection` (Thinking modal, covers the whole ListRow dispatch path)
   - [x] `click_settings_row_selects_and_resets_scroll_flag`
 
-**Shipped as** V4.a.1 `6191bfb` · V4.a.2 `<tbd>`
+**Shipped as** V4.a.1 `6191bfb` · V4.a.2 `de8a9e9`
 
 ---
 
