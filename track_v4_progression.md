@@ -7,6 +7,28 @@ Paired with `PLAN_V4.md`. Per-sub-milestone checklist; rolling metrics at the bo
 Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` / `refactor(v4.X): …` / `chore(v4.X): …` after passing:
 `cargo fmt` · `cargo clippy --all-features --all-targets -- -D warnings` · `cargo test --locked --all-features --all-targets` · `cargo build --release`.
 
+## V4 shipped 🎉
+
+All five sub-milestones done. Rolling metrics:
+
+| Metric | V3 final | V4 final | Delta |
+|---|---|---|---|
+| Tests | 242 | **255** | +13 |
+| `src/app/mod.rs` LoC | 7 241 | **5 375** | −25.8% |
+| Modules under `src/app/` (excl. `mod.rs`) | 5 | **8** (+cards, +modal_keys, +modals/bodies) | +3 |
+| Click-on-chip works | no | **yes** (except Commands) | — |
+| Click-outside-modal closes | no | **yes** | — |
+| Transcript search is a real overlay | no | **yes** | — |
+| Template picker is a real modal | no | **yes** | — |
+| `CHANGELOG.md` | no | **yes** | — |
+| Release workflow triggers on `v*` tag | no | **yes** | — |
+| Homebrew formula in tree | no | **yes** | — |
+| `Cargo.toml` version | `0.1.0` | **`1.0.0`** | — |
+
+**Shipping `v1.0.0`** requires the user-triggered steps at the bottom of V4.e (tag + push + publish + fill formula SHA256s).
+
+Six documented deviations; none affect user-visible behaviour.
+
 ---
 
 ## V4.a — Click-on-chip mouse handling ✅
@@ -109,7 +131,7 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 5. Publish to crates.io: `cargo publish` (requires `CARGO_REGISTRY_TOKEN`).
 6. Publish the GitHub release draft.
 
-**Shipped as** `<tbd>`
+**Shipped as** `8a394be`
 
 ---
 
