@@ -48,7 +48,7 @@ jobs:
       # V3.c · enforce -D warnings explicitly so a warning can never merge.
       # Local dev runs with the same flags; CI must match.
       - name: Run clippy action
-        uses: clechasseur/rs-clippy-check@v3
+        uses: clechasseur/rs-clippy-check@v5
         with:
           args: --all-features --all-targets -- -D warnings
       - name: Cache Cargo dependencies
