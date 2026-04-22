@@ -93,11 +93,35 @@ pub(super) fn handle_focus_key(code: KeyCode, _mods: KeyModifiers, app: &mut App
     }
 }
 
-/// Mouse-click dispatcher: focus on transcript cards, toggle expand on a
-/// tool card's header row (2nd click toggles), re-pin live tail when the
-/// user clicks the ⬇ chip.
+/// Mouse-click dispatcher.
+///
+/// Order of hit-test:
+///   1. V4.a · if a modal is open and the click is OUTSIDE its bounding
+///      rect, close the modal (universal "press-escape" gesture).
+///   2. V4.a · if the click lands on a registered modal chip, dispatch
+///      the chip's keyboard-equivalent action. (Populated by modals
+///      as draw registers chips; V4.a.1 seeds the infra + list-row
+///      tags; per-modal chip registrations can grow in follow-ups.)
+///   3. Live-tail chip — re-pin the transcript tail.
+///   4. Transcript entry click — focus the card; second click on a
+///      tool card toggles expand.
 pub(super) fn on_mouse_click(x: u16, y: u16, app: &mut App) {
-    // Live-tail chip first.
+    // V4.a · click-outside-modal closes the modal.
+    if app.modal.is_some()
+        && let Some(modal_rect) = app.mouse_map.modal_area
+        && !super::rect_contains(modal_rect, x, y)
+    {
+        app.modal = None;
+        return;
+    }
+
+    // V4.a · modal chip dispatch.
+    if let Some(tag) = app.mouse_map.chip_at(x, y) {
+        dispatch_chip(tag, app);
+        return;
+    }
+
+    // Live-tail chip.
     if let Some(r) = app.mouse_map.live_tail_chip
         && rect_contains(r, x, y)
     {
@@ -120,6 +144,75 @@ pub(super) fn on_mouse_click(x: u16, y: u16, app: &mut App) {
         }
     } else {
         app.focus_idx = Some(idx);
+    }
+}
+
+/// V4.a · map a clicked `ChipTag` onto the same state change the
+/// keyboard handler would produce. Additional chip variants get
+/// their dispatch arms added here as modals register them.
+fn dispatch_chip(tag: super::ChipTag, app: &mut App) {
+    use super::ChipTag;
+    use crate::ui::modal::Modal;
+    match tag {
+        ChipTag::ListRow(idx) => {
+            // Set selected = idx in the currently-open list modal so
+            // the next Enter lands on the clicked row. This mimics a
+            // "click-to-focus, Enter-to-activate" pattern rather than
+            // a full double-click-activates — much less surprising
+            // when a user misclicks.
+            match app.modal.as_mut() {
+                Some(Modal::Commands(l)) => l.selected = idx.min(l.items.len().saturating_sub(1)),
+                Some(Modal::Models(l)) => l.selected = idx.min(l.items.len().saturating_sub(1)),
+                Some(Modal::History(l)) => l.selected = idx.min(l.items.len().saturating_sub(1)),
+                Some(Modal::Forks(l)) => l.selected = idx.min(l.items.len().saturating_sub(1)),
+                _ => {}
+            }
+        }
+        ChipTag::SettingsRow(idx) => {
+            if let Some(Modal::Settings(s)) = app.modal.as_mut() {
+                s.selected = idx;
+                s.user_scrolled = false;
+            }
+        }
+        ChipTag::ThinkingOption(idx) => {
+            if let Some(Modal::Thinking(r)) = app.modal.as_mut() {
+                r.selected = idx.min(r.options.len().saturating_sub(1));
+            }
+        }
+        ChipTag::PlanReviewAccept => {
+            app.modal = None;
+            app.accept_proposed_plan();
+        }
+        ChipTag::PlanReviewDeny => {
+            app.modal = None;
+            app.deny_proposed_plan();
+        }
+        ChipTag::PlanReviewEdit => {
+            if let Some(Modal::PlanReview(state)) = app.modal.as_mut() {
+                state.mode = crate::ui::modal::PlanReviewMode::Edit;
+                state.selected = 0;
+            }
+        }
+        ChipTag::PlanReviewEditStep(i) => {
+            if let Some(Modal::PlanReview(state)) = app.modal.as_mut() {
+                state.selected = i.min(state.items.len().saturating_sub(1));
+            }
+        }
+        ChipTag::ExtSelectOption(idx) => {
+            if let Some(Modal::ExtSelect { selected, .. }) = app.modal.as_mut() {
+                *selected = idx;
+            }
+        }
+        ChipTag::ExtConfirmYes | ChipTag::ExtConfirmNo => {
+            if let Some(Modal::ExtConfirm { selected, .. }) = app.modal.as_mut() {
+                // ExtConfirm: 0 = No, 1 = Yes (per ui/modal.rs).
+                *selected = if matches!(tag, ChipTag::ExtConfirmYes) {
+                    1
+                } else {
+                    0
+                };
+            }
+        }
     }
 }
 

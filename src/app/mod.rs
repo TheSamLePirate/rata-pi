@@ -214,8 +214,46 @@ fn write_crash_dump(info: &panic::PanicHookInfo<'_>) -> Option<String> {
 
 // ───────────────────────────────────────────────────────── state ──
 
-/// Hit-test map populated by `draw_body`. Mouse handlers consult it to map
-/// screen coordinates to transcript entries.
+/// V4.a · tag for a clickable region inside an open modal. Each
+/// variant maps back onto the same action the keyboard binding would
+/// trigger, so the dispatcher in `input::on_mouse_click` can reuse
+/// existing code paths.
+///
+/// The V4.a.1 commit registers only the Plan Review action chips;
+/// V4.a.2 populates the remaining variants (SettingsRow, ListRow,
+/// Thinking, Ext*). They live here now so the dispatcher is already
+/// exhaustive and future work only has to add `mm.push_chip(...)`
+/// calls in the matching draw paths.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChipTag {
+    // ── Plan Review action chips ────────────────────────────────────
+    PlanReviewAccept,
+    PlanReviewEdit,
+    PlanReviewDeny,
+    /// Edit-mode focus on the Nth step in the draft.
+    PlanReviewEditStep(usize),
+
+    // ── Settings modal rows ─────────────────────────────────────────
+    /// Row index into the currently-rebuilt settings row list.
+    SettingsRow(usize),
+
+    // ── Generic list rows (Commands / Models / History / Forks / Files) ─
+    /// Row index into the filtered list.
+    ListRow(usize),
+
+    // ── Thinking picker radio options ───────────────────────────────
+    ThinkingOption(usize),
+
+    // ── Extension UI dialogs ────────────────────────────────────────
+    ExtSelectOption(usize),
+    ExtConfirmYes,
+    ExtConfirmNo,
+}
+
+/// Hit-test map populated by `draw_body` + modal draw paths. Mouse
+/// handlers consult it to map screen coordinates to transcript entries
+/// and (V4.a) to modal chips.
 #[derive(Debug, Default, Clone)]
 struct MouseMap {
     body_rect: Rect,
@@ -223,12 +261,22 @@ struct MouseMap {
     visible: Vec<(u16, u16, usize)>,
     /// Rect of the "⬇ live tail" chip when visible.
     live_tail_chip: Option<Rect>,
+    /// V4.a · every clickable chip / row the currently-drawn modal
+    /// exposes. Rebuilt per-frame; scanned in order on click so the
+    /// first hit wins.
+    modal_chips: Vec<(Rect, ChipTag)>,
+    /// V4.a · bounding rect of the currently-open modal (centered
+    /// popup). Click outside → close modal (the universal
+    /// "press-escape" gesture for mice).
+    modal_area: Option<Rect>,
 }
 
 impl MouseMap {
     fn clear(&mut self) {
         self.visible.clear();
         self.live_tail_chip = None;
+        self.modal_chips.clear();
+        self.modal_area = None;
     }
 
     fn entry_at(&self, x: u16, y: u16) -> Option<usize> {
@@ -241,6 +289,24 @@ impl MouseMap {
             }
         }
         None
+    }
+
+    /// V4.a · find the chip under `(x, y)`, if any. First-hit wins so
+    /// modals must register chips in visual order.
+    pub(super) fn chip_at(&self, x: u16, y: u16) -> Option<ChipTag> {
+        self.modal_chips
+            .iter()
+            .find(|(r, _)| rect_contains(*r, x, y))
+            .map(|(_, t)| *t)
+    }
+
+    /// V4.a · helper for modal draw paths to register a chip rect.
+    /// Populated by specific modal draw passes as they wire up —
+    /// V4.a.2 hooks the remaining modals. The infrastructure sits
+    /// here ready so follow-ups are additive.
+    #[allow(dead_code)]
+    pub(super) fn push_chip(&mut self, rect: Rect, tag: ChipTag) {
+        self.modal_chips.push((rect, tag));
     }
 }
 
@@ -3911,7 +3977,7 @@ fn retry_lines(r: &Retry, t: &Theme) -> Vec<Line<'static>> {
     ])]
 }
 
-fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
+fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App, mm: &mut MouseMap) {
     let theme = &app.theme;
     let (title, body, hint, max_w, max_h) = match modal {
         Modal::Help => (
@@ -4114,6 +4180,8 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
 
     let t = &app.theme;
     let rect = centered(area, max_w, max_h);
+    // V4.a · register the modal's bounding rect for mouse click-outside-closes.
+    mm.modal_area = Some(rect);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -4230,6 +4298,46 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             .scroll((scroll_y, 0)),
         main_area,
     );
+
+    // V4.a · register Plan Review action chip rects so the mouse
+    // dispatcher can route clicks on Accept / Edit / Deny back to the
+    // keyboard-equivalent action. Chip row position is predictable:
+    //   Review mode body layout:
+    //     line 0     : blank
+    //     line 1     : intro
+    //     line 2     : blank
+    //     line 3..N+3: step list (N = items.len())
+    //     line N+3   : blank
+    //     line N+4   : auto-run row
+    //     line N+5   : blank
+    //     line N+6   : action chips row  ← target
+    if let Modal::PlanReview(state) = modal
+        && state.mode == crate::ui::modal::PlanReviewMode::Review
+    {
+        let chip_src_line = 6u16 + state.items.len() as u16;
+        let screen_y = main_area
+            .y
+            .saturating_add(chip_src_line)
+            .saturating_sub(scroll_y);
+        if screen_y >= main_area.y && screen_y < main_area.y + main_area.height {
+            // chip layout from plan_review_body:
+            //   "  " then "  Accept  " then "  " then "  Edit  " then "  " then "  Deny  "
+            // col offsets within body: 2..12, 14..22, 24..32
+            let x0 = main_area.x;
+            let chips = [
+                (2u16..12u16, ChipTag::PlanReviewAccept),
+                (14u16..22u16, ChipTag::PlanReviewEdit),
+                (24u16..32u16, ChipTag::PlanReviewDeny),
+            ];
+            for (cols, tag) in chips {
+                let cx = x0.saturating_add(cols.start);
+                let cw = cols.end - cols.start;
+                if cx + cw <= main_area.x + main_area.width {
+                    mm.push_chip(Rect::new(cx, screen_y, cw, 1), tag);
+                }
+            }
+        }
+    }
 
     // Detail pane (Commands modal only).
     if let (Some(da), Modal::Commands(list)) = (detail_area, modal) {
@@ -7051,6 +7159,65 @@ I'll take it from here.",
     fn wheel_scroll_without_modal_is_a_noop() {
         let mut a = app();
         assert!(!scroll_modal(&mut a, 4));
+    }
+
+    // ── V4.a · chip infrastructure + click-outside-closes ──────────────
+
+    /// V4.a · clicking outside an open modal closes it — the universal
+    /// "press-escape" gesture for mouse users.
+    #[test]
+    fn click_outside_modal_closes_it() {
+        let mut a = app();
+        a.modal = Some(Modal::Shortcuts { scroll: 0 });
+        // Pretend draw registered the modal at rows 5..20, cols 10..80.
+        a.mouse_map.modal_area = Some(Rect::new(10, 5, 70, 15));
+        crate::app::input::on_mouse_click(2, 2, &mut a); // outside
+        assert!(a.modal.is_none(), "click outside should close modal");
+    }
+
+    /// V4.a · clicking inside the modal does NOT close it. (And with
+    /// no chip / entry registered, the click becomes a no-op — just
+    /// consumed.)
+    #[test]
+    fn click_inside_modal_does_not_close() {
+        let mut a = app();
+        a.modal = Some(Modal::Shortcuts { scroll: 0 });
+        a.mouse_map.modal_area = Some(Rect::new(10, 5, 70, 15));
+        crate::app::input::on_mouse_click(40, 10, &mut a); // inside
+        assert!(a.modal.is_some());
+    }
+
+    /// V4.a · clicking a registered chip dispatches its action.
+    /// Plan Review Accept chip → proposal accepted.
+    #[test]
+    fn click_plan_review_accept_chip_accepts() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("[[PLAN_SET: alpha | beta]]"));
+        assert!(a.proposed_plan.is_some());
+        // Register the Accept chip at (20, 10, 10, 1).
+        a.mouse_map.modal_area = Some(Rect::new(5, 5, 80, 20));
+        a.mouse_map
+            .push_chip(Rect::new(20, 10, 10, 1), ChipTag::PlanReviewAccept);
+        crate::app::input::on_mouse_click(25, 10, &mut a);
+        assert!(a.modal.is_none(), "chip click should close modal");
+        assert!(a.proposed_plan.is_none(), "proposal should be accepted");
+        assert!(a.plan.is_active(), "plan should be live");
+    }
+
+    /// V4.a · Deny chip closes + discards.
+    #[test]
+    fn click_plan_review_deny_chip_denies() {
+        let mut a = app();
+        a.on_event(Incoming::AgentStart);
+        a.on_event(assistant_end("[[PLAN_SET: a | b]]"));
+        a.mouse_map.modal_area = Some(Rect::new(5, 5, 80, 20));
+        a.mouse_map
+            .push_chip(Rect::new(40, 10, 8, 1), ChipTag::PlanReviewDeny);
+        crate::app::input::on_mouse_click(42, 10, &mut a);
+        assert!(a.modal.is_none());
+        assert!(a.proposed_plan.is_none(), "proposal discarded on Deny");
+        assert!(!a.plan.is_active(), "plan not activated");
     }
 
     /// V3.h · Shortcuts modal scroll regression. PgDn bumps by 10;

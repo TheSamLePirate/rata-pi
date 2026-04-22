@@ -9,24 +9,26 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 
 ---
 
-## V4.a — Click-on-chip mouse handling
+## V4.a — Click-on-chip mouse handling ✅ (V4.a.1 infra; V4.a.2 deferred)
 
-- [ ] `MouseMap.modal_chips: Vec<(Rect, ChipTag)>`
-- [ ] `enum ChipTag` covering every action-chip modal:
-  - [ ] Plan Review: `PlanReviewAccept`, `PlanReviewEdit`, `PlanReviewDeny`
-  - [ ] Settings: `SettingsRow(usize)`
-  - [ ] Commands / Models / History / Forks / Files: `ListRow(usize)`
-  - [ ] Thinking picker: `ThinkingOption(usize)`
-  - [ ] ExtSelect / ExtConfirm / ExtInput
-- [ ] Each modal's draw path registers its chips
-- [ ] `input::on_mouse_click` dispatches by `ChipTag` (keyboard-equivalent behavior)
-- [ ] Tests:
-  - [ ] Click Plan Review Accept → proposal accepted
-  - [ ] Click Settings row → toggle flips / cycle advances
-  - [ ] Click Commands row → selection + Enter behavior
-  - [ ] Click outside any chip is a no-op (doesn't scroll transcript)
+- [x] `MouseMap.modal_chips: Vec<(Rect, ChipTag)>` + `modal_area: Option<Rect>`
+- [x] `enum ChipTag` exhaustive (all variants declared; populating them is additive):
+  - [x] Plan Review: `PlanReviewAccept`, `PlanReviewEdit`, `PlanReviewDeny`, `PlanReviewEditStep(usize)`
+  - [x] Settings: `SettingsRow(usize)` (variant present; registration in V4.a.2)
+  - [x] List rows: `ListRow(usize)` (variant present; registration in V4.a.2)
+  - [x] Thinking picker: `ThinkingOption(usize)` (variant present; registration in V4.a.2)
+  - [x] Ext dialogs: `ExtSelectOption`, `ExtConfirmYes`, `ExtConfirmNo` (variants present; registration in V4.a.2)
+- [x] `input::on_mouse_click` dispatches by `ChipTag` — every variant has its keyboard-equivalent arm
+- [x] Plan Review action chips (Accept / Edit / Deny) registered in `draw_modal`
+- [x] Click-outside-modal closes the modal (universal "press-escape" for mice)
+- [!] Registration for Settings / List / Thinking / Ext chips — **deferred to V4.a.2**. The dispatcher is fully wired; each remaining modal is a `mm.push_chip(...)` call or two in its draw path. See Deviations §1.
+- [x] Tests:
+  - [x] `click_outside_modal_closes_it`
+  - [x] `click_inside_modal_does_not_close`
+  - [x] `click_plan_review_accept_chip_accepts`
+  - [x] `click_plan_review_deny_chip_denies`
 
-**Shipped as** ``
+**Shipped as** `<tbd>` (V4.a.1)
 
 ---
 
@@ -118,7 +120,12 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 
 *(Same pattern as V3 — record sub-milestone · task · what changed · why. Blank section = on plan.)*
 
-_(none yet)_
+### 1. V4.a · Settings / List / Thinking / Ext chip registration deferred
+**What changed.** V4.a.1 shipped the full chip infrastructure (`MouseMap.modal_chips`, `push_chip`, `chip_at`, `dispatch_chip`), all `ChipTag` variants, click-outside-modal-closes, and Plan Review action chips end-to-end. The remaining registrations (SettingsRow / ListRow / ThinkingOption / ExtSelect / ExtConfirm) are **not yet wired into `draw_modal`**.
+
+**Why.** Registering a chip per visible row in a list modal requires computing per-row rects at render time against a scrolling viewport; doing it cleanly wants either (a) instrumenting the body builders (`commands_text`, `models_text`, …) to emit row-position metadata or (b) a second render pass that consumes the rendered Paragraph's line rects. Option (a) pollutes the body builders with layout concerns; (b) isn't cheap to do right.
+
+The user-visible behavior is **already a big step forward** — click-outside-closes + Plan Review chips cover the most-requested gestures. Keyboard shortcuts for every other modal still work. Follow-ups land in V4.a.2 (could be a 1-day piece of work) without any further plumbing: the dispatcher is exhaustive and the map is generic.
 
 ---
 

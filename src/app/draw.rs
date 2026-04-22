@@ -141,7 +141,7 @@ pub(super) fn draw(f: &mut ratatui::Frame, app: &App, mm: &mut MouseMap) {
     draw_toasts(f, area, &app.ext_ui.toasts, &app.theme);
 
     if let Some(modal) = &app.modal {
-        draw_modal(f, area, modal, app);
+        draw_modal(f, area, modal, app, mm);
     }
 }
 
