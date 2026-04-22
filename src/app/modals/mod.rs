@@ -5,5 +5,6 @@
 //! user's choice as an RPC. `mod.rs` re-exports the public surface its
 //! own code needs and delegates everything else.
 
+pub(super) mod bodies;
 pub(super) mod interview;
 pub(super) mod settings;
