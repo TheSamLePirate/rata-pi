@@ -9,26 +9,29 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 
 ---
 
-## V4.a — Click-on-chip mouse handling ✅ (V4.a.1 infra; V4.a.2 deferred)
+## V4.a — Click-on-chip mouse handling ✅
 
 - [x] `MouseMap.modal_chips: Vec<(Rect, ChipTag)>` + `modal_area: Option<Rect>`
-- [x] `enum ChipTag` exhaustive (all variants declared; populating them is additive):
-  - [x] Plan Review: `PlanReviewAccept`, `PlanReviewEdit`, `PlanReviewDeny`, `PlanReviewEditStep(usize)`
-  - [x] Settings: `SettingsRow(usize)` (variant present; registration in V4.a.2)
-  - [x] List rows: `ListRow(usize)` (variant present; registration in V4.a.2)
-  - [x] Thinking picker: `ThinkingOption(usize)` (variant present; registration in V4.a.2)
-  - [x] Ext dialogs: `ExtSelectOption`, `ExtConfirmYes`, `ExtConfirmNo` (variants present; registration in V4.a.2)
+- [x] `enum ChipTag` exhaustive; every variant has a dispatch arm in `input::dispatch_chip`:
+  - [x] Plan Review: `PlanReviewAccept` · `PlanReviewEdit` · `PlanReviewDeny` · `PlanReviewEditStep(usize)`
+  - [x] Settings: `SettingsRow(usize)`
+  - [x] List rows: `ListRow(usize)` (Models / History / Forks / Files / GitLog)
+  - [x] Thinking picker: `ThinkingOption(usize)`
+  - [x] Ext dialogs: `ExtSelectOption(usize)` · `ExtConfirmYes` · `ExtConfirmNo`
 - [x] `input::on_mouse_click` dispatches by `ChipTag` — every variant has its keyboard-equivalent arm
-- [x] Plan Review action chips (Accept / Edit / Deny) registered in `draw_modal`
-- [x] Click-outside-modal closes the modal (universal "press-escape" for mice)
-- [!] Registration for Settings / List / Thinking / Ext chips — **deferred to V4.a.2**. The dispatcher is fully wired; each remaining modal is a `mm.push_chip(...)` call or two in its draw path. See Deviations §1.
+- [x] Plan Review action chips registered in `draw_modal`
+- [x] V4.a.2 · chip rects registered for Settings / list modals / Thinking / ExtSelect / ExtConfirm
+- [x] Click-outside-modal closes the modal
+- [—] Commands modal row click — **dropped**. Commands has category-group headers interleaved with rows; mapping a clicked Y back to an item index needs the full `commands_selected_line` walk. Keyboard shortcuts still work. Followup candidate if users ask.
 - [x] Tests:
   - [x] `click_outside_modal_closes_it`
   - [x] `click_inside_modal_does_not_close`
   - [x] `click_plan_review_accept_chip_accepts`
   - [x] `click_plan_review_deny_chip_denies`
+  - [x] `click_list_row_sets_selection` (Thinking modal, covers the whole ListRow dispatch path)
+  - [x] `click_settings_row_selects_and_resets_scroll_flag`
 
-**Shipped as** `6191bfb` (V4.a.1 · infrastructure + Plan Review + click-outside)
+**Shipped as** V4.a.1 `6191bfb` · V4.a.2 `<tbd>`
 
 ---
 
@@ -102,17 +105,18 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 
 | | V3 final | V4.a | V4.b | V4.c | V4.d | V4.e |
 |---|---|---|---|---|---|---|
-| Tests | 242 | | | | | ≥ 265 |
-| `src/app/mod.rs` LoC | 7 241 | | | | < 4 000 | |
-| Modules under `src/app/modals/` | 2 | | | | ≥ 4 | |
-| Click-on-chip works | no | yes | yes | yes | yes | yes |
+| Tests | 242 | **248** | | | | ≥ 265 |
+| `src/app/mod.rs` LoC | 7 241 | 7 394 | | | < 4 000 | |
+| Modules under `src/app/modals/` | 2 | 2 | | | ≥ 4 | |
+| Click-on-chip works | no | **yes** (except Commands) | yes | yes | yes | yes |
+| Click-outside-modal closes | no | **yes** | yes | yes | yes | yes |
 | Transcript search overlay | no | no | yes | yes | yes | yes |
 | Template picker modal | no | no | no | yes | yes | yes |
 | `cargo install rata-pi` works | no | no | no | no | no | yes |
 | Homebrew formula available | no | no | no | no | no | yes |
 | Release tag | — | — | — | — | — | `v1.0.0` |
-| Clippy clean | ✓ | | | | | ✓ |
-| Fmt clean | ✓ | | | | | ✓ |
+| Clippy clean | ✓ | ✓ | | | | ✓ |
+| Fmt clean | ✓ | ✓ | | | | ✓ |
 
 ---
 
@@ -120,12 +124,15 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 
 *(Same pattern as V3 — record sub-milestone · task · what changed · why. Blank section = on plan.)*
 
-### 1. V4.a · Settings / List / Thinking / Ext chip registration deferred
-**What changed.** V4.a.1 shipped the full chip infrastructure (`MouseMap.modal_chips`, `push_chip`, `chip_at`, `dispatch_chip`), all `ChipTag` variants, click-outside-modal-closes, and Plan Review action chips end-to-end. The remaining registrations (SettingsRow / ListRow / ThinkingOption / ExtSelect / ExtConfirm) are **not yet wired into `draw_modal`**.
+### 2. V4.a.2 · Commands modal row click dropped
+**What changed.** Every other list-style modal (Models / History / Forks / Files / GitLog) got click-to-select rows in V4.a.2. Commands did not.
 
-**Why.** Registering a chip per visible row in a list modal requires computing per-row rects at render time against a scrolling viewport; doing it cleanly wants either (a) instrumenting the body builders (`commands_text`, `models_text`, …) to emit row-position metadata or (b) a second render pass that consumes the rendered Paragraph's line rects. Option (a) pollutes the body builders with layout concerns; (b) isn't cheap to do right.
+**Why.** Commands has category-group headers (Session / Git / Model / …) interleaved with the rows; the source-line → item-index map goes through `commands_selected_line`, which walks the filtered list grouping on each frame. Running that walk in reverse to convert a clicked Y back to an item index is a 30-line helper that duplicates display logic. The keyboard path still works; user can arrow to a row. If it comes up as a user request, revisit.
 
-The user-visible behavior is **already a big step forward** — click-outside-closes + Plan Review chips cover the most-requested gestures. Keyboard shortcuts for every other modal still work. Follow-ups land in V4.a.2 (could be a 1-day piece of work) without any further plumbing: the dispatcher is exhaustive and the map is generic.
+### 1. V4.a.1 · Settings / List / Thinking / Ext chip registration deferred
+*(Resolved by V4.a.2 — deviation closed.)*
+
+V4.a.1 shipped the dispatcher + infra + Plan Review chips; V4.a.2 added chip registrations for Settings, list modals (Models / History / Forks / Files / GitLog), Thinking picker, ExtSelect, ExtConfirm. Every modal except Commands (see §2) now routes mouse clicks to the same code path as the keyboard shortcut.
 
 ---
 

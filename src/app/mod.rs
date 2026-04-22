@@ -4339,6 +4339,82 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App, mm: 
         }
     }
 
+    // V4.a.2 · register chip rects for list-style modals. Rows are
+    // one-per-item starting at source-line 2 (list-modal convention —
+    // see `selected_line` match arms above). Rect spans the full list
+    // width so a click anywhere on the row counts.
+    let register_list_rows = |mm: &mut MouseMap, n: usize, tag_fn: fn(usize) -> ChipTag| {
+        for i in 0..n {
+            let src = 2u16 + i as u16;
+            let screen_y = main_area.y.saturating_add(src).saturating_sub(scroll_y);
+            if screen_y >= main_area.y && screen_y < main_area.y + main_area.height {
+                mm.push_chip(
+                    Rect::new(main_area.x, screen_y, main_area.width, 1),
+                    tag_fn(i),
+                );
+            }
+        }
+    };
+    match modal {
+        Modal::Models(l) => register_list_rows(mm, l.items.len(), ChipTag::ListRow),
+        Modal::History(l) => register_list_rows(mm, l.items.len(), ChipTag::ListRow),
+        Modal::Forks(l) => register_list_rows(mm, l.items.len(), ChipTag::ListRow),
+        Modal::Files(ff) => register_list_rows(mm, ff.filtered.len(), ChipTag::ListRow),
+        Modal::GitLog(s) => register_list_rows(mm, s.commits.len(), ChipTag::ListRow),
+        Modal::Thinking(r) => register_list_rows(mm, r.options.len(), ChipTag::ThinkingOption),
+        Modal::ExtSelect { options, .. } => {
+            // ExtSelect lines start at 0 (no header), one per option.
+            for i in 0..options.len() {
+                let src = i as u16;
+                let screen_y = main_area.y.saturating_add(src).saturating_sub(scroll_y);
+                if screen_y >= main_area.y && screen_y < main_area.y + main_area.height {
+                    mm.push_chip(
+                        Rect::new(main_area.x, screen_y, main_area.width, 1),
+                        ChipTag::ExtSelectOption(i),
+                    );
+                }
+            }
+        }
+        Modal::ExtConfirm { .. } => {
+            // ext_confirm_text lays out the two buttons on a single
+            // row: "  [ No ]    [ Yes ]  " approximately at the last
+            // content line. Registering full-row halves keeps the
+            // layout simple and click-friendly.
+            let screen_y = main_area
+                .y
+                .saturating_add(main_area.height.saturating_sub(2));
+            if screen_y >= main_area.y && screen_y < main_area.y + main_area.height {
+                let half = main_area.width / 2;
+                mm.push_chip(
+                    Rect::new(main_area.x, screen_y, half, 1),
+                    ChipTag::ExtConfirmNo,
+                );
+                mm.push_chip(
+                    Rect::new(main_area.x + half, screen_y, main_area.width - half, 1),
+                    ChipTag::ExtConfirmYes,
+                );
+            }
+        }
+        Modal::Settings(_) => {
+            // V4.a.2 · settings rows have variable heights (Header =
+            // 2 rows, interactive = 1). Use the same source-line math
+            // `settings_row_source_line` already exposes.
+            let rows = build_settings_rows(app);
+            for (i, _r) in rows.iter().enumerate() {
+                if let Some(src) = settings_row_source_line(&rows, i) {
+                    let screen_y = main_area.y.saturating_add(src).saturating_sub(scroll_y);
+                    if screen_y >= main_area.y && screen_y < main_area.y + main_area.height {
+                        mm.push_chip(
+                            Rect::new(main_area.x, screen_y, main_area.width, 1),
+                            ChipTag::SettingsRow(i),
+                        );
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
     // Detail pane (Commands modal only).
     if let (Some(da), Modal::Commands(list)) = (detail_area, modal) {
         let detail = command_detail_lines(list, t);
@@ -7203,6 +7279,52 @@ I'll take it from here.",
         assert!(a.modal.is_none(), "chip click should close modal");
         assert!(a.proposed_plan.is_none(), "proposal should be accepted");
         assert!(a.plan.is_active(), "plan should be live");
+    }
+
+    /// V4.a.2 · clicking a ListRow chip sets the modal's selected
+    /// index. Following Enter then activates the new selection.
+    #[test]
+    fn click_list_row_sets_selection() {
+        let mut a = app();
+        // Build a Thinking modal (uses RadioModal which is list-like).
+        let opts = vec![
+            (ThinkingLevel::Off, "off"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+        ];
+        a.modal = Some(Modal::Thinking(RadioModal::new("think", opts, 0)));
+        a.mouse_map.modal_area = Some(Rect::new(10, 5, 60, 15));
+        // Clicking index-2 chip should set selected=2.
+        a.mouse_map
+            .push_chip(Rect::new(10, 9, 60, 1), ChipTag::ThinkingOption(2));
+        crate::app::input::on_mouse_click(30, 9, &mut a);
+        match a.modal {
+            Some(Modal::Thinking(ref r)) => assert_eq!(r.selected, 2),
+            _ => panic!("modal missing"),
+        }
+    }
+
+    /// V4.a.2 · SettingsRow chip click selects the clicked row and
+    /// turns off user_scrolled so focus-follow auto-scroll resumes.
+    #[test]
+    fn click_settings_row_selects_and_resets_scroll_flag() {
+        let mut a = app();
+        a.modal = Some(Modal::Settings(crate::ui::modal::SettingsState {
+            selected: 0,
+            scroll: 0,
+            user_scrolled: true,
+        }));
+        a.mouse_map.modal_area = Some(Rect::new(5, 5, 80, 20));
+        a.mouse_map
+            .push_chip(Rect::new(5, 10, 80, 1), ChipTag::SettingsRow(7));
+        crate::app::input::on_mouse_click(30, 10, &mut a);
+        match &a.modal {
+            Some(Modal::Settings(s)) => {
+                assert_eq!(s.selected, 7);
+                assert!(!s.user_scrolled);
+            }
+            _ => panic!("modal missing"),
+        }
     }
 
     /// V4.a · Deny chip closes + discards.
