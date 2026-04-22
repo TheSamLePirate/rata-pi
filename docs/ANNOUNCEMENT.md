@@ -4,9 +4,9 @@
 
 Today I'm tagging **rata-pi 1.0.0**. It's a Ratatui-based terminal UI
 for [`@mariozechner/pi-coding-agent`](https://github.com/mariozechner/pi-coding-agent)
-— the `pi` CLI. You install it with `brew install olivvein/rata-pi/rata-pi`,
+— the `pi` CLI. You install it with `brew install TheSamLePirate/rata-pi/rata-pi`,
 `cargo install rata-pi`, or a platform tarball from the
-[Releases page](https://github.com/olivvein/rata-pi/releases).
+[Releases page](https://github.com/TheSamLePirate/rata-pi/releases).
 
 ## Why it exists
 
@@ -131,7 +131,7 @@ and [`track_v4_progression.md`](../track_v4_progression.md). Highlights:
 npm install -g @mariozechner/pi-coding-agent
 
 # install rata-pi
-brew install olivvein/rata-pi/rata-pi    # macOS / Linux
+brew install TheSamLePirate/rata-pi/rata-pi    # macOS / Linux
 # or
 cargo install rata-pi
 

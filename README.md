@@ -100,7 +100,7 @@ announcement.
 ### Homebrew (macOS, Linux)
 
 ```bash
-brew install olivvein/rata-pi/rata-pi
+brew install TheSamLePirate/rata-pi/rata-pi
 ```
 
 *(tap repo is populated once the `v1.0.0` GitHub release is published
@@ -116,7 +116,7 @@ cargo install rata-pi
 ### Build from source
 
 ```bash
-git clone https://github.com/olivvein/rata-pi
+git clone https://github.com/TheSamLePirate/rata-pi
 cd rata-pi
 cargo build --release   # target/release/rata-pi, ~5 MiB
 cargo run --release     # run without installing
@@ -133,7 +133,7 @@ Every `v*` tag triggers a
 - Windows x86_64 (`x86_64-pc-windows-msvc`)
 
 Download the tarball / zip for your platform from the
-[Releases page](https://github.com/olivvein/rata-pi/releases).
+[Releases page](https://github.com/TheSamLePirate/rata-pi/releases).
 
 ## Running
 

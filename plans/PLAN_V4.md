@@ -131,12 +131,12 @@ Total: ~10 working days. Realistic calendar: 2–3 weeks.
   - **Plain GitHub Actions** — hand-written release.yml that runs `cargo build --release` on Ubuntu + macOS + Windows, uploads artifacts.
   - Default: cargo-dist (it's the path of least resistance for a single-binary Rust CLI).
 - [ ] Homebrew formula — either via cargo-dist or hand-written in a `homebrew-rata-pi` tap repo.
-- [ ] README install section rewritten — `brew install olivvein/rata-pi/rata-pi` + `cargo install rata-pi` + "or build from source".
+- [ ] README install section rewritten — `brew install TheSamLePirate/rata-pi/rata-pi` + `cargo install rata-pi` + "or build from source".
 - [ ] Tag `v1.0.0`, push, verify the release workflow produces installable artifacts.
 
 ### Acceptance
 - `cargo install rata-pi --version 1.0.0` works.
-- `brew install olivvein/rata-pi/rata-pi` works OR a documented formula is checked into a `Formula/` dir for manual tap.
+- `brew install TheSamLePirate/rata-pi/rata-pi` works OR a documented formula is checked into a `Formula/` dir for manual tap.
 - GitHub release page shows binaries for at least macOS (arm64 + x86_64) and Linux (x86_64).
 - CHANGELOG renders cleanly on GitHub.
 

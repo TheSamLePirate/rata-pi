@@ -6,8 +6,8 @@ authors = ["olivvein <parcouru_epoque.9b@icloud.com>"]
 license = "MIT"
 edition = "2024"
 readme = "README.md"
-repository = "https://github.com/olivvein/rata-pi"
-homepage = "https://github.com/olivvein/rata-pi"
+repository = "https://github.com/TheSamLePirate/rata-pi"
+homepage = "https://github.com/TheSamLePirate/rata-pi"
 keywords = ["tui", "ratatui", "pi", "agent", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 

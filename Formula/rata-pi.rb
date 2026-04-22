@@ -10,7 +10,7 @@
 #
 # Then either:
 #   (a) copy this file into a `homebrew-rata-pi` tap repo so users can
-#       `brew install olivvein/rata-pi/rata-pi`, or
+#       `brew install TheSamLePirate/rata-pi/rata-pi`, or
 #   (b) `brew install --formula Formula/rata-pi.rb` from a local checkout.
 #
 # Future version bumps: update `version`, `url`, and `sha256` for each
@@ -18,17 +18,17 @@
 
 class RataPi < Formula
   desc "Terminal UI for the Pi coding agent (@mariozechner/pi-coding-agent)"
-  homepage "https://github.com/olivvein/rata-pi"
+  homepage "https://github.com/TheSamLePirate/rata-pi"
   version "1.0.0"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/olivvein/rata-pi/releases/download/v#{version}/rata-pi-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/TheSamLePirate/rata-pi/releases/download/v#{version}/rata-pi-aarch64-apple-darwin.tar.gz"
       sha256 "REPLACE_WITH_SHA256_FOR_aarch64-apple-darwin"
     end
     on_intel do
-      url "https://github.com/olivvein/rata-pi/releases/download/v#{version}/rata-pi-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/TheSamLePirate/rata-pi/releases/download/v#{version}/rata-pi-x86_64-apple-darwin.tar.gz"
       sha256 "REPLACE_WITH_SHA256_FOR_x86_64-apple-darwin"
     end
   end
@@ -36,7 +36,7 @@ class RataPi < Formula
   on_linux do
     # 64-bit x86 only at 1.0.0. aarch64-linux is a follow-up (needs
     # cross-compilation or a separate Linux ARM runner in CI).
-    url "https://github.com/olivvein/rata-pi/releases/download/v#{version}/rata-pi-x86_64-unknown-linux-gnu.tar.gz"
+    url "https://github.com/TheSamLePirate/rata-pi/releases/download/v#{version}/rata-pi-x86_64-unknown-linux-gnu.tar.gz"
     sha256 "REPLACE_WITH_SHA256_FOR_x86_64-unknown-linux-gnu"
   end
 

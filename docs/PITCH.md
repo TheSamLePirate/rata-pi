@@ -59,13 +59,13 @@ A full-screen TUI that wraps `pi` without changing it:
 ## Install in one command
 
 ```bash
-brew install olivvein/rata-pi/rata-pi
+brew install TheSamLePirate/rata-pi/rata-pi
 npm install -g @mariozechner/pi-coding-agent
 rata-pi
 ```
 
 Or `cargo install rata-pi`, or a prebuilt tarball from the
-[Releases page](https://github.com/olivvein/rata-pi/releases).
+[Releases page](https://github.com/TheSamLePirate/rata-pi/releases).
 
 ## Who it's for
 

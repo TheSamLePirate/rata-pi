@@ -9,7 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 First tagged release. `1.0.0` consolidates the V2 → V3 → V4 evolution
 into something you can `cargo install rata-pi` or
-`brew install olivvein/rata-pi/rata-pi`.
+`brew install TheSamLePirate/rata-pi/rata-pi`.
 
 ### What rata-pi is
 
