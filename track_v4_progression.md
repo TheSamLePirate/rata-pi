@@ -50,7 +50,7 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
   - [x] `search_modal_live_filter`
   - [x] `search_modal_navigate_and_enter_focus`
 
-**Shipped as** `<tbd>`
+**Shipped as** `25d4d5a`
 
 ---
 
