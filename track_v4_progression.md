@@ -54,22 +54,23 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 
 ---
 
-## V4.c — Template picker modal
+## V4.c — Template picker modal ✅
 
-- [ ] `Template { name, body }` struct
-- [ ] `Modal::Templates(ListModal<Template>)`
-- [ ] Two-column draw (list left, preview right) reusing Commands pattern
-- [ ] `/template` (no args) opens the picker
-- [ ] Enter loads into composer
-- [ ] `d` deletes (maybe with "confirm?" two-step)
-- [ ] `s` captures current composer as a new template (prompts for name via ext-ui input)
-- [ ] Tests:
-  - [ ] List renders all stored templates
-  - [ ] Enter loads template into composer
-  - [ ] `d` removes and refreshes
-  - [ ] `/template` alone opens modal; `/template use <x>` still works
+- [x] `Template { name, body }` struct in `ui::modal` + `From<(String, String)>`
+- [x] `Modal::Templates(ListModal<Template>)`
+- [x] Two-column draw reusing the Commands/Files two-pane path — list on left, body preview on right
+- [x] `/template` (no args) opens the picker (alias `/template list` and `/template pick`)
+- [x] Enter loads into composer; Esc closes without touching the composer
+- [x] `d` / Delete deletes the focused template; auto-closes the modal when the list becomes empty
+- [—] `s`-in-modal quick-save from composer — **dropped**. `/template save <name>` already covers it, and adding an ext-ui input dialog inside the picker for the name prompt would layer modal-on-modal state. See Deviations §4.
+- [x] ListRow chip registered so mouse clicks select + Enter-to-activate
+- [x] Scroll routing: wheel up/down steps selection (ListModal has no separate scroll offset; `selected_line` centres the row)
+- [x] Tests:
+  - [x] `template_picker_enter_loads_body`
+  - [x] `template_picker_delete_removes_and_auto_closes_when_empty`
+  - [x] `template_picker_esc_closes_without_loading`
 
-**Shipped as** ``
+**Shipped as** `<tbd>`
 
 ---
 
@@ -105,24 +106,29 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 
 | | V3 final | V4.a | V4.b | V4.c | V4.d | V4.e |
 |---|---|---|---|---|---|---|
-| Tests | 242 | 248 | **252** | | | ≥ 265 |
-| `src/app/mod.rs` LoC | 7 241 | 7 394 | 7 581 | | < 4 000 | |
-| Modules under `src/app/modals/` | 2 | 2 | 2 | | ≥ 4 | |
+| Tests | 242 | 248 | 252 | **255** | | ≥ 265 |
+| `src/app/mod.rs` LoC | 7 241 | 7 394 | 7 581 | 7 808 | < 4 000 | |
+| Modules under `src/app/modals/` | 2 | 2 | 2 | 2 | ≥ 4 | |
 | Click-on-chip works | no | yes (except Commands) | yes | yes | yes | yes |
 | Click-outside-modal closes | no | yes | yes | yes | yes | yes |
-| Transcript search overlay | no | no | **yes** | yes | yes | yes |
-| Template picker modal | no | no | no | yes | yes | yes |
+| Transcript search overlay | no | no | yes | yes | yes | yes |
+| Template picker modal | no | no | no | **yes** | yes | yes |
 | `cargo install rata-pi` works | no | no | no | no | no | yes |
 | Homebrew formula available | no | no | no | no | no | yes |
 | Release tag | — | — | — | — | — | `v1.0.0` |
-| Clippy clean | ✓ | ✓ | ✓ | | | ✓ |
-| Fmt clean | ✓ | ✓ | ✓ | | | ✓ |
+| Clippy clean | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| Fmt clean | ✓ | ✓ | ✓ | ✓ | | ✓ |
 
 ---
 
 ## Deviations
 
 *(Same pattern as V3 — record sub-milestone · task · what changed · why. Blank section = on plan.)*
+
+### 4. V4.c · save-from-inside-picker (`s`) dropped
+**What changed.** `PLAN_V4` listed `s` inside the picker as a "capture current composer as a new template (prompts for name via ext-ui input)". Not shipped.
+
+**Why.** The save path already exists as `/template save <name>` — one slash away. Adding an in-picker `s` means either stacking a text-input modal on top of the picker (modal-on-modal state isn't supported today) or building a dedicated inline input widget inside the picker row. Both are scope increases for a feature that duplicates an existing one-liner. The picker is now the discoverable entry for load / delete; save stays as a slash. Revisit if users ask.
 
 ### 3. V4.b · inline match highlighting in transcript dropped
 **What changed.** `PLAN_V4` called for the transcript search overlay to push a highlight substring through the visuals cache so matches underline/reverse inside the rendered assistant markdown. The search modal ships **without** inline highlighting.

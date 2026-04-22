@@ -165,6 +165,7 @@ fn dispatch_chip(tag: super::ChipTag, app: &mut App) {
                 Some(Modal::Models(l)) => l.selected = idx.min(l.items.len().saturating_sub(1)),
                 Some(Modal::History(l)) => l.selected = idx.min(l.items.len().saturating_sub(1)),
                 Some(Modal::Forks(l)) => l.selected = idx.min(l.items.len().saturating_sub(1)),
+                Some(Modal::Templates(l)) => l.selected = idx.min(l.items.len().saturating_sub(1)),
                 _ => {}
             }
         }

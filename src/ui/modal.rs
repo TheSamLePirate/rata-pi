@@ -154,6 +154,11 @@ pub enum Modal {
     /// Esc closes.
     Search(SearchState),
 
+    /// V4.c · composer template picker. Two-pane: name list on the
+    /// left, body preview on the right. Enter loads into composer,
+    /// `d` deletes, Esc closes.
+    Templates(ListModal<Template>),
+
     Help,
 
     /// Extension UI dialog: select from a list of strings.
@@ -334,6 +339,22 @@ pub struct GitBranchState {
     pub branches: Vec<Branch>,
     pub query: String,
     pub selected: usize,
+}
+
+/// V4.c · a saved composer template. Name is the key under which
+/// the body is stored in the on-disk templates map; body is the raw
+/// composer text. The modal uses this as its list-item type so
+/// selection carries both fields.
+#[derive(Debug, Clone)]
+pub struct Template {
+    pub name: String,
+    pub body: String,
+}
+
+impl From<(String, String)> for Template {
+    fn from((name, body): (String, String)) -> Self {
+        Self { name, body }
+    }
 }
 
 /// A scrollable, filterable list of items.

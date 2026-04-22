@@ -1528,6 +1528,17 @@ fn scroll_modal(app: &mut App, delta: i32) -> bool {
             bump(&mut s.scroll, delta);
             true
         }
+        // V4.c · Templates has no separate scroll offset (ListModal
+        // centers on `selected`). Wheel up/down moves the selection
+        // by one — auto-scroll follows via `selected_line` math.
+        Modal::Templates(l) => {
+            if !l.items.is_empty() {
+                let step = if delta > 0 { 1 } else { -1 };
+                let next = (l.selected as i32 + step).clamp(0, l.items.len() as i32 - 1) as usize;
+                l.selected = next;
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -1668,6 +1679,52 @@ async fn handle_modal_key(
                 dispatch_settings_action(app, client, action).await;
             }
         }
+        // V4.c · template picker.
+        //   ↑↓ / j / k  nav
+        //   Enter       load body into composer, close modal
+        //   d / Del     delete focused template + refresh the list
+        //   Esc         close
+        Modal::Templates(list) => match code {
+            KeyCode::Esc => app.modal = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !list.items.is_empty() {
+                    list.selected = (list.selected + 1).min(list.items.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                list.selected = list.selected.saturating_sub(1);
+            }
+            KeyCode::Home | KeyCode::Char('g') => list.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                list.selected = list.items.len().saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(t) = list.items.get(list.selected) {
+                    let body = t.body.clone();
+                    let name = t.name.clone();
+                    app.composer.set_text(&body);
+                    app.modal = None;
+                    app.flash_success(format!("loaded template {name:?}"));
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let Some(t) = list.items.get(list.selected) {
+                    let name = t.name.clone();
+                    crate::templates::delete(&name);
+                    list.items.remove(list.selected);
+                    if list.selected >= list.items.len() && !list.items.is_empty() {
+                        list.selected = list.items.len() - 1;
+                    }
+                    if list.items.is_empty() {
+                        app.modal = None;
+                        app.flash_info(format!("deleted {name:?} — no templates left"));
+                    } else {
+                        app.flash_success(format!("deleted template {name:?}"));
+                    }
+                }
+            }
+            _ => {}
+        },
         // V4.b · transcript-search overlay.
         //   printable / Backspace / Delete / ←→/Home/End — edit query
         //   n / Down / Tab     — next hit
@@ -2530,13 +2587,8 @@ fn handle_template_slash(app: &mut App, arg: &str) {
     let sub = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("").trim();
     match sub {
-        "" | "list" => {
-            let names = crate::templates::list_names();
-            if names.is_empty() {
-                app.flash_info("no templates saved yet — /template save <name> first");
-            } else {
-                app.flash_info(format!("templates: {}", names.join(" · ")));
-            }
+        "" | "list" | "pick" => {
+            open_template_picker(app);
         }
         "save" if !rest.is_empty() => {
             let body = app.composer.text();
@@ -2576,6 +2628,26 @@ fn handle_template_slash(app: &mut App, arg: &str) {
             app.flash_warn("/template <save|use|list|delete> [name]");
         }
     }
+}
+
+/// V4.c · open the template picker modal, snapshotting the current
+/// templates map into a `ListModal<Template>`. Flashes when empty so
+/// first-time users see the save instruction.
+fn open_template_picker(app: &mut App) {
+    use crate::ui::modal::{ListModal, Template};
+    let items: Vec<Template> = crate::templates::load()
+        .into_iter()
+        .map(Template::from)
+        .collect();
+    if items.is_empty() {
+        app.flash_info("no templates saved yet — /template save <name> first");
+        return;
+    }
+    app.modal = Some(Modal::Templates(ListModal::new(
+        "templates",
+        "↑↓ nav · Enter load · d delete · Esc close",
+        items,
+    )));
 }
 
 fn handle_plan_slash(app: &mut App, arg: &str) {
@@ -4204,6 +4276,16 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App, mm: 
             100,
             32,
         ),
+        // V4.c · template picker. Two-pane: name list left, body
+        // preview right (reuses the Commands/Files two-column
+        // layout path below).
+        Modal::Templates(list) => (
+            format!(" {} ", list.title),
+            templates_text(list, theme),
+            list.hint.clone(),
+            100,
+            24,
+        ),
         Modal::Search(state) => {
             let hint = if state.hits.is_empty() {
                 if state.query.is_empty() {
@@ -4312,7 +4394,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App, mm: 
     // Two-pane layout when this is a Commands modal AND the terminal is
     // wide enough: left ~60% = list, right ~40% = detail pane.
     let (list_area, detail_area) = match modal {
-        Modal::Commands(_) | Modal::Files(_) if inner.width >= 80 => {
+        Modal::Commands(_) | Modal::Files(_) | Modal::Templates(_) if inner.width >= 80 => {
             let left_w = (inner.width * 6) / 10;
             let right_w = inner.width - left_w - 1;
             let list_rect = Rect::new(inner.x, inner.y, left_w, inner.height);
@@ -4352,6 +4434,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App, mm: 
         Modal::Forks(l) => Some(2 + l.selected as u16),
         Modal::Files(ff) => Some(2 + ff.selected as u16),
         Modal::GitLog(s) => Some(2 + s.selected as u16),
+        Modal::Templates(l) => Some(2 + l.selected as u16),
         Modal::ExtSelect { selected, .. } => Some(*selected as u16),
         // Interview: focus-follow auto-scroll. When the user manually
         // scrolled (PgUp/PgDn), their offset wins — we'll read it below
@@ -4475,6 +4558,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App, mm: 
         Modal::Forks(l) => register_list_rows(mm, l.items.len(), ChipTag::ListRow),
         Modal::Files(ff) => register_list_rows(mm, ff.filtered.len(), ChipTag::ListRow),
         Modal::GitLog(s) => register_list_rows(mm, s.commits.len(), ChipTag::ListRow),
+        Modal::Templates(l) => register_list_rows(mm, l.items.len(), ChipTag::ListRow),
         Modal::Thinking(r) => register_list_rows(mm, r.options.len(), ChipTag::ThinkingOption),
         Modal::ExtSelect { options, .. } => {
             // ExtSelect lines start at 0 (no header), one per option.
@@ -4539,6 +4623,14 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App, mm: 
     }
     if let (Some(da), Modal::Files(ff)) = (detail_area, modal) {
         let detail = file_preview_lines(ff, t);
+        f.render_widget(
+            Paragraph::new(Text::from(detail)).wrap(Wrap { trim: false }),
+            da,
+        );
+    }
+    // V4.c · template preview pane: body of the selected template.
+    if let (Some(da), Modal::Templates(list)) = (detail_area, modal) {
+        let detail = template_preview_lines(list, t);
         f.render_widget(
             Paragraph::new(Text::from(detail)).wrap(Wrap { trim: false }),
             da,
@@ -4631,6 +4723,87 @@ fn file_finder_text(
 
 /// Right-pane preview of the selected file: first ~40 lines, syntect-
 /// highlighted by extension. Reads purely from `ff.preview_cache`, which
+/// V4.c · left-pane body for the template picker. One row per saved
+/// template, `▶` marker on the selected row.
+fn templates_text(
+    list: &crate::ui::modal::ListModal<crate::ui::modal::Template>,
+    t: &Theme,
+) -> Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(" templates · {} saved ", list.items.len()),
+        Style::default().fg(t.muted),
+    )));
+    lines.push(Line::default());
+    for (i, tpl) in list.items.iter().enumerate() {
+        let focused = i == list.selected;
+        let marker = if focused { "▶" } else { " " };
+        let marker_style = if focused {
+            Style::default()
+                .fg(t.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.dim)
+        };
+        let name_style = if focused {
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.text)
+        };
+        // Preview: first non-blank line of the body, truncated.
+        let first = tpl
+            .body
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(40)
+            .collect::<String>();
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {marker} "), marker_style),
+            Span::styled(format!("{:<18}", tpl.name), name_style),
+            Span::styled(format!(" · {first}"), Style::default().fg(t.muted)),
+        ]));
+    }
+    Text::from(lines)
+}
+
+/// V4.c · right-pane body preview for the focused template.
+fn template_preview_lines(
+    list: &crate::ui::modal::ListModal<crate::ui::modal::Template>,
+    t: &Theme,
+) -> Vec<Line<'static>> {
+    let Some(tpl) = list.items.get(list.selected) else {
+        return vec![Line::from(Span::styled(
+            "(no selection)",
+            Style::default().fg(t.dim),
+        ))];
+    };
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::from(vec![
+        Span::styled("  ◇ ", Style::default().fg(t.accent)),
+        Span::styled(
+            tpl.name.clone(),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    out.push(Line::default());
+    for ln in tpl.body.lines().take(40) {
+        out.push(Line::from(Span::styled(
+            ln.to_string(),
+            Style::default().fg(t.text),
+        )));
+    }
+    if tpl.body.lines().count() > 40 {
+        out.push(Line::default());
+        out.push(Line::from(Span::styled(
+            format!("…({} more lines)", tpl.body.lines().count() - 40),
+            Style::default().fg(t.dim),
+        )));
+    }
+    out
+}
+
 /// `prepare_frame_caches` populates on selection changes. The file system
 /// is NOT touched inside this function.
 fn file_preview_lines(ff: &crate::ui::modal::FileFinder, t: &Theme) -> Vec<Line<'static>> {
@@ -7636,6 +7809,66 @@ I'll take it from here.",
         handle_modal_key(KeyCode::Enter, KeyModifiers::NONE, &mut a, None).await;
         assert!(a.modal.is_none());
         assert_eq!(a.focus_idx, Some(3));
+    }
+
+    // ── V4.c · template picker modal ────────────────────────────────
+
+    /// V4.c · Enter on a Templates row loads the body into the
+    /// composer and closes the modal.
+    #[tokio::test]
+    async fn template_picker_enter_loads_body() {
+        use crate::ui::modal::{ListModal, Template};
+        let items = vec![
+            Template {
+                name: "alpha".into(),
+                body: "first body".into(),
+            },
+            Template {
+                name: "beta".into(),
+                body: "second body".into(),
+            },
+        ];
+        let mut a = app();
+        a.modal = Some(Modal::Templates(ListModal::new("templates", "hint", items)));
+        // Arrow down to second entry.
+        handle_modal_key(KeyCode::Down, KeyModifiers::NONE, &mut a, None).await;
+        handle_modal_key(KeyCode::Enter, KeyModifiers::NONE, &mut a, None).await;
+        assert!(a.modal.is_none(), "Enter should close the modal");
+        assert_eq!(a.composer.text(), "second body");
+    }
+
+    /// V4.c · `d` removes the focused template. When the list goes
+    /// empty the modal closes automatically.
+    #[tokio::test]
+    async fn template_picker_delete_removes_and_auto_closes_when_empty() {
+        use crate::ui::modal::{ListModal, Template};
+        let items = vec![Template {
+            name: "only".into(),
+            body: "body".into(),
+        }];
+        let mut a = app();
+        a.modal = Some(Modal::Templates(ListModal::new("templates", "hint", items)));
+        handle_modal_key(KeyCode::Char('d'), KeyModifiers::NONE, &mut a, None).await;
+        assert!(
+            a.modal.is_none(),
+            "emptying the list should auto-close the picker"
+        );
+    }
+
+    /// V4.c · Esc closes without loading anything into the composer.
+    #[tokio::test]
+    async fn template_picker_esc_closes_without_loading() {
+        use crate::ui::modal::{ListModal, Template};
+        let items = vec![Template {
+            name: "one".into(),
+            body: "body".into(),
+        }];
+        let mut a = app();
+        let before = a.composer.text();
+        a.modal = Some(Modal::Templates(ListModal::new("templates", "hint", items)));
+        handle_modal_key(KeyCode::Esc, KeyModifiers::NONE, &mut a, None).await;
+        assert!(a.modal.is_none());
+        assert_eq!(a.composer.text(), before, "composer must be untouched");
     }
 
     /// V4.a.2 · SettingsRow chip click selects the clicked row and

@@ -76,6 +76,12 @@ pub fn delete(name: &str) -> bool {
 }
 
 /// Names sorted alphabetically.
+///
+/// V3.j.4 used this for the flash-based listing; V4.c moved to the
+/// picker modal which consumes the full `load()` map. Kept in case
+/// a future slash subcommand wants a quick listing without loading
+/// bodies.
+#[allow(dead_code)]
 pub fn list_names() -> Vec<String> {
     load().into_keys().collect()
 }
