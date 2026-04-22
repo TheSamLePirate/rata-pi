@@ -1668,6 +1668,97 @@ async fn handle_modal_key(
                 dispatch_settings_action(app, client, action).await;
             }
         }
+        // V4.b · transcript-search overlay.
+        //   printable / Backspace / Delete / ←→/Home/End — edit query
+        //   n / Down / Tab     — next hit
+        //   N / Up / BackTab   — prev hit
+        //   Enter              — focus the current hit, close modal
+        //   Esc                — close modal without focusing
+        Modal::Search(state) => {
+            let mut query_changed = false;
+            match code {
+                KeyCode::Esc => {
+                    app.modal = None;
+                }
+                KeyCode::Enter => {
+                    if let Some(&idx) = state.hits.get(state.hit_idx) {
+                        app.focus_idx = Some(idx);
+                        app.scroll = None;
+                    }
+                    app.modal = None;
+                }
+                KeyCode::Char('n') | KeyCode::Down | KeyCode::Tab
+                    if !state.hits.is_empty()
+                        && !mods.contains(KeyModifiers::CONTROL)
+                        && !mods.contains(KeyModifiers::ALT) =>
+                {
+                    state.hit_idx = (state.hit_idx + 1) % state.hits.len();
+                }
+                KeyCode::Char('N') | KeyCode::Up | KeyCode::BackTab
+                    if !state.hits.is_empty()
+                        && !mods.contains(KeyModifiers::CONTROL)
+                        && !mods.contains(KeyModifiers::ALT) =>
+                {
+                    state.hit_idx = if state.hit_idx == 0 {
+                        state.hits.len() - 1
+                    } else {
+                        state.hit_idx - 1
+                    };
+                }
+                KeyCode::Backspace => {
+                    if state.query_cursor > 0 {
+                        let prev = prev_char_boundary_str(&state.query, state.query_cursor);
+                        state.query.drain(prev..state.query_cursor);
+                        state.query_cursor = prev;
+                        query_changed = true;
+                    }
+                }
+                KeyCode::Delete => {
+                    if state.query_cursor < state.query.len() {
+                        let next = next_char_boundary_str(&state.query, state.query_cursor);
+                        state.query.drain(state.query_cursor..next);
+                        query_changed = true;
+                    }
+                }
+                KeyCode::Left => {
+                    if state.query_cursor > 0 {
+                        state.query_cursor =
+                            prev_char_boundary_str(&state.query, state.query_cursor);
+                    }
+                }
+                KeyCode::Right => {
+                    if state.query_cursor < state.query.len() {
+                        state.query_cursor =
+                            next_char_boundary_str(&state.query, state.query_cursor);
+                    }
+                }
+                KeyCode::Home => state.query_cursor = 0,
+                KeyCode::End => state.query_cursor = state.query.len(),
+                KeyCode::Char(ch)
+                    if !mods.contains(KeyModifiers::CONTROL)
+                        && !mods.contains(KeyModifiers::ALT) =>
+                {
+                    // Lowercase `n` / `N` handled above as navigation
+                    // when hits exist. When the query is still growing
+                    // (no hits yet, or user is typing `naive`, etc.)
+                    // we get here because the navigation arm is gated
+                    // on `!state.hits.is_empty()`.
+                    let mut buf = [0u8; 4];
+                    let s = ch.encode_utf8(&mut buf);
+                    state.query.insert_str(state.query_cursor, s);
+                    state.query_cursor += s.len();
+                    query_changed = true;
+                }
+                _ => {}
+            }
+            if query_changed && let Some(Modal::Search(state)) = app.modal.as_mut() {
+                state.hits = transcript_hits(&app.transcript, &state.query);
+                // Clamp hit_idx into the new hit range.
+                if state.hit_idx >= state.hits.len() {
+                    state.hit_idx = state.hits.len().saturating_sub(1);
+                }
+            }
+        }
         Modal::GitLog(state) => {
             let n = state.commits.len();
             match code {
@@ -2389,19 +2480,16 @@ fn insert_file_ref(app: &mut App, path: &str, mode: crate::ui::modal::FilePickMo
     app.history.reset_walk();
 }
 
-/// V3.j.3 · MVP transcript search. `/search foo` case-insensitively
-/// scans the transcript for `foo`, focuses the most recent matching
-/// entry (so the user sees the card), and flashes a hit-count summary.
-/// A full highlight-and-n/N overlay lands in a future milestone.
-fn handle_search_slash(app: &mut App, arg: &str) {
-    let q = arg.trim();
-    if q.is_empty() {
-        app.flash_warn("usage: /search <text>");
-        return;
+/// V4.b · scan the transcript for a case-insensitive substring.
+/// Shared helper between the slash entry and the live-filter path
+/// in the search modal.
+pub(super) fn transcript_hits(transcript: &Transcript, query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
     }
-    let needle = q.to_lowercase();
+    let needle = query.to_lowercase();
     let mut hits: Vec<usize> = Vec::new();
-    for (i, e) in app.transcript.entries().iter().enumerate() {
+    for (i, e) in transcript.entries().iter().enumerate() {
         let hay = match e {
             Entry::User(s)
             | Entry::Assistant(s)
@@ -2417,19 +2505,23 @@ fn handle_search_slash(app: &mut App, arg: &str) {
             hits.push(i);
         }
     }
-    if hits.is_empty() {
-        app.flash_warn(format!("no matches for {q:?}"));
-        return;
+    hits
+}
+
+/// V4.b · `/search` opens the transcript-search overlay modal. `arg`
+/// pre-populates the query (back-compat with the V3.j.3 MVP, which
+/// jumped-to-latest from the slash directly). With no arg, the modal
+/// opens empty and the user types.
+fn handle_search_slash(app: &mut App, arg: &str) {
+    let q = arg.trim();
+    let mut state = crate::ui::modal::SearchState::with_query(q);
+    state.hits = transcript_hits(&app.transcript, &state.query);
+    if !state.hits.is_empty() {
+        // Default to the last hit — "show me the most recent match"
+        // is the V3.j.3 behaviour users are already used to.
+        state.hit_idx = state.hits.len() - 1;
     }
-    // Focus the most recent hit so the user lands on the answer.
-    let idx = *hits.last().unwrap();
-    app.focus_idx = Some(idx);
-    app.scroll = None;
-    app.flash_success(format!(
-        "{} match{} for {q:?} — focused latest",
-        hits.len(),
-        if hits.len() == 1 { "" } else { "es" }
-    ));
+    app.modal = Some(Modal::Search(state));
 }
 
 /// V3.j.4 · `/template` dispatcher.
@@ -4112,6 +4204,28 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App, mm: 
             100,
             32,
         ),
+        Modal::Search(state) => {
+            let hint = if state.hits.is_empty() {
+                if state.query.is_empty() {
+                    "type to search · Esc close".to_string()
+                } else {
+                    "no matches · keep typing · Esc close".to_string()
+                }
+            } else {
+                format!(
+                    "{} of {} · n/N next/prev · Enter focus · Esc close",
+                    state.hit_idx + 1,
+                    state.hits.len()
+                )
+            };
+            (
+                " ⌕ search ".to_string(),
+                Text::from(search_body(state, &app.transcript, theme)),
+                hint,
+                100,
+                24,
+            )
+        }
         Modal::Settings(state) => (
             " ⚙  settings ".to_string(),
             Text::from(settings_body(app, state, theme)),
@@ -5030,6 +5144,116 @@ fn git_log_body(state: &crate::ui::modal::GitLogState, t: &Theme) -> Vec<Line<'s
         ]));
     }
     out
+}
+
+/// V4.b · body of the transcript-search overlay. Shows the query
+/// (with an inline cursor) followed by a preview of each hit: which
+/// transcript row it's on, a short label, and a snippet centred on
+/// the match. `hit_idx` gets a `▶` focus marker so the user sees
+/// which card Enter would jump to.
+fn search_body(
+    state: &crate::ui::modal::SearchState,
+    transcript: &Transcript,
+    t: &Theme,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    // Query input row with inline cursor overlay.
+    let (before, under, after) = split_cursor(&state.query, state.query_cursor);
+    let q_style = Style::default().fg(t.text);
+    let cursor_style = Style::default()
+        .fg(t.text)
+        .add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    out.push(Line::from(vec![
+        Span::styled("  query: ", Style::default().fg(t.muted)),
+        Span::styled(before, q_style),
+        Span::styled(under, cursor_style),
+        Span::styled(after, q_style),
+    ]));
+    out.push(Line::default());
+
+    if state.query.is_empty() {
+        out.push(Line::from(Span::styled(
+            "  start typing — every transcript row is scanned case-insensitively",
+            Style::default().fg(t.dim),
+        )));
+        return out;
+    }
+
+    if state.hits.is_empty() {
+        out.push(Line::from(Span::styled(
+            format!("  no matches for {:?}", state.query),
+            Style::default().fg(t.warning),
+        )));
+        return out;
+    }
+
+    // Preview each hit: "[N] kind · snippet" where kind is user /
+    // assistant / thinking / tool output / etc., and snippet is ~60
+    // chars of context around the first occurrence of the query.
+    let needle = state.query.to_lowercase();
+    for (i, &idx) in state.hits.iter().enumerate() {
+        let focused = i == state.hit_idx;
+        let marker = if focused { "▶" } else { " " };
+        let marker_style = if focused {
+            Style::default()
+                .fg(t.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.dim)
+        };
+        let (kind, text) = match transcript.entries().get(idx) {
+            Some(Entry::User(s)) => ("user", s.as_str()),
+            Some(Entry::Assistant(s)) => ("assistant", s.as_str()),
+            Some(Entry::Thinking(s)) => ("thinking", s.as_str()),
+            Some(Entry::Info(s)) => ("info", s.as_str()),
+            Some(Entry::Warn(s)) => ("warn", s.as_str()),
+            Some(Entry::Error(s)) => ("error", s.as_str()),
+            Some(Entry::ToolCall(tc)) => ("tool", tc.output.as_str()),
+            Some(Entry::BashExec(bx)) => ("bash", bx.output.as_str()),
+            _ => continue,
+        };
+        let snippet = context_snippet(text, &needle, 60);
+        out.push(Line::from(vec![
+            Span::styled(format!("  {marker} "), marker_style),
+            Span::styled(
+                format!("[#{}]", idx + 1),
+                Style::default().fg(t.dim).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {kind:>9} · "), Style::default().fg(t.muted)),
+            Span::styled(snippet, Style::default().fg(t.text)),
+        ]));
+    }
+
+    out
+}
+
+/// V4.b · extract ~`max` chars of context around the first occurrence
+/// of `needle` (lowercase) inside `text`. Newlines collapse to single
+/// spaces so the preview stays on one line.
+fn context_snippet(text: &str, needle_lower: &str, max: usize) -> String {
+    let haystack = text.to_lowercase();
+    let pos = haystack.find(needle_lower).unwrap_or(0);
+    let half = max / 2;
+    let start = pos.saturating_sub(half);
+    let end = (pos + needle_lower.len() + half).min(text.len());
+    // Walk to the nearest char boundary so we don't slice mid-utf8.
+    let mut s = start;
+    while s < text.len() && !text.is_char_boundary(s) {
+        s += 1;
+    }
+    let mut e = end;
+    while e < text.len() && !text.is_char_boundary(e) {
+        e += 1;
+    }
+    let slice = &text[s..e];
+    let flat: String = slice
+        .chars()
+        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+        .collect();
+    let prefix = if s > 0 { "…" } else { "" };
+    let suffix = if e < text.len() { "…" } else { "" };
+    format!("{prefix}{flat}{suffix}")
 }
 
 /// V3.f · body of the Plan Review modal. Review mode renders the action
@@ -7302,6 +7526,116 @@ I'll take it from here.",
             Some(Modal::Thinking(ref r)) => assert_eq!(r.selected, 2),
             _ => panic!("modal missing"),
         }
+    }
+
+    // ── V4.b · transcript-search overlay ────────────────────────────
+
+    /// V4.b · transcript_hits returns the indices of every row whose
+    /// content contains the query (case-insensitive).
+    #[test]
+    fn transcript_hits_finds_matches_case_insensitive() {
+        let mut t = Transcript::default();
+        t.push(Entry::User("Hello World".into()));
+        t.push(Entry::Assistant("The Credit Balance was too low".into()));
+        t.push(Entry::Info("unrelated".into()));
+        t.push(Entry::User("world again".into()));
+        let h = transcript_hits(&t, "world");
+        assert_eq!(h, vec![0, 3]);
+        let h = transcript_hits(&t, "CREDIT");
+        assert_eq!(h, vec![1]);
+        let h = transcript_hits(&t, "zzz");
+        assert!(h.is_empty());
+        // Empty query → no hits (not "everything matches").
+        assert!(transcript_hits(&t, "").is_empty());
+    }
+
+    /// V4.b · `/search foo` opens a pre-populated Search modal with
+    /// hits computed and the cursor parked on the last match.
+    #[test]
+    fn slash_search_opens_modal_prefilled() {
+        let mut a = app();
+        a.transcript.push(Entry::User("one".into()));
+        a.transcript
+            .push(Entry::Assistant("two matches here".into()));
+        a.transcript.push(Entry::User("three".into()));
+        a.transcript.push(Entry::Assistant("also match".into()));
+        handle_search_slash(&mut a, "match");
+        match &a.modal {
+            Some(Modal::Search(s)) => {
+                assert_eq!(s.query, "match");
+                assert_eq!(s.hits, vec![1, 3]);
+                // Last hit by default.
+                assert_eq!(s.hit_idx, 1);
+            }
+            _ => panic!("modal not open"),
+        }
+    }
+
+    /// V4.b · typing in the search modal rebuilds hits live.
+    #[tokio::test]
+    async fn search_modal_live_filter() {
+        let mut a = app();
+        a.transcript.push(Entry::User("alpha".into()));
+        a.transcript.push(Entry::Assistant("beta gamma".into()));
+        a.transcript.push(Entry::User("gamma delta".into()));
+        handle_search_slash(&mut a, "");
+        // Type "gamma".
+        for ch in "gamma".chars() {
+            handle_modal_key(KeyCode::Char(ch), KeyModifiers::NONE, &mut a, None).await;
+        }
+        match &a.modal {
+            Some(Modal::Search(s)) => {
+                assert_eq!(s.query, "gamma");
+                assert_eq!(s.hits, vec![1, 2]);
+            }
+            _ => panic!("modal gone"),
+        }
+        // Backspace trims; hits update.
+        handle_modal_key(KeyCode::Backspace, KeyModifiers::NONE, &mut a, None).await;
+        handle_modal_key(KeyCode::Backspace, KeyModifiers::NONE, &mut a, None).await;
+        match &a.modal {
+            Some(Modal::Search(s)) => {
+                assert_eq!(s.query, "gam");
+                assert_eq!(s.hits, vec![1, 2]);
+            }
+            _ => panic!("modal gone"),
+        }
+    }
+
+    /// V4.b · `n` / `N` cycle through hits; Enter focuses the current
+    /// hit + closes the modal; Esc closes without focusing.
+    #[tokio::test]
+    async fn search_modal_navigate_and_enter_focus() {
+        let mut a = app();
+        a.transcript.push(Entry::User("one foo".into()));
+        a.transcript.push(Entry::Assistant("two foo bar".into()));
+        a.transcript.push(Entry::User("three".into()));
+        a.transcript.push(Entry::Info("four foo".into()));
+        handle_search_slash(&mut a, "foo");
+        // Starts at hit_idx = 2 (last hit = entry 3).
+        match &a.modal {
+            Some(Modal::Search(s)) => {
+                assert_eq!(s.hits, vec![0, 1, 3]);
+                assert_eq!(s.hit_idx, 2);
+            }
+            _ => panic!(),
+        }
+        // `n` wraps around to 0.
+        handle_modal_key(KeyCode::Char('n'), KeyModifiers::NONE, &mut a, None).await;
+        match &a.modal {
+            Some(Modal::Search(s)) => assert_eq!(s.hit_idx, 0),
+            _ => panic!(),
+        }
+        // `N` wraps back to last.
+        handle_modal_key(KeyCode::Char('N'), KeyModifiers::SHIFT, &mut a, None).await;
+        match &a.modal {
+            Some(Modal::Search(s)) => assert_eq!(s.hit_idx, 2),
+            _ => panic!(),
+        }
+        // Enter focuses entry 3 and closes.
+        handle_modal_key(KeyCode::Enter, KeyModifiers::NONE, &mut a, None).await;
+        assert!(a.modal.is_none());
+        assert_eq!(a.focus_idx, Some(3));
     }
 
     /// V4.a.2 · SettingsRow chip click selects the clicked row and

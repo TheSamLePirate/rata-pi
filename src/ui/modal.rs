@@ -149,6 +149,11 @@ pub enum Modal {
     /// V2.13.b · every tunable setting + observable state.
     Settings(SettingsState),
 
+    /// V4.b · transcript search overlay. Live-filter as the user
+    /// types; `n`/`N` cycle through matches; Enter focuses the card;
+    /// Esc closes.
+    Search(SearchState),
+
     Help,
 
     /// Extension UI dialog: select from a list of strings.
@@ -247,6 +252,30 @@ pub enum PlanReviewPurpose {
     /// `[[PLAN_ADD: …]]` against an existing active plan — the user sees
     /// "amend your plan with step X?" with the full amended list.
     Amendment,
+}
+
+/// V4.b · state for the transcript-search overlay. `hits` stores
+/// transcript entry indices that match the current case-insensitive
+/// substring query. `hit_idx` is the cursor position within `hits`
+/// (0-based). `query_cursor` is the byte offset of the text-entry
+/// caret within `query`.
+#[derive(Debug, Default)]
+pub struct SearchState {
+    pub query: String,
+    pub query_cursor: usize,
+    pub hits: Vec<usize>,
+    pub hit_idx: usize,
+}
+
+impl SearchState {
+    pub fn with_query(q: &str) -> Self {
+        Self {
+            query_cursor: q.len(),
+            query: q.to_string(),
+            hits: Vec::new(),
+            hit_idx: 0,
+        }
+    }
 }
 
 #[derive(Debug)]

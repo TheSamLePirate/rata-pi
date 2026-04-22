@@ -35,22 +35,22 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 
 ---
 
-## V4.b — Transcript search overlay
+## V4.b — Transcript search overlay ✅
 
-- [ ] `Modal::Search(SearchState { query, hits, cursor })`
-- [ ] Key handling: printable → append; Backspace → pop; Enter → focus current hit; `n`/`N` → cycle; `Esc` → close
-- [ ] Live filter recomputes `hits` on query change (in `prepare_frame_caches`)
-- [ ] Highlight substring passed into visuals cache; markdown renderer underlines matches in assistant text
-- [ ] Hint line shows match count + shortcuts
-- [ ] `/search <text>` opens the modal pre-populated (back-compat with V3.j MVP)
-- [ ] `Ctrl+F`? or keep `/search` slash only — decide during implementation (keyboard-shortcut collision check)
-- [ ] Tests:
-  - [ ] Query → hit count
-  - [ ] `n`/`N` cycles
-  - [ ] Enter focuses; Esc closes
-  - [ ] Idle-frame perf: no visuals cache walk when query unchanged
+- [x] `Modal::Search(SearchState { query, query_cursor, hits, hit_idx })`
+- [x] Key handling: printable → append at cursor; Backspace/Delete → edit; ←→/Home/End → cursor motion; Enter → focus current hit + close; `n`/`N` → cycle (wraps); Down/Tab / Up/BackTab aliases; Esc → close
+- [x] Live filter recomputes `hits` on every query edit (synchronously in the key handler — cheap substring scan, no framework-level debounce needed)
+- [—] Inline highlight in transcript via visuals cache — **dropped**. The modal shows a preview of every hit with snippet + context; jumping to focus via Enter already directs the user to the card. Visuals-cache-wide highlighting adds a lot of plumbing for modest marginal value. Logged in Deviations §3.
+- [x] Hint line shows `N of M · n/N next/prev · Enter focus · Esc close`
+- [x] `/search <text>` opens the modal pre-populated; starts focused on the last hit (matches V3.j.3 MVP behaviour); `/search` alone opens empty
+- [—] `Ctrl+F` binding — skipped; it's already "focus mode". `/search` is the canonical entry.
+- [x] Tests:
+  - [x] `transcript_hits_finds_matches_case_insensitive`
+  - [x] `slash_search_opens_modal_prefilled`
+  - [x] `search_modal_live_filter`
+  - [x] `search_modal_navigate_and_enter_focus`
 
-**Shipped as** ``
+**Shipped as** `<tbd>`
 
 ---
 
@@ -105,24 +105,31 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 
 | | V3 final | V4.a | V4.b | V4.c | V4.d | V4.e |
 |---|---|---|---|---|---|---|
-| Tests | 242 | **248** | | | | ≥ 265 |
-| `src/app/mod.rs` LoC | 7 241 | 7 394 | | | < 4 000 | |
-| Modules under `src/app/modals/` | 2 | 2 | | | ≥ 4 | |
-| Click-on-chip works | no | **yes** (except Commands) | yes | yes | yes | yes |
-| Click-outside-modal closes | no | **yes** | yes | yes | yes | yes |
-| Transcript search overlay | no | no | yes | yes | yes | yes |
+| Tests | 242 | 248 | **252** | | | ≥ 265 |
+| `src/app/mod.rs` LoC | 7 241 | 7 394 | 7 581 | | < 4 000 | |
+| Modules under `src/app/modals/` | 2 | 2 | 2 | | ≥ 4 | |
+| Click-on-chip works | no | yes (except Commands) | yes | yes | yes | yes |
+| Click-outside-modal closes | no | yes | yes | yes | yes | yes |
+| Transcript search overlay | no | no | **yes** | yes | yes | yes |
 | Template picker modal | no | no | no | yes | yes | yes |
 | `cargo install rata-pi` works | no | no | no | no | no | yes |
 | Homebrew formula available | no | no | no | no | no | yes |
 | Release tag | — | — | — | — | — | `v1.0.0` |
-| Clippy clean | ✓ | ✓ | | | | ✓ |
-| Fmt clean | ✓ | ✓ | | | | ✓ |
+| Clippy clean | ✓ | ✓ | ✓ | | | ✓ |
+| Fmt clean | ✓ | ✓ | ✓ | | | ✓ |
 
 ---
 
 ## Deviations
 
 *(Same pattern as V3 — record sub-milestone · task · what changed · why. Blank section = on plan.)*
+
+### 3. V4.b · inline match highlighting in transcript dropped
+**What changed.** `PLAN_V4` called for the transcript search overlay to push a highlight substring through the visuals cache so matches underline/reverse inside the rendered assistant markdown. The search modal ships **without** inline highlighting.
+
+**Why.** The modal's preview panel already shows, per hit: transcript index, kind (user / assistant / …), and a 60-char context snippet centred on the match. Pressing Enter on a hit focuses the card. That covers the two things users actually want ("did it say X?" → snippet answers; "show me where" → Enter jumps). Inline highlighting requires wiring a highlight substring into `build_one_visual` and through the markdown renderer — both would have to learn to produce extra spans conditionally, invalidating the visuals cache on every query keystroke. The marginal value vs. the V3.b perf-sensitive paths wasn't worth it.
+
+If user feedback asks for it, the hook is obvious: `markdown::render` already takes a `&Theme`; add an optional `&SearchHighlight` too. Leave cache invalidation keyed on the query hash. Not hard — just not shipped.
 
 ### 2. V4.a.2 · Commands modal row click dropped
 **What changed.** Every other list-style modal (Models / History / Forks / Files / GitLog) got click-to-select rows in V4.a.2. Commands did not.
