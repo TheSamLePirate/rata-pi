@@ -20,6 +20,7 @@ mod draw;
 mod events;
 mod helpers;
 mod input;
+mod modal_keys;
 mod modals;
 mod visuals;
 
@@ -44,13 +45,13 @@ use modals::bodies::{
     search_body, shortcuts_body, stats_text, template_preview_lines, templates_text, thinking_text,
     which_pi,
 };
-use modals::interview::{
-    dispatch_interview_response, interview_body, interview_body_and_focus_rows, interview_key,
-};
-use modals::settings::{
-    build_settings_rows, dispatch_settings_action, settings_body, settings_modal_key,
-    settings_row_source_line,
-};
+use modals::interview::{interview_body, interview_body_and_focus_rows};
+use modals::settings::{build_settings_rows, settings_body, settings_row_source_line};
+// Re-exported for the reducer_tests module (used directly in test arms).
+#[cfg(test)]
+use modals::interview::interview_key;
+#[cfg(test)]
+use modals::settings::{dispatch_settings_action, settings_modal_key};
 // Re-exported for the reducer_tests module; not used in prod code paths.
 #[cfg(test)]
 use modals::settings::{CycleAction, CycleDir, SettingsAction, SettingsRow, ToggleAction};
@@ -61,9 +62,11 @@ use std::panic;
 use std::time::Duration;
 
 use color_eyre::eyre::Result;
+#[cfg(test)]
+use crossterm::event::KeyModifiers;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    EventStream, KeyCode, KeyEventKind, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -80,7 +83,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use crate::cli::Args;
 use crate::history::{History, HistoryEntry};
 use crate::rpc::client::{self, RpcClient, RpcError};
-use crate::rpc::commands::{ExtensionUiResponse, RpcCommand};
+use crate::rpc::commands::RpcCommand;
 use crate::rpc::events::Incoming;
 use crate::rpc::types::{
     AgentMessage, CommandInfo, FollowUpMode, ForkMessage, Model, SessionStats, State, SteeringMode,
@@ -513,7 +516,7 @@ struct AppCaps {
 /// them local here avoids a cross-module API change for one two-line
 /// function. If a third caller appears we'll lift both copies into
 /// `app/helpers.rs`.
-fn prev_char_boundary_str(s: &str, i: usize) -> usize {
+pub(super) fn prev_char_boundary_str(s: &str, i: usize) -> usize {
     let mut j = i.saturating_sub(1);
     while j > 0 && !s.is_char_boundary(j) {
         j -= 1;
@@ -521,7 +524,7 @@ fn prev_char_boundary_str(s: &str, i: usize) -> usize {
     j
 }
 
-fn next_char_boundary_str(s: &str, i: usize) -> usize {
+pub(super) fn next_char_boundary_str(s: &str, i: usize) -> usize {
     let mut j = i.saturating_add(1).min(s.len());
     while j < s.len() && !s.is_char_boundary(j) {
         j += 1;
@@ -1120,7 +1123,7 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: Args
     Ok(())
 }
 
-async fn bootstrap(client: &RpcClient, app: &mut App) {
+pub(super) async fn bootstrap(client: &RpcClient, app: &mut App) {
     // V2.11.2 · fire all bootstrap RPCs concurrently. They have no
     // dependencies on each other and each is a separate round-trip to pi,
     // so serial-await wasted ~N × RTT at startup. Stats refresh now joins
@@ -1186,7 +1189,7 @@ async fn bootstrap(client: &RpcClient, app: &mut App) {
 /// Viewport cap for the file-finder fuzzy-filter list. Keeping this
 /// modest is a perf knob: even at 20k files, only the top 500 are scored
 /// AND materialised into a Vec — the rest are ignored by `filter`.
-const FILES_CAP: usize = 500;
+pub(super) const FILES_CAP: usize = 500;
 
 /// Populate modal + transcript caches that the draw closure relies on.
 /// Runs once per frame from the UI loop. The operations are idempotent —
@@ -1556,7 +1559,7 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
         && let Event::Key(k) = ev
         && k.kind == KeyEventKind::Press
     {
-        handle_modal_key(k.code, k.modifiers, app, client).await;
+        modal_keys::handle_modal_key(k.code, k.modifiers, app, client).await;
         return;
     }
 
@@ -1607,823 +1610,8 @@ async fn handle_crossterm(ev: Event, app: &mut App, client: Option<&RpcClient>) 
     }
 }
 
-async fn handle_modal_key(
-    code: KeyCode,
-    mods: KeyModifiers,
-    app: &mut App,
-    client: Option<&RpcClient>,
-) {
-    let Some(modal) = app.modal.as_mut() else {
-        return;
-    };
-    match modal {
-        Modal::Stats(_)
-        | Modal::Help
-        | Modal::GitStatus(_)
-        | Modal::PlanView
-        | Modal::Doctor(_)
-        | Modal::Mcp(_) => match code {
-            // V3.e.6 · read-only viewers accept Esc, Enter, AND q (less-
-            // style) so every dismissal keystroke the user might try
-            // works. Interactive modals (Settings, Commands, Interview,
-            // GitLog, Files, …) keep Esc-only to avoid eating `q`.
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.modal = None,
-            _ => {}
-        },
-        Modal::Diff(d) => match code {
-            KeyCode::Esc | KeyCode::Char('q') => app.modal = None,
-            KeyCode::Char('j') | KeyCode::Down => {
-                d.scroll = d.scroll.saturating_add(1);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                d.scroll = d.scroll.saturating_sub(1);
-            }
-            KeyCode::PageDown => {
-                d.scroll = d.scroll.saturating_add(10);
-            }
-            KeyCode::PageUp => {
-                d.scroll = d.scroll.saturating_sub(10);
-            }
-            KeyCode::Home | KeyCode::Char('g') => {
-                d.scroll = 0;
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                d.scroll = u16::MAX;
-            }
-            _ => {}
-        },
-        // V2.13.a · read-only shortcut reference. Scroll-only.
-        Modal::Shortcuts { scroll } => match code {
-            KeyCode::Esc | KeyCode::Char('q') => app.modal = None,
-            KeyCode::Char('j') | KeyCode::Down => {
-                *scroll = scroll.saturating_add(1);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                *scroll = scroll.saturating_sub(1);
-            }
-            KeyCode::PageDown => {
-                *scroll = scroll.saturating_add(10);
-            }
-            KeyCode::PageUp => {
-                *scroll = scroll.saturating_sub(10);
-            }
-            KeyCode::Home | KeyCode::Char('g') => {
-                *scroll = 0;
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                *scroll = u16::MAX;
-            }
-            _ => {}
-        },
-        // V2.13.b · settings modal. Navigate with ↑↓/j/k (skipping
-        // Headers). Enter / Space toggles booleans or advances cycles.
-        // ← / → steps cycle rows. PgUp/PgDn scroll the viewport.
-        Modal::Settings(_) => {
-            let (maybe_action, should_close) = settings_modal_key(code, mods, app);
-            if should_close {
-                app.modal = None;
-            } else if let Some(action) = maybe_action {
-                dispatch_settings_action(app, client, action).await;
-            }
-        }
-        // V4.c · template picker.
-        //   ↑↓ / j / k  nav
-        //   Enter       load body into composer, close modal
-        //   d / Del     delete focused template + refresh the list
-        //   Esc         close
-        Modal::Templates(list) => match code {
-            KeyCode::Esc => app.modal = None,
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !list.items.is_empty() {
-                    list.selected = (list.selected + 1).min(list.items.len() - 1);
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                list.selected = list.selected.saturating_sub(1);
-            }
-            KeyCode::Home | KeyCode::Char('g') => list.selected = 0,
-            KeyCode::End | KeyCode::Char('G') => {
-                list.selected = list.items.len().saturating_sub(1);
-            }
-            KeyCode::Enter => {
-                if let Some(t) = list.items.get(list.selected) {
-                    let body = t.body.clone();
-                    let name = t.name.clone();
-                    app.composer.set_text(&body);
-                    app.modal = None;
-                    app.flash_success(format!("loaded template {name:?}"));
-                }
-            }
-            KeyCode::Char('d') | KeyCode::Delete => {
-                if let Some(t) = list.items.get(list.selected) {
-                    let name = t.name.clone();
-                    crate::templates::delete(&name);
-                    list.items.remove(list.selected);
-                    if list.selected >= list.items.len() && !list.items.is_empty() {
-                        list.selected = list.items.len() - 1;
-                    }
-                    if list.items.is_empty() {
-                        app.modal = None;
-                        app.flash_info(format!("deleted {name:?} — no templates left"));
-                    } else {
-                        app.flash_success(format!("deleted template {name:?}"));
-                    }
-                }
-            }
-            _ => {}
-        },
-        // V4.b · transcript-search overlay.
-        //   printable / Backspace / Delete / ←→/Home/End — edit query
-        //   n / Down / Tab     — next hit
-        //   N / Up / BackTab   — prev hit
-        //   Enter              — focus the current hit, close modal
-        //   Esc                — close modal without focusing
-        Modal::Search(state) => {
-            let mut query_changed = false;
-            match code {
-                KeyCode::Esc => {
-                    app.modal = None;
-                }
-                KeyCode::Enter => {
-                    if let Some(&idx) = state.hits.get(state.hit_idx) {
-                        app.focus_idx = Some(idx);
-                        app.scroll = None;
-                    }
-                    app.modal = None;
-                }
-                KeyCode::Char('n') | KeyCode::Down | KeyCode::Tab
-                    if !state.hits.is_empty()
-                        && !mods.contains(KeyModifiers::CONTROL)
-                        && !mods.contains(KeyModifiers::ALT) =>
-                {
-                    state.hit_idx = (state.hit_idx + 1) % state.hits.len();
-                }
-                KeyCode::Char('N') | KeyCode::Up | KeyCode::BackTab
-                    if !state.hits.is_empty()
-                        && !mods.contains(KeyModifiers::CONTROL)
-                        && !mods.contains(KeyModifiers::ALT) =>
-                {
-                    state.hit_idx = if state.hit_idx == 0 {
-                        state.hits.len() - 1
-                    } else {
-                        state.hit_idx - 1
-                    };
-                }
-                KeyCode::Backspace => {
-                    if state.query_cursor > 0 {
-                        let prev = prev_char_boundary_str(&state.query, state.query_cursor);
-                        state.query.drain(prev..state.query_cursor);
-                        state.query_cursor = prev;
-                        query_changed = true;
-                    }
-                }
-                KeyCode::Delete => {
-                    if state.query_cursor < state.query.len() {
-                        let next = next_char_boundary_str(&state.query, state.query_cursor);
-                        state.query.drain(state.query_cursor..next);
-                        query_changed = true;
-                    }
-                }
-                KeyCode::Left => {
-                    if state.query_cursor > 0 {
-                        state.query_cursor =
-                            prev_char_boundary_str(&state.query, state.query_cursor);
-                    }
-                }
-                KeyCode::Right => {
-                    if state.query_cursor < state.query.len() {
-                        state.query_cursor =
-                            next_char_boundary_str(&state.query, state.query_cursor);
-                    }
-                }
-                KeyCode::Home => state.query_cursor = 0,
-                KeyCode::End => state.query_cursor = state.query.len(),
-                KeyCode::Char(ch)
-                    if !mods.contains(KeyModifiers::CONTROL)
-                        && !mods.contains(KeyModifiers::ALT) =>
-                {
-                    // Lowercase `n` / `N` handled above as navigation
-                    // when hits exist. When the query is still growing
-                    // (no hits yet, or user is typing `naive`, etc.)
-                    // we get here because the navigation arm is gated
-                    // on `!state.hits.is_empty()`.
-                    let mut buf = [0u8; 4];
-                    let s = ch.encode_utf8(&mut buf);
-                    state.query.insert_str(state.query_cursor, s);
-                    state.query_cursor += s.len();
-                    query_changed = true;
-                }
-                _ => {}
-            }
-            if query_changed && let Some(Modal::Search(state)) = app.modal.as_mut() {
-                state.hits = transcript_hits(&app.transcript, &state.query);
-                // Clamp hit_idx into the new hit range.
-                if state.hit_idx >= state.hits.len() {
-                    state.hit_idx = state.hits.len().saturating_sub(1);
-                }
-            }
-        }
-        Modal::GitLog(state) => {
-            let n = state.commits.len();
-            match code {
-                KeyCode::Esc => app.modal = None,
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if n > 0 {
-                        state.selected = (state.selected + 1).min(n - 1);
-                    }
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    state.selected = state.selected.saturating_sub(1);
-                }
-                KeyCode::PageDown => {
-                    if n > 0 {
-                        state.selected = (state.selected + 10).min(n - 1);
-                    }
-                }
-                KeyCode::PageUp => {
-                    state.selected = state.selected.saturating_sub(10);
-                }
-                KeyCode::Home | KeyCode::Char('g') => {
-                    state.selected = 0;
-                }
-                KeyCode::End | KeyCode::Char('G') => {
-                    if n > 0 {
-                        state.selected = n - 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        Modal::GitBranch(state) => {
-            let n = state.branches.len();
-            if handle_list_keys(&mut state.query, &mut state.selected, code, n) {
-                return;
-            }
-            match code {
-                KeyCode::Esc => app.modal = None,
-                KeyCode::Enter => {
-                    let pick = state
-                        .branches
-                        .iter()
-                        .filter(|b| {
-                            state.query.is_empty()
-                                || b.name
-                                    .to_ascii_lowercase()
-                                    .contains(&state.query.to_ascii_lowercase())
-                        })
-                        .nth(state.selected)
-                        .map(|b| b.name.clone());
-                    app.modal = None;
-                    if let Some(name) = pick {
-                        match crate::git::switch(&name).await {
-                            Ok(_) => app.flash_success(format!("switched to {name}")),
-                            Err(e) => app.flash_error(format!("switch failed: {e}")),
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Modal::Commands(list) => {
-            let n = filtered_count_commands(&list.items, &list.query);
-            if handle_list_keys(&mut list.query, &mut list.selected, code, n) {
-                return;
-            }
-            match code {
-                KeyCode::Esc => app.modal = None,
-                KeyCode::Enter => {
-                    let Some(cmd) = filtered_commands(&list.items, &list.query)
-                        .nth(list.selected)
-                        .cloned()
-                    else {
-                        return;
-                    };
-                    // `/themes` reuses the Commands modal. Entries look like
-                    // "theme <name>" — apply inline.
-                    if cmd.is_theme() {
-                        let theme_name = cmd.name.strip_prefix("theme ").unwrap_or("");
-                        if app.set_theme_by_name(theme_name) {
-                            app.flash(format!("theme → {}", app.theme.name));
-                        }
-                        app.modal = None;
-                        return;
-                    }
-                    if cmd.is_builtin() {
-                        let needs_arg = !cmd.args.is_empty();
-                        if needs_arg {
-                            app.composer.clear();
-                            app.composer.insert_char('/');
-                            app.composer.insert_str(&cmd.name);
-                            app.composer.insert_char(' ');
-                        } else {
-                            app.modal = None;
-                            let name = cmd.name.clone();
-                            if !try_local_slash(app, &name, "").await {
-                                if let Some(c) = client {
-                                    try_pi_slash(app, c, &name, "").await;
-                                } else {
-                                    app.flash(format!("/{name} needs pi (offline)"));
-                                }
-                            }
-                            return;
-                        }
-                        app.modal = None;
-                        return;
-                    }
-                    // Pi command — prefill the composer with /name so the
-                    // user can type arguments and submit.
-                    app.composer.clear();
-                    app.composer.insert_char('/');
-                    app.composer.insert_str(&cmd.name);
-                    app.composer.insert_char(' ');
-                    app.modal = None;
-                }
-                _ => {}
-            }
-        }
-        Modal::Models(list) => {
-            let n = filtered_count_models(&list.items, &list.query);
-            if handle_list_keys(&mut list.query, &mut list.selected, code, n) {
-                return;
-            }
-            match code {
-                KeyCode::Esc => app.modal = None,
-                KeyCode::Enter => {
-                    let Some(m) = filtered_models(&list.items, &list.query)
-                        .nth(list.selected)
-                        .cloned()
-                    else {
-                        return;
-                    };
-                    if let Some(c) = client {
-                        match c
-                            .call(RpcCommand::SetModel {
-                                provider: m.provider.clone(),
-                                model_id: m.id.clone(),
-                            })
-                            .await
-                        {
-                            Ok(_) => {
-                                app.session.model_label = format!("{}/{}", m.provider, m.id);
-                                app.flash(format!("model → {}/{}", m.provider, m.id));
-                            }
-                            Err(e) => app.flash_error(format!("set_model failed: {e}")),
-                        }
-                    }
-                    app.modal = None;
-                }
-                _ => {}
-            }
-        }
-        Modal::History(list) => {
-            let n = filtered_count_history(&list.items, &list.query);
-            if handle_list_keys(&mut list.query, &mut list.selected, code, n) {
-                return;
-            }
-            match code {
-                KeyCode::Esc => app.modal = None,
-                KeyCode::Enter => {
-                    if let Some(entry) = filtered_history(&list.items, &list.query)
-                        .nth(list.selected)
-                        .cloned()
-                    {
-                        app.composer.set_text(&entry.text);
-                    }
-                    app.modal = None;
-                }
-                _ => {}
-            }
-        }
-        Modal::Forks(list) => {
-            let n = filtered_count_forks(&list.items, &list.query);
-            if handle_list_keys(&mut list.query, &mut list.selected, code, n) {
-                return;
-            }
-            match code {
-                KeyCode::Esc => app.modal = None,
-                KeyCode::Enter => {
-                    let pick = filtered_forks(&list.items, &list.query)
-                        .nth(list.selected)
-                        .cloned();
-                    app.modal = None;
-                    if let (Some(c), Some(f)) = (client, pick) {
-                        match c
-                            .call(RpcCommand::Fork {
-                                entry_id: f.entry_id.clone(),
-                            })
-                            .await
-                        {
-                            Ok(_) => {
-                                app.flash_success(format!(
-                                    "forked at {}",
-                                    truncate_preview(&f.text, 40)
-                                ));
-                                bootstrap(c, app).await;
-                            }
-                            Err(e) => app.flash_error(format!("fork failed: {e}")),
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Modal::Files(ff) => {
-            // V2.11.1 · use the cached filter + track selection changes
-            // so the fuzzy matcher never runs inside a key-press handler
-            // and the preview cache drops when the selection moves.
-            ff.refresh_filter(FILES_CAP);
-            let n = ff.filtered.len();
-            let prev_sel = ff.selected;
-            let prev_query = ff.query.clone();
-            if handle_list_keys(&mut ff.query, &mut ff.selected, code, n) {
-                if ff.query != prev_query {
-                    ff.refresh_filter(FILES_CAP);
-                }
-                if ff.selected != prev_sel {
-                    ff.invalidate_preview();
-                }
-                return;
-            }
-            match code {
-                KeyCode::Esc => app.modal = None,
-                KeyCode::Enter => {
-                    let Some(path) = ff.current_path().map(str::to_string) else {
-                        return;
-                    };
-                    let mode = ff.mode;
-                    app.modal = None;
-                    insert_file_ref(app, &path, mode);
-                }
-                _ => {}
-            }
-        }
-        Modal::Thinking(radio) => match code {
-            KeyCode::Esc => app.modal = None,
-            KeyCode::Up => {
-                if radio.selected > 0 {
-                    radio.selected -= 1;
-                }
-            }
-            KeyCode::Down => {
-                if radio.selected + 1 < radio.options.len() {
-                    radio.selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                let (level, _label) = radio.options[radio.selected];
-                if let Some(c) = client {
-                    match c.call(RpcCommand::SetThinkingLevel { level }).await {
-                        Ok(_) => {
-                            app.session.thinking = Some(level);
-                            app.flash(format!("thinking → {level:?}"));
-                        }
-                        Err(e) => app.flash_error(format!("set_thinking_level failed: {e}")),
-                    }
-                }
-                app.modal = None;
-            }
-            _ => {}
-        },
-        Modal::ExtSelect {
-            request_id,
-            options,
-            selected,
-            ..
-        } => match code {
-            KeyCode::Up => {
-                if *selected > 0 {
-                    *selected -= 1;
-                }
-            }
-            KeyCode::Down => {
-                if !options.is_empty() && *selected + 1 < options.len() {
-                    *selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                let value = options.get(*selected).cloned();
-                let req_id = request_id.clone();
-                app.modal = None;
-                if let (Some(c), Some(v)) = (client, value) {
-                    let _ = c
-                        .send_ext_ui_response(ExtensionUiResponse::value(req_id, v))
-                        .await;
-                }
-            }
-            KeyCode::Esc => {
-                let req_id = request_id.clone();
-                app.modal = None;
-                if let Some(c) = client {
-                    let _ = c
-                        .send_ext_ui_response(ExtensionUiResponse::cancelled(req_id))
-                        .await;
-                }
-            }
-            _ => {}
-        },
-        Modal::ExtConfirm {
-            request_id,
-            selected,
-            ..
-        } => match code {
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                *selected = 1 - *selected;
-            }
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let req_id = request_id.clone();
-                app.modal = None;
-                if let Some(c) = client {
-                    let _ = c
-                        .send_ext_ui_response(ExtensionUiResponse::confirmed(req_id, true))
-                        .await;
-                }
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                let req_id = request_id.clone();
-                app.modal = None;
-                if let Some(c) = client {
-                    let _ = c
-                        .send_ext_ui_response(ExtensionUiResponse::confirmed(req_id, false))
-                        .await;
-                }
-            }
-            KeyCode::Enter => {
-                let confirmed = *selected == 1;
-                let req_id = request_id.clone();
-                app.modal = None;
-                if let Some(c) = client {
-                    let _ = c
-                        .send_ext_ui_response(ExtensionUiResponse::confirmed(req_id, confirmed))
-                        .await;
-                }
-            }
-            KeyCode::Esc => {
-                let req_id = request_id.clone();
-                app.modal = None;
-                if let Some(c) = client {
-                    let _ = c
-                        .send_ext_ui_response(ExtensionUiResponse::cancelled(req_id))
-                        .await;
-                }
-            }
-            _ => {}
-        },
-        // V2.12.g · interview modal — see `interview_key` below.
-        Modal::Interview(state) => {
-            // Esc always cancels. We intercept it here so it never
-            // reaches the per-field key handler (a text field would
-            // otherwise swallow it silently).
-            if code == KeyCode::Esc {
-                app.modal = None;
-                app.transcript
-                    .push(Entry::Info("interview cancelled by user".to_string()));
-                app.flash("interview cancelled");
-                return;
-            }
-            let submit = interview_key(state.as_mut(), code, mods);
-            if submit {
-                // Valid form + submit trigger: serialise the response,
-                // close the modal, dispatch to pi.
-                let response = state.as_response();
-                let summary = state.human_summary();
-                app.modal = None;
-                if let Some(c) = client {
-                    dispatch_interview_response(app, c, response, summary).await;
-                } else {
-                    app.flash("interview needs pi (offline) — response discarded");
-                }
-            }
-        }
-        Modal::ExtInput {
-            request_id, value, ..
-        }
-        | Modal::ExtEditor {
-            request_id, value, ..
-        } => match code {
-            KeyCode::Char(ch) => {
-                value.push(ch);
-            }
-            KeyCode::Backspace => {
-                value.pop();
-            }
-            KeyCode::Enter => {
-                let req_id = request_id.clone();
-                let v = std::mem::take(value);
-                app.modal = None;
-                if let Some(c) = client {
-                    let _ = c
-                        .send_ext_ui_response(ExtensionUiResponse::value(req_id, v))
-                        .await;
-                }
-            }
-            KeyCode::Esc => {
-                let req_id = request_id.clone();
-                app.modal = None;
-                if let Some(c) = client {
-                    let _ = c
-                        .send_ext_ui_response(ExtensionUiResponse::cancelled(req_id))
-                        .await;
-                }
-            }
-            _ => {}
-        },
-        // V3.f · Plan Review modal. Three sub-modes:
-        //   * Review (action chips + step list, read-only)
-        //   * Edit (step list focus; add / delete / enter-to-edit)
-        //   * Edit + text-entry (a single step under cursor)
-        Modal::PlanReview(state) => {
-            use crate::ui::modal::{EditingStep, PlanReviewMode};
-
-            // ── Text-entry sub-mode: raw keys edit the buffer. ────────
-            if let Some(edit) = state.editing.as_mut() {
-                match code {
-                    KeyCode::Enter => {
-                        // Commit buffer → items[index]; return to Edit.
-                        if let Some(slot) = state.items.get_mut(edit.index) {
-                            *slot = std::mem::take(&mut edit.buffer);
-                        }
-                        state.editing = None;
-                    }
-                    KeyCode::Esc => {
-                        // Drop edits, return to Edit list.
-                        state.editing = None;
-                    }
-                    KeyCode::Backspace => {
-                        if edit.cursor > 0 {
-                            let prev = prev_char_boundary_str(&edit.buffer, edit.cursor);
-                            edit.buffer.drain(prev..edit.cursor);
-                            edit.cursor = prev;
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if edit.cursor < edit.buffer.len() {
-                            let next = next_char_boundary_str(&edit.buffer, edit.cursor);
-                            edit.buffer.drain(edit.cursor..next);
-                        }
-                    }
-                    KeyCode::Left => {
-                        if edit.cursor > 0 {
-                            edit.cursor = prev_char_boundary_str(&edit.buffer, edit.cursor);
-                        }
-                    }
-                    KeyCode::Right => {
-                        if edit.cursor < edit.buffer.len() {
-                            edit.cursor = next_char_boundary_str(&edit.buffer, edit.cursor);
-                        }
-                    }
-                    KeyCode::Home => edit.cursor = 0,
-                    KeyCode::End => edit.cursor = edit.buffer.len(),
-                    KeyCode::Char(ch)
-                        if !mods.contains(KeyModifiers::CONTROL)
-                            && !mods.contains(KeyModifiers::ALT) =>
-                    {
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf);
-                        edit.buffer.insert_str(edit.cursor, s);
-                        edit.cursor += s.len();
-                    }
-                    _ => {}
-                }
-                return;
-            }
-
-            match state.mode {
-                // ── Review mode: action chips drive Accept / Edit / Deny. ──
-                PlanReviewMode::Review => match code {
-                    KeyCode::Char('a') | KeyCode::Char('A') => {
-                        app.modal = None;
-                        app.accept_proposed_plan();
-                    }
-                    KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
-                        app.modal = None;
-                        app.deny_proposed_plan();
-                    }
-                    KeyCode::Char('e') | KeyCode::Char('E') => {
-                        state.mode = PlanReviewMode::Edit;
-                        state.selected = 0;
-                    }
-                    KeyCode::Char('t') | KeyCode::Char('T') => {
-                        state.auto_run_pref = !state.auto_run_pref;
-                        if let Some(p) = app.proposed_plan.as_mut() {
-                            p.suggested_auto_run = state.auto_run_pref;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        // Focused chip: 0 Accept · 1 Edit · 2 Deny.
-                        let sel = state.selected;
-                        match sel {
-                            0 => {
-                                app.modal = None;
-                                app.accept_proposed_plan();
-                            }
-                            1 => {
-                                state.mode = PlanReviewMode::Edit;
-                                state.selected = 0;
-                            }
-                            _ => {
-                                app.modal = None;
-                                app.deny_proposed_plan();
-                            }
-                        }
-                    }
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        state.selected = state.selected.saturating_sub(1);
-                    }
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        state.selected = (state.selected + 1).min(2);
-                    }
-                    KeyCode::PageDown => state.scroll = state.scroll.saturating_add(10),
-                    KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(10),
-                    KeyCode::Home | KeyCode::Char('g') => state.scroll = 0,
-                    KeyCode::End | KeyCode::Char('G') => state.scroll = u16::MAX,
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        state.scroll = state.scroll.saturating_add(1)
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        state.scroll = state.scroll.saturating_sub(1)
-                    }
-                    _ => {}
-                },
-                // ── Edit mode: navigate steps, add / delete / enter-to-edit. ──
-                PlanReviewMode::Edit => match code {
-                    KeyCode::Esc => {
-                        // Back to Review without committing anything (the
-                        // list itself is already committed; edits to the
-                        // list mutate items directly).
-                        state.mode = PlanReviewMode::Review;
-                        state.selected = 1; // keep focus on Edit chip
-                    }
-                    KeyCode::Char('s') | KeyCode::Char('S')
-                        if mods.contains(KeyModifiers::CONTROL) =>
-                    {
-                        // Ctrl+S commits the edited list as the accepted plan.
-                        if let Some(p) = app.proposed_plan.as_mut() {
-                            p.items = state.items.clone();
-                            p.suggested_auto_run = state.auto_run_pref;
-                        }
-                        app.modal = None;
-                        app.accept_proposed_plan();
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if !state.items.is_empty() {
-                            state.selected = (state.selected + 1).min(state.items.len() - 1);
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        state.selected = state.selected.saturating_sub(1);
-                    }
-                    KeyCode::Enter | KeyCode::Char('i') => {
-                        if let Some(cur) = state.items.get(state.selected) {
-                            let buffer = cur.clone();
-                            let cursor = buffer.len();
-                            state.editing = Some(EditingStep {
-                                index: state.selected,
-                                buffer,
-                                cursor,
-                            });
-                        }
-                    }
-                    KeyCode::Char('a') => {
-                        // Add blank step below the focused row.
-                        let at = state.selected.saturating_add(1).min(state.items.len());
-                        state.items.insert(at, String::new());
-                        state.selected = at;
-                        if let Some(p) = app.proposed_plan.as_mut() {
-                            p.items = state.items.clone();
-                        }
-                        // Jump straight into text-entry for the new row.
-                        state.editing = Some(EditingStep {
-                            index: at,
-                            buffer: String::new(),
-                            cursor: 0,
-                        });
-                    }
-                    KeyCode::Delete | KeyCode::Char('x') => {
-                        if state.selected < state.items.len() {
-                            state.items.remove(state.selected);
-                            if state.selected >= state.items.len() && !state.items.is_empty() {
-                                state.selected = state.items.len() - 1;
-                            }
-                            if let Some(p) = app.proposed_plan.as_mut() {
-                                p.items = state.items.clone();
-                            }
-                        }
-                    }
-                    KeyCode::Char('t') | KeyCode::Char('T') => {
-                        state.auto_run_pref = !state.auto_run_pref;
-                        if let Some(p) = app.proposed_plan.as_mut() {
-                            p.suggested_auto_run = state.auto_run_pref;
-                        }
-                    }
-                    _ => {}
-                },
-            }
-        }
-    }
-}
-
 /// Shared list key handler. Returns `true` if the key was consumed here.
-fn handle_list_keys(
+pub(super) fn handle_list_keys(
     query: &mut String,
     selected: &mut usize,
     code: KeyCode,
@@ -2456,7 +1644,7 @@ fn handle_list_keys(
     }
 }
 
-fn filtered_commands<'a>(
+pub(super) fn filtered_commands<'a>(
     items: &'a [crate::ui::commands::MenuItem],
     q: &'a str,
 ) -> impl Iterator<Item = &'a crate::ui::commands::MenuItem> + 'a {
@@ -2465,21 +1653,24 @@ fn filtered_commands<'a>(
         .filter(move |c| crate::ui::commands::matches(c, q))
 }
 
-fn filtered_count_commands(items: &[crate::ui::commands::MenuItem], q: &str) -> usize {
+pub(super) fn filtered_count_commands(items: &[crate::ui::commands::MenuItem], q: &str) -> usize {
     filtered_commands(items, q).count()
 }
 
-fn filtered_models<'a>(items: &'a [Model], q: &'a str) -> impl Iterator<Item = &'a Model> + 'a {
+pub(super) fn filtered_models<'a>(
+    items: &'a [Model],
+    q: &'a str,
+) -> impl Iterator<Item = &'a Model> + 'a {
     items
         .iter()
         .filter(move |m| matches_query(&m.id, q) || matches_query(&m.provider, q))
 }
 
-fn filtered_count_models(items: &[Model], q: &str) -> usize {
+pub(super) fn filtered_count_models(items: &[Model], q: &str) -> usize {
     filtered_models(items, q).count()
 }
 
-fn filtered_history<'a>(
+pub(super) fn filtered_history<'a>(
     items: &'a [HistoryEntry],
     q: &'a str,
 ) -> impl Iterator<Item = &'a HistoryEntry> + 'a {
@@ -2489,18 +1680,18 @@ fn filtered_history<'a>(
         .filter(move |e| matches_query(&e.text, q))
 }
 
-fn filtered_count_history(items: &[HistoryEntry], q: &str) -> usize {
+pub(super) fn filtered_count_history(items: &[HistoryEntry], q: &str) -> usize {
     filtered_history(items, q).count()
 }
 
-fn filtered_forks<'a>(
+pub(super) fn filtered_forks<'a>(
     items: &'a [ForkMessage],
     q: &'a str,
 ) -> impl Iterator<Item = &'a ForkMessage> + 'a {
     items.iter().filter(move |f| matches_query(&f.text, q))
 }
 
-fn filtered_count_forks(items: &[ForkMessage], q: &str) -> usize {
+pub(super) fn filtered_count_forks(items: &[ForkMessage], q: &str) -> usize {
     filtered_forks(items, q).count()
 }
 
@@ -2516,7 +1707,7 @@ pub(super) fn last_tool_id(transcript: &Transcript) -> Option<String> {
 /// `Insert` mode: append `@path` (with a leading space if the composer isn't
 /// empty). `AtToken` mode: replace the current `@...` token — scan back from
 /// the end of `app.input` to the last `@` and swap from there.
-fn insert_file_ref(app: &mut App, path: &str, mode: crate::ui::modal::FilePickMode) {
+pub(super) fn insert_file_ref(app: &mut App, path: &str, mode: crate::ui::modal::FilePickMode) {
     use crate::ui::modal::FilePickMode;
     let token = format!("@{path}");
     match mode {
@@ -2817,7 +2008,7 @@ pub(super) fn merged_commands(pi_commands: &[CommandInfo]) -> Vec<crate::ui::com
 }
 
 /// Handle slash commands that do NOT need pi. Returns true if consumed.
-async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
+pub(super) async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
     match name {
         "help" => {
             app.modal = Some(Modal::Help);
@@ -3045,7 +2236,7 @@ async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> bool {
 }
 
 /// Handle slash commands that DO need pi. Returns true if consumed.
-async fn try_pi_slash(app: &mut App, client: &RpcClient, name: &str, arg: &str) -> bool {
+pub(super) async fn try_pi_slash(app: &mut App, client: &RpcClient, name: &str, arg: &str) -> bool {
     match name {
         "rename" => {
             if arg.is_empty() {
@@ -5486,7 +4677,7 @@ I'll take it from here.",
         handle_search_slash(&mut a, "");
         // Type "gamma".
         for ch in "gamma".chars() {
-            handle_modal_key(KeyCode::Char(ch), KeyModifiers::NONE, &mut a, None).await;
+            modal_keys::handle_modal_key(KeyCode::Char(ch), KeyModifiers::NONE, &mut a, None).await;
         }
         match &a.modal {
             Some(Modal::Search(s)) => {
@@ -5496,8 +4687,8 @@ I'll take it from here.",
             _ => panic!("modal gone"),
         }
         // Backspace trims; hits update.
-        handle_modal_key(KeyCode::Backspace, KeyModifiers::NONE, &mut a, None).await;
-        handle_modal_key(KeyCode::Backspace, KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Backspace, KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Backspace, KeyModifiers::NONE, &mut a, None).await;
         match &a.modal {
             Some(Modal::Search(s)) => {
                 assert_eq!(s.query, "gam");
@@ -5526,19 +4717,19 @@ I'll take it from here.",
             _ => panic!(),
         }
         // `n` wraps around to 0.
-        handle_modal_key(KeyCode::Char('n'), KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Char('n'), KeyModifiers::NONE, &mut a, None).await;
         match &a.modal {
             Some(Modal::Search(s)) => assert_eq!(s.hit_idx, 0),
             _ => panic!(),
         }
         // `N` wraps back to last.
-        handle_modal_key(KeyCode::Char('N'), KeyModifiers::SHIFT, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Char('N'), KeyModifiers::SHIFT, &mut a, None).await;
         match &a.modal {
             Some(Modal::Search(s)) => assert_eq!(s.hit_idx, 2),
             _ => panic!(),
         }
         // Enter focuses entry 3 and closes.
-        handle_modal_key(KeyCode::Enter, KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Enter, KeyModifiers::NONE, &mut a, None).await;
         assert!(a.modal.is_none());
         assert_eq!(a.focus_idx, Some(3));
     }
@@ -5563,8 +4754,8 @@ I'll take it from here.",
         let mut a = app();
         a.modal = Some(Modal::Templates(ListModal::new("templates", "hint", items)));
         // Arrow down to second entry.
-        handle_modal_key(KeyCode::Down, KeyModifiers::NONE, &mut a, None).await;
-        handle_modal_key(KeyCode::Enter, KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Down, KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Enter, KeyModifiers::NONE, &mut a, None).await;
         assert!(a.modal.is_none(), "Enter should close the modal");
         assert_eq!(a.composer.text(), "second body");
     }
@@ -5580,7 +4771,7 @@ I'll take it from here.",
         }];
         let mut a = app();
         a.modal = Some(Modal::Templates(ListModal::new("templates", "hint", items)));
-        handle_modal_key(KeyCode::Char('d'), KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Char('d'), KeyModifiers::NONE, &mut a, None).await;
         assert!(
             a.modal.is_none(),
             "emptying the list should auto-close the picker"
@@ -5598,7 +4789,7 @@ I'll take it from here.",
         let mut a = app();
         let before = a.composer.text();
         a.modal = Some(Modal::Templates(ListModal::new("templates", "hint", items)));
-        handle_modal_key(KeyCode::Esc, KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Esc, KeyModifiers::NONE, &mut a, None).await;
         assert!(a.modal.is_none());
         assert_eq!(a.composer.text(), before, "composer must be untouched");
     }
@@ -5647,17 +4838,17 @@ I'll take it from here.",
     async fn shortcuts_modal_scroll_and_close_bindings() {
         let mut a = app();
         a.modal = Some(Modal::Shortcuts { scroll: 0 });
-        handle_modal_key(KeyCode::PageDown, KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::PageDown, KeyModifiers::NONE, &mut a, None).await;
         match &a.modal {
             Some(Modal::Shortcuts { scroll }) => assert_eq!(*scroll, 10),
             _ => panic!("Shortcuts modal gone after PageDown"),
         }
-        handle_modal_key(KeyCode::Home, KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Home, KeyModifiers::NONE, &mut a, None).await;
         match &a.modal {
             Some(Modal::Shortcuts { scroll }) => assert_eq!(*scroll, 0),
             _ => panic!("Shortcuts modal gone after Home"),
         }
-        handle_modal_key(KeyCode::Char('q'), KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Char('q'), KeyModifiers::NONE, &mut a, None).await;
         assert!(a.modal.is_none(), "q should close Shortcuts");
     }
 
@@ -5833,15 +5024,15 @@ I'll take it from here.",
         a.on_event(assistant_end("[[PLAN_SET: alpha | beta | gamma]]"));
 
         // Enter Edit mode.
-        handle_modal_key(KeyCode::Char('e'), KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Char('e'), KeyModifiers::NONE, &mut a, None).await;
         match &a.modal {
             Some(Modal::PlanReview(s)) => assert_eq!(s.mode, PlanReviewMode::Edit),
             _ => unreachable!(),
         }
 
         // Focus beta (index 1), delete it. After deletion items = ["alpha", "gamma"].
-        handle_modal_key(KeyCode::Down, KeyModifiers::NONE, &mut a, None).await;
-        handle_modal_key(KeyCode::Char('x'), KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Down, KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Char('x'), KeyModifiers::NONE, &mut a, None).await;
         match &a.modal {
             Some(Modal::PlanReview(s)) => {
                 assert_eq!(s.items, vec!["alpha".to_string(), "gamma".to_string()]);
@@ -5850,8 +5041,8 @@ I'll take it from here.",
         }
 
         // Add a step below gamma, commit its buffer directly, exit text entry.
-        handle_modal_key(KeyCode::Down, KeyModifiers::NONE, &mut a, None).await;
-        handle_modal_key(KeyCode::Char('a'), KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Down, KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Char('a'), KeyModifiers::NONE, &mut a, None).await;
         // `a` inserted a blank row AND entered text-entry on it.
         match a.modal.as_mut() {
             Some(Modal::PlanReview(s)) => {
@@ -5867,10 +5058,10 @@ I'll take it from here.",
             _ => unreachable!(),
         }
         // Enter commits the buffer back into items[index].
-        handle_modal_key(KeyCode::Enter, KeyModifiers::NONE, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Enter, KeyModifiers::NONE, &mut a, None).await;
 
         // Ctrl+S accepts the edited draft.
-        handle_modal_key(KeyCode::Char('s'), KeyModifiers::CONTROL, &mut a, None).await;
+        modal_keys::handle_modal_key(KeyCode::Char('s'), KeyModifiers::CONTROL, &mut a, None).await;
         assert!(a.modal.is_none(), "modal should close on Ctrl+S accept");
         assert!(a.proposed_plan.is_none(), "proposal cleared after accept");
         let items: Vec<String> = a.plan.items.iter().map(|i| i.text.clone()).collect();
