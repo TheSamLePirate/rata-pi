@@ -1,0 +1,114 @@
+name: Release
+
+# V4.e · cross-platform release build + GitHub release on tag push.
+#
+# Triggers on `v*` tag push (e.g. `v1.0.0`). Each matrix runner builds
+# a release-profile binary for its target, tars/zips it, and uploads
+# to a GitHub Release. The Homebrew formula (Formula/rata-pi.rb)
+# references the macOS + Linux tarballs by URL; post-release the
+# formula's SHA256 fields need filling with the actual artifact
+# hashes (see Formula/rata-pi.rb header).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: rata-pi
+            archive_ext: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: rata-pi
+            archive_ext: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin: rata-pi
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: rata-pi.exe
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -eux
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.bin }}
+          cp README.md LICENSE CHANGELOG.md dist/ 2>/dev/null || true
+          tar -czf rata-pi-${{ matrix.target }}.tar.gz -C dist .
+          shasum -a 256 rata-pi-${{ matrix.target }}.tar.gz
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/${{ matrix.bin }} dist/
+          Copy-Item README.md, LICENSE, CHANGELOG.md dist/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path dist/* -DestinationPath rata-pi-${{ matrix.target }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rata-pi-${{ matrix.target }}
+          path: rata-pi-${{ matrix.target }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  release:
+    name: github release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect SHA256 hashes
+        run: |
+          set -eux
+          cd artifacts
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
+            | xargs -0 shasum -a 256 \
+            > ../SHA256SUMS.txt
+          cat ../SHA256SUMS.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            SHA256SUMS.txt
+          body_path: CHANGELOG.md
+          draft: true
+          generate_release_notes: false

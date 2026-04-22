@@ -12,13 +12,9 @@ the agent never runs a multi-step plan without explicit user consent.
 
 ## Status
 
-V3 in progress. The codebase already ships a large feature set
-(streaming transcript with per-entry render cache, modal-based UI,
-six built-in themes, notifications, crash dumps, RPC timeouts, a
-plan-approval review modal, an agent-driven interview form, marker
-stripping, and a settings panel for every runtime toggle). See
-`PLAN_V3.md` for the active plan and `track_v3_progression.md` for
-where each sub-milestone currently stands.
+**`v1.0.0`** — first tagged release. See
+[`CHANGELOG.md`](CHANGELOG.md) for the full feature list and
+[`PLAN_V4.md`](PLAN_V4.md) for what shipped between V3 and 1.0.
 
 ## Features
 
@@ -52,19 +48,54 @@ where each sub-milestone currently stands.
   user actions 10 s), terminal panic hook with crash dump persisted
   to the platform state dir, graceful shutdown of the pi child.
 
+## Install
+
+### Homebrew (macOS, Linux)
+
+```bash
+brew install olivvein/rata-pi/rata-pi
+```
+
+*(tap repo will be populated once `v1.0.0` is published and the
+formula in [`Formula/rata-pi.rb`](Formula/rata-pi.rb) has its
+SHA256 fields filled.)*
+
+### cargo install
+
+```bash
+cargo install rata-pi
+```
+
+### Build from source
+
+```bash
+git clone https://github.com/olivvein/rata-pi
+cd rata-pi
+cargo build --release   # target/release/rata-pi
+cargo run --release     # run without installing
+```
+
+### Prebuilt binaries
+
+Every `v*` tag triggers a [release workflow](.github/workflows/release.yml)
+that builds for:
+
+- macOS arm64 (`aarch64-apple-darwin`)
+- macOS x86_64 (`x86_64-apple-darwin`)
+- Linux x86_64 (`x86_64-unknown-linux-gnu`)
+- Windows x86_64 (`x86_64-pc-windows-msvc`)
+
+Download the tarball / zip for your platform from the
+[Releases page](https://github.com/olivvein/rata-pi/releases).
+
 ## Running
 
 ```bash
-cargo run --release
+rata-pi                        # uses `pi` from $PATH
+rata-pi --pi-bin /path/to/pi   # explicit path
 ```
 
-rata-pi spawns `pi` from `$PATH` by default. Override with:
-
-```bash
-cargo run --release -- --pi-bin /path/to/pi
-```
-
-If pi isn't available the app still starts in offline mode so you
+If `pi` isn't available the app still starts in offline mode so you
 can inspect the chrome, settings, shortcuts, and themes. Any RPC-
 backed toggle flips the local flag and flashes a warning that the
 change won't persist past this session.
@@ -95,12 +126,14 @@ modules: `mod` (state + dispatch + draw_modal), `draw` (chrome),
 
 ## Docs
 
+- [`CHANGELOG.md`](CHANGELOG.md) — user-facing release notes.
 - [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) — every feature with
   keybindings, settings, and the plan / interview flows in detail.
-- [`PLAN_V3.md`](PLAN_V3.md) — V3 master plan, design decisions, and
-  sub-milestone structure.
-- [`track_v3_progression.md`](track_v3_progression.md) — live V3
-  progression tracker with commit hashes, rolling metrics, and
+- [`PLAN_V3.md`](PLAN_V3.md) / [`PLAN_V4.md`](PLAN_V4.md) — master
+  plans, design decisions, sub-milestone structure.
+- [`track_v3_progression.md`](track_v3_progression.md) /
+  [`track_v4_progression.md`](track_v4_progression.md) — live
+  progression trackers with commit hashes, rolling metrics, and
   deviations.
 - [`pi-doc.md`](pi-doc.md) — pointers into the pi coding agent source
   and docs used while building rata-pi.

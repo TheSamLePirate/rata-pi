@@ -87,19 +87,29 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 
 ---
 
-## V4.e — Distribution + v1.0.0 release
+## V4.e — Distribution + v1.0.0 release ✅ (artifacts prepped; tag + push is the user's call)
 
-- [ ] `CHANGELOG.md` — covers V2 → V3 → V4 from a user's perspective; `## [1.0.0] - 2026-XX-XX` header
-- [ ] `Cargo.toml` version: `0.1.0` → `1.0.0`
-- [ ] Release automation (default: `cargo-dist`; fallback: hand-rolled GitHub Actions)
-- [ ] Homebrew formula (via cargo-dist OR manual tap)
-- [ ] README install section rewritten
-- [ ] CI: release workflow triggers on tag push
-- [ ] Tag `v1.0.0` + verify the workflow produces artifacts for macOS (arm64 + x86_64) and Linux (x86_64)
-- [ ] `cargo install rata-pi --version 1.0.0` works end-to-end (publish to crates.io if applicable)
-- [ ] GitHub release page displays installers + binaries
+- [x] `CHANGELOG.md` — user-facing, covers V2 → V3 → V4, `## [1.0.0]` section with feature groups + known deviations
+- [x] `Cargo.toml` version: `0.1.0` → `1.0.0`; also added `readme`, `repository`, `homepage`, `keywords`, `categories` for crates.io
+- [!] Release automation — **hand-rolled GitHub Actions** in `.github/workflows/release.yml` (cargo-dist deviation, see §6). Triggers on `v*` tag push. Builds macOS arm64 + macOS x86_64 + Linux x86_64 + Windows x86_64; uploads tarballs / zip + SHA256SUMS.txt; creates a draft release with CHANGELOG.md as the body.
+- [x] `Formula/rata-pi.rb` — three-platform Homebrew formula with `REPLACE_WITH_SHA256` placeholders + documented fill-in step. Install caveat hints at the `npm install -g @mariozechner/pi-coding-agent` dep.
+- [x] README install section rewritten — brew tap + cargo install + build from source + prebuilt binaries + run + pi dependency notes.
+- [x] Status blurb in README updated to "v1.0.0 — first tagged release".
+- [x] Full gate green at `v1.0.0`: 255 tests, clippy `-D warnings` clean, fmt clean, release build green.
 
-**Shipped as** ``
+### User-triggered final steps (not executable from this session)
+
+1. Review + merge the V4.e commit onto main.
+2. Tag: `git tag -a v1.0.0 -m "1.0.0"`.
+3. Push tag: `git push origin v1.0.0` — this fires `.github/workflows/release.yml`.
+4. Once the workflow's draft release is up:
+   - Download `SHA256SUMS.txt` from the release.
+   - Fill the three `REPLACE_WITH_SHA256` placeholders in `Formula/rata-pi.rb` with the matching hashes.
+   - Commit + push the Formula update to a `homebrew-rata-pi` tap repo (or keep it local for `brew install --formula Formula/rata-pi.rb`).
+5. Publish to crates.io: `cargo publish` (requires `CARGO_REGISTRY_TOKEN`).
+6. Publish the GitHub release draft.
+
+**Shipped as** `<tbd>`
 
 ---
 
@@ -107,16 +117,19 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 
 | | V3 final | V4.a | V4.b | V4.c | V4.d | V4.e |
 |---|---|---|---|---|---|---|
-| Tests | 242 | 248 | 252 | 255 | **255** | ≥ 265 |
-| `src/app/mod.rs` LoC | 7 241 | 7 394 | 7 581 | 7 808 | **5 375** | |
-| Modules under `src/app/` (excl. `mod.rs`) | 5 | 5 | 5 | 5 | **8** | |
+| Tests | 242 | 248 | 252 | 255 | 255 | **255** |
+| `src/app/mod.rs` LoC | 7 241 | 7 394 | 7 581 | 7 808 | 5 375 | 5 375 |
+| Modules under `src/app/` (excl. `mod.rs`) | 5 | 5 | 5 | 5 | 8 | 8 |
 | Click-on-chip works | no | yes (except Commands) | yes | yes | yes | yes |
 | Click-outside-modal closes | no | yes | yes | yes | yes | yes |
 | Transcript search overlay | no | no | yes | yes | yes | yes |
 | Template picker modal | no | no | no | yes | yes | yes |
-| `cargo install rata-pi` works | no | no | no | no | no | yes |
-| Homebrew formula available | no | no | no | no | no | yes |
-| Release tag | — | — | — | — | — | `v1.0.0` |
+| `cargo install rata-pi` works | no | no | no | no | no | **prep'd** |
+| Homebrew formula available | no | no | no | no | no | **in tree** |
+| `CHANGELOG.md` | no | no | no | no | no | **yes** |
+| Release workflow (`.github/workflows/release.yml`) | no | no | no | no | no | **yes** |
+| `Cargo.toml` version | `0.1.0` | `0.1.0` | `0.1.0` | `0.1.0` | `0.1.0` | **`1.0.0`** |
+| Release tag | — | — | — | — | — | **pending user push** |
 | Clippy clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Fmt clean | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 
@@ -125,6 +138,13 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
 ## Deviations
 
 *(Same pattern as V3 — record sub-milestone · task · what changed · why. Blank section = on plan.)*
+
+### 6. V4.e · hand-rolled GitHub Actions release, not cargo-dist
+**What changed.** `PLAN_V4` defaulted to `cargo-dist`; the shipped workflow is a plain `.github/workflows/release.yml`.
+
+**Why.** cargo-dist generates its workflow by running `cargo dist init` locally; that needs a network-reachable tool install + an interactive config flow. A hand-written workflow (~70 lines of YAML) does everything cargo-dist would for a single-binary Rust crate with four target triples: matrix build, tar/zip staging, SHA256 emit, and a draft GitHub release with CHANGELOG.md as the body. No new dev-env dep, reviewable in the PR, easy to evolve.
+
+If future versions want Windows code signing, macOS notarisation, or multi-binary installers, cargo-dist is the right move then — the current workflow is a clean baseline to migrate from.
 
 ### 5. V4.d · `mod.rs` < 4 000 LoC target missed at 5 375
 **What changed.** `PLAN_V4` targeted `src/app/mod.rs` < 4 000 LoC. Final is 5 375 after V4.d.1/.2/.3 pulled 3 087 lines out.
