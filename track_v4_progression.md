@@ -70,7 +70,7 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
   - [x] `template_picker_delete_removes_and_auto_closes_when_empty`
   - [x] `template_picker_esc_closes_without_loading`
 
-**Shipped as** `<tbd>`
+**Shipped as** `cc2c5bc`
 
 ---
 
