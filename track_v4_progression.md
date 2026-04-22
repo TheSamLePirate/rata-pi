@@ -28,7 +28,7 @@ Each sub-milestone ships as its own commit with subject `feat(v4.X): <summary>` 
   - [x] `click_plan_review_accept_chip_accepts`
   - [x] `click_plan_review_deny_chip_denies`
 
-**Shipped as** `<tbd>` (V4.a.1)
+**Shipped as** `6191bfb` (V4.a.1 · infrastructure + Plan Review + click-outside)
 
 ---
 
