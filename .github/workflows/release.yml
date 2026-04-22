@@ -75,7 +75,7 @@ jobs:
           Compress-Archive -Path dist/* -DestinationPath rata-pi-${{ matrix.target }}.zip
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rata-pi-${{ matrix.target }}
           path: rata-pi-${{ matrix.target }}.${{ matrix.archive_ext }}
