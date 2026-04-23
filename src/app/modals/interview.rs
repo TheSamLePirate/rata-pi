@@ -269,10 +269,8 @@ fn text_field_key(
                 *cursor = prev_char_boundary(value, *cursor);
             }
         }
-        (KeyCode::Right, m) if !m.contains(KeyModifiers::ALT) => {
-            if *cursor < value.len() {
-                *cursor = next_char_boundary(value, *cursor);
-            }
+        (KeyCode::Right, m) if !m.contains(KeyModifiers::ALT) && *cursor < value.len() => {
+            *cursor = next_char_boundary(value, *cursor);
         }
         (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) => {
             *cursor = word_left_index(value, *cursor);
