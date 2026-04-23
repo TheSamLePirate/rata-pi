@@ -26,19 +26,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin: rata-pi
+            bin: tau
             archive_ext: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            bin: rata-pi
+            bin: tau
             archive_ext: tar.gz
           - os: macos-latest
             target: x86_64-apple-darwin
-            bin: rata-pi
+            bin: tau
             archive_ext: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin: rata-pi.exe
+            bin: tau.exe
             archive_ext: zip
     runs-on: ${{ matrix.os }}
     steps:
