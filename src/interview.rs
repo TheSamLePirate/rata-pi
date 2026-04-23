@@ -7,7 +7,7 @@
 //! [[INTERVIEW: { ...json interview definition... }]]
 //! ```
 //!
-//! rata-pi parses the JSON on `agent_end`, opens a full-screen Interview
+//! Tau parses the JSON on `agent_end`, opens a full-screen Interview
 //! modal with sections and mixed field types, and on submit sends a user
 //! message containing the answers back to the agent as a JSON payload
 //! wrapped in `<interview-response>` tags.
@@ -1272,7 +1272,7 @@ fn try_parse_interview(s: &str) -> Option<Interview> {
 /// prompts so the agent knows it can author an interview.
 pub fn capability_hint() -> &'static str {
     concat!(
-        "\n\n(rata-pi interview protocol — when you need several related ",
+        "\n\n(Tau interview protocol — when you need several related ",
         "answers from the user, emit these one-per-line markers. Pipe (|) ",
         "separates fields; trailing `!` on the kind = required; trailing ",
         "`*` on an option = default / preselected. All markers are ",

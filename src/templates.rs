@@ -1,7 +1,7 @@
 //! Reusable composer templates — V3.j.4.
 //!
 //! Stored as a flat JSON map `{ name: body }` under
-//! `<config_dir>/rata-pi/templates.json`. The usual user commands:
+//! `<config_dir>/tau/templates.json`. The usual user commands:
 //!
 //! * `/template save <name>`   — snapshot the composer into `<name>`
 //! * `/template list`          — open a picker (V3.j.4+: for now flashes)
@@ -21,7 +21,7 @@ fn persist_disabled() -> bool {
 }
 
 fn templates_path() -> Option<PathBuf> {
-    ProjectDirs::from("dev", "olivvein", "rata-pi").map(|d| d.config_dir().join("templates.json"))
+    ProjectDirs::from("dev", "olivvein", "tau").map(|d| d.config_dir().join("templates.json"))
 }
 
 pub fn load() -> BTreeMap<String, String> {

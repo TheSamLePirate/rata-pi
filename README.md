@@ -1,4 +1,4 @@
-# rata-pi
+# Tau (2*PI)
 
 **A fast, keyboard-first terminal UI for the
 [Pi coding agent](https://github.com/mariozechner/pi-coding-agent).**
@@ -7,8 +7,10 @@ Stream model output, approve plans before they run, browse tool calls, run
 git from the composer, and reuse prompt templates — all without leaving
 the terminal.
 
+> **Note:** The underlying Rust project and repository remain named `rata-pi`, but the resulting binary and user-facing application is **Tau**.
+
 ```text
-  ┌ rata-pi ● claude-sonnet-4-6 · llm · ⎇ main ● t3 ──────────────┐
+  ┌ Tau ● claude-sonnet-4-6 · llm · ⎇ main ● t3 ──────────────────┐
   │ you                                                           │
   │   refactor the settings reducer — keep the RPC fanout intact  │
   │                                                               │
@@ -59,11 +61,11 @@ announcement.
   pin, focus mode (`Ctrl+F`) for card-level nav, markdown + syntect
   fenced-code highlighting that tracks the active theme.
 - **Plan approval flow** — when the agent emits
-  `[[PLAN_SET: …]]`, rata-pi opens a review modal. You Accept, Edit
+  `[[PLAN_SET: …]]`, Tau opens a review modal. You Accept, Edit
   (add / delete / in-place edit steps), or Deny. Accepted plans
   auto-run if you left the toggle on.
 - **Agent interview forms** — `[[ASK_TEXT: …]]`-style markers pop a
-  structured form with Tab navigation and `Ctrl+Enter` submit. rata-pi
+  structured form with Tab navigation and `Ctrl+Enter` submit. Tau
   returns a single JSON block so the agent parses deterministically.
 - **Slash picker** — `/` or `F1` opens a fuzzy palette over built-ins
   + pi skills / prompts / extensions.
@@ -88,7 +90,7 @@ announcement.
   64-snapshot ring. Draft auto-saved on quit, restored on next launch.
 - **Preferences persistence** — theme, notifications, vim, thinking
   visibility, raw-marker visibility, and focus-marker style persist to
-  `<config_dir>/rata-pi/config.json`.
+  `<config_dir>/tau/config.json`.
 - **Notifications** — OSC 777 always on; `notify-rust` native desktop
   notifications behind the `notify` feature flag.
 - **Resilience** — per-call RPC timeouts (bootstrap 3 s, stats 1 s,
@@ -118,7 +120,7 @@ cargo install rata-pi
 ```bash
 git clone https://github.com/TheSamLePirate/rata-pi
 cd rata-pi
-cargo build --release   # target/release/rata-pi, ~5 MiB
+cargo build --release   # target/release/tau, ~5 MiB
 cargo run --release     # run without installing
 ```
 
@@ -138,8 +140,8 @@ Download the tarball / zip for your platform from the
 ## Running
 
 ```bash
-rata-pi                        # uses `pi` from $PATH
-rata-pi --pi-bin /path/to/pi   # explicit path
+tau                        # uses `pi` from $PATH
+tau --pi-bin /path/to/pi   # explicit path
 ```
 
 If `pi` isn't available the app still starts in **offline mode**: the
@@ -191,7 +193,7 @@ utilities.
   progression trackers with commit hashes, rolling metrics, and
   deviations.
 - [`pi-doc.md`](pi-doc.md) — pointers into the pi coding agent source
-  and docs used while building rata-pi.
+  and docs used while building Tau.
 
 ## License
 

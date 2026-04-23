@@ -171,7 +171,7 @@ fn append_file(path: Option<&std::path::Path>, entry: &HistoryEntry) -> std::io:
 }
 
 fn resolve_path() -> Option<PathBuf> {
-    let dirs = ProjectDirs::from("dev", "olivvein", "rata-pi")?;
+    let dirs = ProjectDirs::from("dev", "olivvein", "tau")?;
     Some(dirs.data_local_dir().join("history.jsonl"))
 }
 

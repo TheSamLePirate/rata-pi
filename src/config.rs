@@ -1,18 +1,18 @@
 //! Persistent user config — theme, toggles, composer draft.
 //!
-//! V3.j.1 · rata-pi picks up the user's preferred theme + a handful of
-//! `/settings` toggles from `<config_dir>/rata-pi/config.json` on
+//! V3.j.1 · Tau picks up the user's preferred theme + a handful of
+//! `/settings` toggles from `<config_dir>/tau/config.json` on
 //! launch, and writes it back whenever one of those settings changes.
 //! A second file (`draft.txt` in the same dir) holds the composer
 //! buffer the user had unsent at quit-time so the next launch can
 //! offer to restore it.
 //!
 //! The directory path comes from `directories::ProjectDirs` — same
-//! resolution rata-pi uses for history. On typical platforms that
+//! resolution Tau uses for history. On typical platforms that
 //! means:
-//!   Linux   → ~/.config/rata-pi/
-//!   macOS   → ~/Library/Application Support/dev.olivvein.rata-pi/
-//!   Windows → %APPDATA%\olivvein\rata-pi\config\
+//!   Linux   → ~/.config/tau/
+//!   macOS   → ~/Library/Application Support/dev.olivvein.tau/
+//!   Windows → %APPDATA%\olivvein\tau\config\
 //!
 //! Deviation from PLAN_V3: the plan called for TOML. We use JSON so
 //! the dep footprint stays at serde_json (already pulled in for the
@@ -39,7 +39,7 @@ pub struct UserConfig {
 }
 
 fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from("dev", "olivvein", "rata-pi")
+    ProjectDirs::from("dev", "olivvein", "tau")
 }
 
 /// Absolute path of `config.json`. `None` when no project dir resolves

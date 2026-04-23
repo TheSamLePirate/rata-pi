@@ -29,14 +29,14 @@ pub fn export(transcript: &Transcript) -> std::io::Result<PathBuf> {
 }
 
 fn resolve_dir() -> PathBuf {
-    ProjectDirs::from("dev", "olivvein", "rata-pi")
+    ProjectDirs::from("dev", "olivvein", "tau")
         .map(|d| d.data_local_dir().join("exports"))
-        .unwrap_or_else(|| std::env::temp_dir().join("rata-pi-exports"))
+        .unwrap_or_else(|| std::env::temp_dir().join("tau-exports"))
 }
 
 pub fn render(transcript: &Transcript) -> String {
     let mut out = String::new();
-    out.push_str("# rata-pi session\n\n");
+    out.push_str("# Tau session\n\n");
     for e in transcript.entries() {
         match e {
             Entry::User(s) => {

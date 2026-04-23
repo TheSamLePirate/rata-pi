@@ -542,7 +542,7 @@ pub(crate) fn build_settings_rows(app: &App) -> Vec<SettingsRow> {
 
     rows.push(R::Header("Build"));
     rows.push(R::Info {
-        label: "rata-pi".into(),
+        label: "Tau".into(),
         value: app.caps.package_version.into(),
     });
     rows.push(R::Info {

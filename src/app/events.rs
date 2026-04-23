@@ -133,7 +133,7 @@ pub(super) fn on_event(app: &mut App, ev: Incoming) {
                 app.set_live(LiveState::Error);
                 // Pi sends the final failed AssistantMessage in the
                 // `error` field (was mis-named `partial` in older
-                // rata-pi — silent default-to-null was masking every
+                // Tau — silent default-to-null was masking every
                 // API failure). Probe it for a human-readable message.
                 let detail = extract_error_detail(&error);
                 let msg = match detail {

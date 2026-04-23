@@ -181,7 +181,7 @@ mod tests {
     /// fire regardless of how the file got that size.
     #[test]
     fn preview_rejects_files_over_size_cap_without_reading() {
-        let dir = std::env::temp_dir().join(format!("rata-pi-v3b-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tau-v3b-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("huge.txt");
         let f = std::fs::File::create(&path).unwrap();
@@ -195,7 +195,7 @@ mod tests {
     /// bounded sample (no more than the documented MAX_LINES).
     #[test]
     fn preview_clips_to_max_lines() {
-        let dir = std::env::temp_dir().join(format!("rata-pi-v3b-clip-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tau-v3b-clip-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("many.txt");
         let content: String = (0..200).map(|i| format!("line {i}\n")).collect();

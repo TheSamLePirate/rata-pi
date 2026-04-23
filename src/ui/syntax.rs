@@ -4,7 +4,7 @@
 //! cache of syntect themes keyed by name — the first call for a given
 //! palette name clones and stores it, subsequent calls reuse. V3.g.1
 //! adds the `theme` parameter so fenced-code colouring tracks the
-//! active rata-pi theme instead of being locked to `base16-ocean.dark`.
+//! active Tau theme instead of being locked to `base16-ocean.dark`.
 //!
 //! Language detection:
 //!   1. `lang_hint` treated as a markdown fence tag (rust, py, sh, …).
@@ -27,7 +27,7 @@ static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
 /// Cache of resolved syntect `SynTheme`s keyed by name. Populated lazily
 /// on first call for each name. Tiny — ~6 entries at most (one per
-/// built-in rata-pi theme).
+/// built-in Tau theme).
 static PALETTE_CACHE: OnceLock<Mutex<std::collections::HashMap<&'static str, SynTheme>>> =
     OnceLock::new();
 
@@ -135,7 +135,7 @@ mod tests {
     }
 
     /// V3.g.1 · the chosen syntect palette differs across built-in
-    /// rata-pi themes. Swapping theme must change the colouring so
+    /// Tau themes. Swapping theme must change the colouring so
     /// fenced code stops looking out-of-place on a themed transcript.
     #[test]
     fn different_themes_produce_different_palettes() {

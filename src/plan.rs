@@ -385,7 +385,7 @@ pub fn strip_markers(text: &str) -> String {
 /// Short capability hint appended to user prompts when no plan is active.
 /// Tells pi which markers it can emit to create / extend / advance a plan.
 pub fn capability_hint() -> &'static str {
-    "\n\n(rata-pi plan protocol — use these markers when useful:\n\
+    "\n\n(Tau plan protocol — use these markers when useful:\n\
      [[PLAN_SET: step 1 | step 2 | step 3]]   propose or replace a plan\n\
      [[PLAN_ADD: new step]]                   append to the current plan\n\
      [[STEP_DONE]]                            end the current step\n\

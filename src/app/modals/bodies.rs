@@ -502,7 +502,7 @@ pub(crate) fn mcp_body(rows: &[crate::ui::modal::McpRow], t: &Theme) -> Vec<Line
     }
     out.push(Line::default());
     out.push(Line::from(Span::styled(
-        "  hint: MCP servers are configured in pi's settings, not rata-pi",
+        "  hint: MCP servers are configured in pi's settings, not Tau",
         Style::default().fg(t.dim),
     )));
     out
@@ -539,7 +539,7 @@ pub(crate) fn shortcuts_body(t: &Theme) -> Vec<Line<'static>> {
     };
 
     out.push(Line::from(Span::styled(
-        "  Every keyboard action rata-pi responds to.",
+        "  Every keyboard action Tau responds to.",
         Style::default().fg(t.muted),
     )));
 
@@ -1191,7 +1191,7 @@ pub(crate) fn help_text(t: &Theme) -> Text<'static> {
     };
     Text::from(vec![
         Line::from(Span::styled(
-            "Welcome to rata-pi.",
+            "Welcome to Tau (2*PI).",
             Style::default().fg(t.text).add_modifier(Modifier::BOLD),
         )),
         Line::default(),

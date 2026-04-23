@@ -2,9 +2,9 @@ use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "rata-pi",
+    name = "tau",
     version,
-    about = "Ratatui TUI for the Pi coding agent (RPC)"
+    about = "Tau (2*PI) - A Ratatui TUI for the Pi coding agent (RPC)"
 )]
 pub struct Args {
     /// Path to the pi binary (default: "pi" on PATH).

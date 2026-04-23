@@ -2,7 +2,7 @@
 //!
 //! Two kinds of entries:
 //!
-//! * **built-ins** — rata-pi's own slash commands; pushed eagerly so the
+//! * **built-ins** — Tau's own slash commands; pushed eagerly so the
 //!   picker shows more than just pi's skill list.
 //! * **pi commands** — fetched at bootstrap via `get_commands`, wrapped in
 //!   `MenuItem` at picker-open time.
@@ -402,7 +402,7 @@ pub fn builtins() -> Vec<MenuItem> {
             "",
             "/notify"
         ),
-        b!(Debug, "version", "show rata-pi version", "", "/version"),
+        b!(Debug, "version", "show Tau version", "", "/version"),
         b!(Debug, "log", "show the log file path", "", "/log"),
         b!(
             Debug,

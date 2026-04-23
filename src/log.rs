@@ -20,7 +20,7 @@ pub fn init(cli_level: Option<&str>) -> Result<LogGuard> {
     let log_dir = resolve_log_dir();
     fs::create_dir_all(&log_dir)?;
 
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "rata-pi.log");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "tau.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let env = EnvFilter::try_from_default_env()
@@ -45,11 +45,11 @@ pub fn init(cli_level: Option<&str>) -> Result<LogGuard> {
 }
 
 fn resolve_log_dir() -> PathBuf {
-    if let Some(dirs) = ProjectDirs::from("dev", "olivvein", "rata-pi") {
+    if let Some(dirs) = ProjectDirs::from("dev", "olivvein", "tau") {
         if let Some(state) = dirs.state_dir() {
             return state.to_path_buf();
         }
         return dirs.data_local_dir().to_path_buf();
     }
-    std::env::temp_dir().join("rata-pi")
+    std::env::temp_dir().join("tau")
 }

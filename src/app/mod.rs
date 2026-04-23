@@ -167,15 +167,15 @@ fn install_panic_hook(kitty: bool) {
         // V2.11 · persist the panic for post-mortem inspection.
         let crash_path = write_crash_dump(info);
         if let Some(path) = crash_path.as_deref() {
-            eprintln!("rata-pi: crash dump written to {path}");
+            eprintln!("Tau: crash dump written to {path}");
         }
         original(info);
     }));
 }
 
 /// Write a timestamped crash dump to the platform's state dir:
-/// `~/.local/state/rata-pi/` on Linux (XDG), `~/Library/Application
-/// Support/rata-pi/` on macOS, `%LOCALAPPDATA%\rata-pi\` on Windows.
+/// `~/.local/state/tau/` on Linux (XDG), `~/Library/Application
+/// Support/tau/` on macOS, `%LOCALAPPDATA%\tau\` on Windows.
 /// Best-effort: returns the path on success, None on any failure.
 fn write_crash_dump(info: &panic::PanicHookInfo<'_>) -> Option<String> {
     use std::io::Write as _;
@@ -186,7 +186,7 @@ fn write_crash_dump(info: &panic::PanicHookInfo<'_>) -> Option<String> {
     let state = dirs
         .state_dir()
         .unwrap_or_else(|| dirs.data_local_dir())
-        .join("rata-pi");
+        .join("tau");
     std::fs::create_dir_all(&state).ok()?;
 
     let ts = std::time::SystemTime::now()
@@ -196,7 +196,7 @@ fn write_crash_dump(info: &panic::PanicHookInfo<'_>) -> Option<String> {
     let path = state.join(format!("crash-{ts}.log"));
 
     let mut f = std::fs::File::create(&path).ok()?;
-    let _ = writeln!(f, "rata-pi crash · ts={ts}");
+    let _ = writeln!(f, "Tau crash · ts={ts}");
     let _ = writeln!(
         f,
         "version={} os={} arch={}",
@@ -608,7 +608,7 @@ fn probe_app_caps() -> AppCaps {
             .map(|d| {
                 d.state_dir()
                     .unwrap_or_else(|| d.data_local_dir())
-                    .join("rata-pi")
+                    .join("tau")
                     .display()
                     .to_string()
             })
@@ -2062,7 +2062,7 @@ pub(super) async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> boo
             true
         }
         "version" => {
-            app.flash(format!("rata-pi v{}", env!("CARGO_PKG_VERSION")));
+            app.flash(format!("Tau v{}", env!("CARGO_PKG_VERSION")));
             true
         }
         "log" => {
@@ -2210,7 +2210,7 @@ pub(super) async fn try_local_slash(app: &mut App, name: &str, arg: &str) -> boo
             true
         }
         // V3.j.4 · composer templates. Stored in
-        // <config_dir>/rata-pi/templates.json; one line per subcommand.
+        // <config_dir>/tau/templates.json; one line per subcommand.
         "template" | "tpl" => {
             handle_template_slash(app, arg);
             true

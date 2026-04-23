@@ -412,7 +412,7 @@ pub(super) fn fmt_elapsed(d: Duration) -> String {
 }
 
 /// V2.13.c · slimmed header. One tight row with:
-///   rata-pi · heartbeat · spinner · model · state · (queue if nonzero)
+///   Tau · heartbeat · spinner · model · state · (queue if nonzero)
 ///   · (git chip if in a repo) · right: turn counter
 /// Thinking / session-name / session-file / notify-backend / etc. moved
 /// to /settings.
@@ -447,7 +447,7 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
     let mut left: Vec<Span<'static>> = vec![
         Span::styled(
-            " rata-pi ",
+            " Tau ",
             Style::default()
                 .fg(t.text)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED),
@@ -588,7 +588,7 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App, mm: &mut MouseMap) {
     if cache.is_empty() {
         let hint = Paragraph::new(Text::from(vec![
             Line::from(Span::styled(
-                "welcome to rata-pi",
+                "Welcome to Tau (2*PI)",
                 Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             )),
             Line::default(),

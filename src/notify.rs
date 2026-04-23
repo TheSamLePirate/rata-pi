@@ -93,7 +93,7 @@ fn send_native(title: &str, body: &str) -> Result<(), notify_rust::error::Error>
     notify_rust::Notification::new()
         .summary(title)
         .body(body)
-        .appname("rata-pi")
+        .appname("Tau")
         .show()
         .map(|_| ())
 }
