@@ -9,6 +9,8 @@ the terminal.
 
 > **Note:** The underlying Rust project and repository remain named `rata-pi`, but the resulting binary and user-facing application is **Tau**.
 
+![Main Screen](docs/images/MainScreen.png)
+
 ```text
   ┌ Tau ● claude-sonnet-4-6 · llm · ⎇ main ● t3 ──────────────────┐
   │ you                                                           │
